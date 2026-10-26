@@ -1,10 +1,10 @@
 import { createInterface } from "node:readline/promises";
+import { emitKeypressEvents } from "node:readline";
 import { stdin, stdout } from "node:process";
 import { execSync } from "node:child_process";
 import {
   maskApiKey,
   matchCatalogModelId,
-  normalizeModelId,
   saveUserConfig,
   VALID_EFFORTS,
   VALID_MODES,
@@ -31,13 +31,11 @@ import {
   formatCompactTokens,
   getGitBranchLabel,
   renderHeaderBanner,
-  renderStatusBar,
   renderTodoBoard,
-  renderToolCallCard,
   TerminalSpinner,
 } from "./ui/theme.js";
-import { renderUnifiedDiff } from "./ui/markdown.js";
-import { completeInputToken, interactiveSelect, SLASH_COMMANDS } from "./ui/select.js";
+import { interactiveSelect, SLASH_COMMANDS } from "./ui/select.js";
+import { readInteractiveComposerLine } from "./ui/composer.js";
 
 export interface SlashCommandResult {
   output: string;
@@ -176,14 +174,22 @@ export async function handleSlashCommand(
     case "/help":
       return {
         output: [
-          `${c.cyan("╭─")} ${c.bold("AivoCode Command Reference")} ${c.cyan("─".repeat(45))}`,
+          `${c.cyan("╭─")} ${c.bold("AivoCode Command & Hotkey Reference")} ${c.cyan("─".repeat(38))}`,
+          `${c.cyan("│")} ${c.bold("Live Hotkeys (inside Composer):")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Shift+Tab / Ctrl+T"))} ${c.slate("Cycle Mode live: AUTO (Build) → PLAN (Architect) → SAFE (Confirm)")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+K"))}             ${c.slate("Open Interactive Model Switcher Modal (search & arrow keys)")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+E"))}             ${c.slate("Cycle Reasoning Effort live: minimal → low → medium → high → xhigh → max")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+W"))}             ${c.slate("Cycle AivoKey Wire live: chat → messages → responses")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+S"))}             ${c.slate("Open Live AivoKey Telemetry & Quota Inspector")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Type /"))}             ${c.slate("Opens Live Floating Slash Command Palette immediately")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Type @"))}             ${c.slate("Opens Live Fuzzy File Finder immediately")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("!<command>"))}         ${c.slate("Execute shell command directly without spending LLM tokens")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Esc (while busy)"))}   ${c.slate("Interrupt active LLM stream or tool execution cleanly")}`,
+          `${c.cyan("├" + "─".repeat(74))}`,
+          `${c.cyan("│")} ${c.bold("Slash Commands:")}`,
           ...SLASH_COMMANDS.map(
             (s) => `${c.cyan("│")}  ${c.bold(c.emerald(s.cmd.padEnd(14)))} ${c.slate(s.description)}`,
           ),
-          `${c.cyan("├" + "─".repeat(74))}`,
-          `${c.cyan("│")}  ${c.bold(c.amber("@path/to/file"))}  ${c.slate("Attach numbered file contents directly to your prompt (Tab autocompletes)")}`,
-          `${c.cyan("│")}  ${c.bold(c.amber("!<command>"))}     ${c.slate("Run a shell command directly in terminal without spending LLM tokens")}`,
-          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+C"))}         ${c.slate("Cancel in-flight generation stream without exiting AivoCode")}`,
           `${c.cyan("╰" + "─".repeat(74))}`,
         ].join("\n"),
       };
@@ -503,15 +509,18 @@ export async function startInteractiveRepl(
   agent: AivoAgent,
   initialKeyStatus: KeyInspectStatus | null,
   fetchFn: typeof fetch = fetch,
+  onStartTurnSpinner?: (label: string) => void,
+  onStopTurnSpinner?: () => void,
 ): Promise<void> {
   let keyStatus = initialKeyStatus;
   let workspaceFiles = walkWorkspaceFiles(agent.config.cwd);
   let gitBranch = getGitBranchLabel(agent.config.cwd);
+  const history: string[] = [];
 
   stdout.write(
     "\n" +
       renderHeaderBanner({
-        version: "0.2.0",
+        version: "0.3.0",
         cwd: agent.config.cwd,
         gitBranch,
         gatewayUrl: agent.config.baseUrl,
@@ -526,25 +535,20 @@ export async function startInteractiveRepl(
       "\n",
   );
 
-  const rl = createInterface({
-    input: stdin,
-    output: stdout,
-    completer: (line: string): [string[], string] => {
-      const res = completeInputToken(line, workspaceFiles);
-      return [res.matches, line];
-    },
-  });
-
   // First-run onboarding wizard if no API key is configured
   if (!agent.config.apiKey && stdin.isTTY) {
+    const rl = createInterface({ input: stdin, output: stdout });
     stdout.write(
       `\n${c.cyan("◆")} ${c.bold("Welcome to AivoCode!")} ${c.slate("Let's connect your AivoKey account.")}\n` +
         `  ${c.slate("Get your API key at:")} ${c.cyan("https://app.aivokey.dev/console/keys")}\n`,
     );
     try {
       const enteredKey = (
-        await rl.question(`  ${c.emerald("❯")} Paste your AivoKey API Key (${c.dim("sk-aivo_... or Enter to skip")}): `)
+        await rl.question(
+          `  ${c.emerald("❯")} Paste your AivoKey API Key (${c.dim("sk-aivo_... or Enter to skip")}): `,
+        )
       ).trim();
+      rl.close();
       if (enteredKey) {
         agent.config.apiKey = enteredKey;
         saveUserConfig({ apiKey: enteredKey }, agent.config.globalConfigPath);
@@ -577,129 +581,163 @@ export async function startInteractiveRepl(
         }
       }
     } catch {
-      /* user skipped onboarding */
+      rl.close();
     }
   }
 
-  let activeAbort: AbortController | null = null;
-  const sigintHandler = () => {
-    if (activeAbort) {
-      activeAbort.abort();
-      stdout.write(`\n${c.amber("⚠ Interrupted active request.")}\n`);
-    }
-  };
-  process.on("SIGINT", sigintHandler);
-
-  try {
-    while (true) {
-      const sysPrompt = buildSystemPrompt(agent.config.cwd, agent.config.mode);
-      const usedCtx = estimateConversationTokens(sysPrompt, agent.session.messages);
-      const modelInfo = agent.getActiveModelInfo();
-      const maxCtx = modelInfo?.contextWindow ?? 128_000;
-      const totalPrompt = agent.session.totalInputTokens + agent.session.totalCacheReadTokens;
-      const cacheHitPct =
-        totalPrompt > 0
-          ? Math.round((agent.session.totalCacheReadTokens / totalPrompt) * 100)
-          : 0;
-
-      const statusBar = renderStatusBar({
-        mode: agent.config.mode,
-        model: agent.config.model,
-        effort: agent.config.reasoningEffort,
-        wire: agent.config.wire,
-        usedContextTokens: usedCtx,
-        maxContextTokens: maxCtx,
-        cacheHitPct,
-        sessionCostMicro: BigInt(agent.session.totalCostMicro || "0"),
-        balanceMicro: keyStatus?.balanceMicro ?? null,
-        gitBranch,
-      });
-
-      stdout.write(`\n${c.slate("─".repeat(76))}\n${statusBar}\n`);
-      const promptGlyph =
-        agent.config.mode === "plan"
-          ? c.violet("❯ ")
-          : agent.config.mode === "safe"
-            ? c.amber("❯ ")
-            : c.cyan("❯ ");
-
-      let line: string;
-      try {
-        line = (await rl.question(promptGlyph)).trim();
-      } catch {
-        break;
-      }
-      if (!line) continue;
-
-      if (line.startsWith("!")) {
-        const shellCmd = line.slice(1).trim();
-        if (shellCmd) {
-          stdout.write(`${c.slate(`$ ${shellCmd}`)}\n`);
-          try {
-            const out = execSync(shellCmd, {
-              cwd: agent.config.cwd,
-              encoding: "utf8",
-              stdio: "pipe",
-            });
-            if (out) stdout.write(out.trimEnd() + "\n");
-          } catch (err) {
-            stdout.write(
-              `${c.rose(`Command failed: ${err instanceof Error ? err.message : String(err)}`)}\n`,
-            );
-          }
-          gitBranch = getGitBranchLabel(agent.config.cwd);
-        }
-        continue;
-      }
-
-      if (line.startsWith("/")) {
-        // Temporarily pause readline while interactive arrow-key select runs
-        const isInteractivePicker =
-          ["/model", "/effort", "/mode", "/wire", "/sessions"].includes(line.trim().toLowerCase());
-        if (isInteractivePicker) rl.pause();
-        const res = await handleSlashCommand(line, agent, keyStatus, fetchFn, true);
-        if (isInteractivePicker) rl.resume();
-        if (res.updatedKeyStatus !== undefined) {
-          keyStatus = res.updatedKeyStatus;
-        }
-        stdout.write(res.output + "\n");
-        if (res.shouldExit) break;
-        continue;
-      }
-
-      activeAbort = new AbortController();
-      try {
-        const turnRes = await agent.runUserPrompt(line, activeAbort.signal);
-        workspaceFiles = walkWorkspaceFiles(agent.config.cwd);
-        gitBranch = getGitBranchLabel(agent.config.cwd);
-
-        const totalIn = turnRes.turnUsage.inputTokens + turnRes.turnUsage.cacheReadTokens;
-        const cachePct =
-          totalIn > 0 ? Math.round((turnRes.turnUsage.cacheReadTokens / totalIn) * 100) : 0;
-        const savedTag =
-          turnRes.turnCacheSavedMicro > 0n
-            ? ` · ${c.teal(`saved ${formatMicroUsd(turnRes.turnCacheSavedMicro)}`)}`
-            : "";
-
-        stdout.write(
-          `\n${c.slate(`  ↳ in=${turnRes.turnUsage.inputTokens.toLocaleString("en-US")} · cache=${turnRes.turnUsage.cacheReadTokens.toLocaleString("en-US")} (${cachePct}%) · out=${turnRes.turnUsage.outputTokens.toLocaleString("en-US")} · turn=${formatMicroUsd(turnRes.turnCostMicro)}${savedTag}`)}\n`,
+  while (true) {
+    const action = await readInteractiveComposerLine({
+      getState: () => {
+        const sysPrompt = buildSystemPrompt(agent.config.cwd, agent.config.mode);
+        const usedCtx = estimateConversationTokens(sysPrompt, agent.session.messages);
+        const modelInfo = agent.getActiveModelInfo();
+        const maxCtx = modelInfo?.contextWindow ?? 128_000;
+        const totalPrompt = agent.session.totalInputTokens + agent.session.totalCacheReadTokens;
+        const cacheHitPct =
+          totalPrompt > 0
+            ? Math.round((agent.session.totalCacheReadTokens / totalPrompt) * 100)
+            : 0;
+        return {
+          mode: agent.config.mode,
+          model: agent.config.model,
+          effort: agent.config.reasoningEffort,
+          wire: agent.config.wire,
+          usedContextTokens: usedCtx,
+          maxContextTokens: maxCtx,
+          cacheHitPct,
+          sessionCostMicro: BigInt(agent.session.totalCostMicro || "0"),
+          balanceMicro: keyStatus?.balanceMicro ?? null,
+          gitBranch,
+          workspaceFiles,
+        };
+      },
+      onHotkeyChange: (next) => {
+        agent.config.mode = next.mode;
+        agent.config.reasoningEffort = next.effort;
+        agent.config.wire = next.wire;
+        agent.session.wire = next.wire;
+        saveUserConfig(
+          {
+            mode: next.mode,
+            reasoningEffort: next.effort,
+            wire: next.wire,
+          },
+          agent.config.globalConfigPath,
         );
-      } catch (err) {
-        if (err && typeof (err as { formatUserAdvice?: unknown }).formatUserAdvice === "function") {
+      },
+      history,
+    });
+
+    if (action.type === "exit") {
+      stdout.write(`\n${c.slate("Session saved. Goodbye!")}\n`);
+      break;
+    }
+
+    if (action.type === "open_model_picker") {
+      const res = await handleSlashCommand("/model", agent, keyStatus, fetchFn, true);
+      stdout.write(res.output + "\n");
+      continue;
+    }
+
+    if (action.type === "open_status") {
+      const res = await handleSlashCommand("/status", agent, keyStatus, fetchFn, true);
+      if (res.updatedKeyStatus !== undefined) keyStatus = res.updatedKeyStatus;
+      stdout.write(res.output + "\n");
+      continue;
+    }
+
+    const line = action.line.trim();
+    if (!line) continue;
+    if (history[history.length - 1] !== line) {
+      history.push(line);
+    }
+
+    if (line.startsWith("!")) {
+      const shellCmd = line.slice(1).trim();
+      if (shellCmd) {
+        stdout.write(`${c.slate(`$ ${shellCmd}`)}\n`);
+        try {
+          const out = execSync(shellCmd, {
+            cwd: agent.config.cwd,
+            encoding: "utf8",
+            stdio: "pipe",
+          });
+          if (out) stdout.write(out.trimEnd() + "\n");
+        } catch (err) {
           stdout.write(
-            `\n${c.rose("✗")} ${c.bold((err as { formatUserAdvice(): string }).formatUserAdvice())}\n`,
-          );
-        } else {
-          stdout.write(
-            `\n${c.rose("✗")} ${err instanceof Error ? err.message : String(err)}\n`,
+            `${c.rose(`Command failed: ${err instanceof Error ? err.message : String(err)}`)}\n`,
           );
         }
-      } finally {
-        activeAbort = null;
+        gitBranch = getGitBranchLabel(agent.config.cwd);
       }
+      continue;
     }
-  } finally {
-    process.off("SIGINT", sigintHandler);
-    rl.close();
+
+    if (line.startsWith("/")) {
+      const res = await handleSlashCommand(line, agent, keyStatus, fetchFn, true);
+      if (res.updatedKeyStatus !== undefined) {
+        keyStatus = res.updatedKeyStatus;
+      }
+      stdout.write(res.output + "\n");
+      if (res.shouldExit) break;
+      continue;
+    }
+
+    // Run agent turn with Esc / Ctrl+C stream interruption listener
+    const abortCtrl = new AbortController();
+    emitKeypressEvents(stdin);
+    const wasRaw = stdin.isRaw;
+    if (stdin.isTTY) stdin.setRawMode(true);
+    stdin.resume();
+
+    const onStreamKey = (
+      _str: string | undefined,
+      key: { name?: string; ctrl?: boolean } | undefined,
+    ) => {
+      if (key?.name === "escape" || (key?.ctrl && key?.name === "c")) {
+        abortCtrl.abort();
+      }
+    };
+    stdin.on("keypress", onStreamKey);
+
+    onStartTurnSpinner?.(`Waiting for ${agent.config.model} (Esc to interrupt)...`);
+
+    try {
+      const turnRes = await agent.runUserPrompt(line, abortCtrl.signal);
+      onStopTurnSpinner?.();
+      workspaceFiles = walkWorkspaceFiles(agent.config.cwd);
+      gitBranch = getGitBranchLabel(agent.config.cwd);
+
+      const totalIn = turnRes.turnUsage.inputTokens + turnRes.turnUsage.cacheReadTokens;
+      const cachePct =
+        totalIn > 0 ? Math.round((turnRes.turnUsage.cacheReadTokens / totalIn) * 100) : 0;
+      const savedTag =
+        turnRes.turnCacheSavedMicro > 0n
+          ? ` · ${c.teal(`saved ${formatMicroUsd(turnRes.turnCacheSavedMicro)}`)}`
+          : "";
+
+      stdout.write(
+        `\n${c.slate(`  ↳ in=${turnRes.turnUsage.inputTokens.toLocaleString("en-US")} · cache=${turnRes.turnUsage.cacheReadTokens.toLocaleString("en-US")} (${cachePct}%) · out=${turnRes.turnUsage.outputTokens.toLocaleString("en-US")} · turn=${formatMicroUsd(turnRes.turnCostMicro)}${savedTag}`)}\n`,
+      );
+    } catch (err) {
+      onStopTurnSpinner?.();
+      if (abortCtrl.signal.aborted) {
+        stdout.write(`\n${c.amber("⚠ Generation interrupted by user (Esc).")}\n`);
+      } else if (
+        err &&
+        typeof (err as { formatUserAdvice?: unknown }).formatUserAdvice === "function"
+      ) {
+        stdout.write(
+          `\n${c.rose("✗")} ${c.bold((err as { formatUserAdvice(): string }).formatUserAdvice())}\n`,
+        );
+      } else {
+        stdout.write(
+          `\n${c.rose("✗")} ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+    } finally {
+      stdin.off("keypress", onStreamKey);
+      if (stdin.isTTY) stdin.setRawMode(Boolean(wasRaw));
+    }
   }
 }

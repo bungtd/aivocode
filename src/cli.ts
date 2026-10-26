@@ -29,6 +29,7 @@ import {
   TerminalSpinner,
 } from "./ui/theme.js";
 import { renderUnifiedDiff } from "./ui/markdown.js";
+import { interactiveConfirmBar } from "./ui/composer.js";
 
 export type CliCommand =
   | "repl"
@@ -440,19 +441,12 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       },
       confirmAction: async (description) => {
         turnSpinner.stop();
-        const rlConfirm = createInterface({ input: stdin, output: stdout });
-        try {
-          const ans = (
-            await rlConfirm.question(
-              `\n${c.amber("?")} Allow ${c.bold(description)}? ${c.slate("[y/N]")} `,
-            )
-          )
-            .trim()
-            .toLowerCase();
-          return ans === "y" || ans === "yes";
-        } finally {
-          rlConfirm.close();
+        const decision = await interactiveConfirmBar(description);
+        if (decision === "always") {
+          agent.config.mode = "auto";
+          return true;
         }
+        return decision === "yes";
       },
     },
   });
@@ -488,6 +482,12 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     return 0;
   }
 
-  await startInteractiveRepl(agent, keyStatus, fetchFn);
+  await startInteractiveRepl(
+    agent,
+    keyStatus,
+    fetchFn,
+    (label) => turnSpinner.start(label),
+    () => turnSpinner.stop(),
+  );
   return 0;
 }
