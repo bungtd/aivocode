@@ -9,6 +9,7 @@ export const DEFAULT_MODEL = "deepseek-v4-flash";
 export type AivoWire = "chat" | "messages" | "responses";
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "off";
 export type PermissionMode = "auto" | "safe" | "plan";
+export type ExecutionStrategy = "auto" | "subagent-driven" | "native" | "ask";
 
 export const VALID_WIRES = new Set<AivoWire>(["chat", "messages", "responses"]);
 export const VALID_EFFORTS = new Set<ReasoningEffort>([
@@ -21,6 +22,12 @@ export const VALID_EFFORTS = new Set<ReasoningEffort>([
   "off",
 ]);
 export const VALID_MODES = new Set<PermissionMode>(["auto", "safe", "plan"]);
+export const VALID_STRATEGIES = new Set<ExecutionStrategy>([
+  "auto",
+  "subagent-driven",
+  "native",
+  "ask",
+]);
 export const VALID_TEAMS = new Set<TeamId>([
   "fullstack",
   "backend",
@@ -36,10 +43,16 @@ export interface UserConfigFile {
   baseUrl?: string;
   model?: string;
   fastModel?: string;
+  architectModel?: string;
+  builderModel?: string;
+  reviewerModel?: string;
   wire?: AivoWire;
   reasoningEffort?: ReasoningEffort;
+  subagentEffort?: ReasoningEffort;
   mode?: PermissionMode;
   team?: TeamId;
+  strategy?: ExecutionStrategy;
+  autoReviewFix?: boolean;
   webSearch?: boolean;
 }
 
@@ -48,10 +61,16 @@ export interface AivoConfig {
   baseUrl: string;
   model: string;
   fastModel: string | null;
+  architectModel?: string | null;
+  builderModel?: string | null;
+  reviewerModel?: string | null;
   wire: AivoWire;
   reasoningEffort: ReasoningEffort;
+  subagentEffort?: ReasoningEffort;
   mode: PermissionMode;
   team?: TeamId;
+  strategy?: ExecutionStrategy;
+  autoReviewFix?: boolean;
   webSearch: boolean;
   cwd: string;
   globalConfigPath: string;
@@ -186,17 +205,35 @@ export function loadUserConfig(path: string = defaultGlobalConfigPath()): UserCo
     if (typeof raw.fastModel === "string" && raw.fastModel.trim()) {
       cfg.fastModel = normalizeModelId(raw.fastModel);
     }
+    if (typeof raw.architectModel === "string" && raw.architectModel.trim()) {
+      cfg.architectModel = normalizeModelId(raw.architectModel);
+    }
+    if (typeof raw.builderModel === "string" && raw.builderModel.trim()) {
+      cfg.builderModel = normalizeModelId(raw.builderModel);
+    }
+    if (typeof raw.reviewerModel === "string" && raw.reviewerModel.trim()) {
+      cfg.reviewerModel = normalizeModelId(raw.reviewerModel);
+    }
     if (typeof raw.wire === "string" && VALID_WIRES.has(raw.wire as AivoWire)) {
       cfg.wire = raw.wire as AivoWire;
     }
     if (typeof raw.reasoningEffort === "string" && VALID_EFFORTS.has(raw.reasoningEffort as ReasoningEffort)) {
       cfg.reasoningEffort = raw.reasoningEffort as ReasoningEffort;
     }
+    if (typeof raw.subagentEffort === "string" && VALID_EFFORTS.has(raw.subagentEffort as ReasoningEffort)) {
+      cfg.subagentEffort = raw.subagentEffort as ReasoningEffort;
+    }
     if (typeof raw.mode === "string" && VALID_MODES.has(raw.mode as PermissionMode)) {
       cfg.mode = raw.mode as PermissionMode;
     }
     if (typeof raw.team === "string" && VALID_TEAMS.has(raw.team as TeamId)) {
       cfg.team = raw.team as TeamId;
+    }
+    if (typeof raw.strategy === "string" && VALID_STRATEGIES.has(raw.strategy as ExecutionStrategy)) {
+      cfg.strategy = raw.strategy as ExecutionStrategy;
+    }
+    if (typeof raw.autoReviewFix === "boolean") {
+      cfg.autoReviewFix = raw.autoReviewFix;
     }
     if (typeof raw.webSearch === "boolean") {
       cfg.webSearch = raw.webSearch;
@@ -219,6 +256,9 @@ export function saveUserConfig(
   if (merged.baseUrl) merged.baseUrl = normalizeGatewayOrigin(merged.baseUrl);
   if (merged.model) merged.model = normalizeModelId(merged.model);
   if (merged.fastModel) merged.fastModel = normalizeModelId(merged.fastModel);
+  if (merged.architectModel) merged.architectModel = normalizeModelId(merged.architectModel);
+  if (merged.builderModel) merged.builderModel = normalizeModelId(merged.builderModel);
+  if (merged.reviewerModel) merged.reviewerModel = normalizeModelId(merged.reviewerModel);
 
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(merged, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
@@ -266,8 +306,30 @@ export function resolveConfig(opts: ResolveConfigOptions = {}): AivoConfig {
   const rawFastModel =
     cli.fastModel ??
     env.AIVOKEY_FAST_MODEL ??
+    env.AIVOKEY_SUBAGENT_MODEL ??
     workspaceCfg.fastModel ??
     globalCfg.fastModel ??
+    null;
+
+  const rawArchitectModel =
+    cli.architectModel ??
+    env.AIVOKEY_ARCHITECT_MODEL ??
+    workspaceCfg.architectModel ??
+    globalCfg.architectModel ??
+    null;
+
+  const rawBuilderModel =
+    cli.builderModel ??
+    env.AIVOKEY_BUILDER_MODEL ??
+    workspaceCfg.builderModel ??
+    globalCfg.builderModel ??
+    null;
+
+  const rawReviewerModel =
+    cli.reviewerModel ??
+    env.AIVOKEY_REVIEWER_MODEL ??
+    workspaceCfg.reviewerModel ??
+    globalCfg.reviewerModel ??
     null;
 
   const rawWire = (
@@ -286,6 +348,14 @@ export function resolveConfig(opts: ResolveConfigOptions = {}): AivoConfig {
     "off"
   ) as ReasoningEffort;
 
+  const rawSubagentEffort = (
+    cli.subagentEffort ??
+    env.AIVOKEY_SUBAGENT_EFFORT ??
+    workspaceCfg.subagentEffort ??
+    globalCfg.subagentEffort ??
+    "low"
+  ) as ReasoningEffort;
+
   const rawMode = (
     cli.mode ??
     env.AIVOKEY_MODE ??
@@ -300,6 +370,20 @@ export function resolveConfig(opts: ResolveConfigOptions = {}): AivoConfig {
     workspaceCfg.team ??
     globalCfg.team
   ) as TeamId | undefined;
+
+  const rawStrategy = (
+    cli.strategy ??
+    env.AIVOKEY_STRATEGY ??
+    workspaceCfg.strategy ??
+    globalCfg.strategy ??
+    "auto"
+  ) as ExecutionStrategy;
+
+  const autoReviewFix =
+    cli.autoReviewFix ??
+    workspaceCfg.autoReviewFix ??
+    globalCfg.autoReviewFix ??
+    true;
 
   const webSearch =
     cli.webSearch ??
@@ -317,10 +401,16 @@ export function resolveConfig(opts: ResolveConfigOptions = {}): AivoConfig {
     baseUrl: normalizeGatewayOrigin(rawBaseUrl),
     model: normalizeModelId(rawModel),
     fastModel: rawFastModel ? normalizeModelId(rawFastModel) : null,
+    architectModel: rawArchitectModel ? normalizeModelId(rawArchitectModel) : null,
+    builderModel: rawBuilderModel ? normalizeModelId(rawBuilderModel) : null,
+    reviewerModel: rawReviewerModel ? normalizeModelId(rawReviewerModel) : null,
     wire: VALID_WIRES.has(rawWire) ? rawWire : "chat",
     reasoningEffort: VALID_EFFORTS.has(rawEffort) ? rawEffort : "off",
+    subagentEffort: VALID_EFFORTS.has(rawSubagentEffort) ? rawSubagentEffort : "low",
     mode: VALID_MODES.has(rawMode) ? rawMode : "auto",
     ...(rawTeam && VALID_TEAMS.has(rawTeam) ? { team: rawTeam } : {}),
+    strategy: VALID_STRATEGIES.has(rawStrategy) ? rawStrategy : "auto",
+    autoReviewFix,
     webSearch,
     cwd,
     globalConfigPath,

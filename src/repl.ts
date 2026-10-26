@@ -5,12 +5,15 @@ import { execSync } from "node:child_process";
 import {
   maskApiKey,
   matchCatalogModelId,
+  normalizeGatewayOrigin,
   saveUserConfig,
   VALID_EFFORTS,
   VALID_MODES,
+  VALID_STRATEGIES,
   VALID_TEAMS,
   VALID_WIRES,
   type AivoWire,
+  type ExecutionStrategy,
   type PermissionMode,
   type ReasoningEffort,
 } from "./config.js";
@@ -20,6 +23,7 @@ import { executeComputerUse } from "./computer-use.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { relative } from "node:path";
 import {
+  DEFAULT_AIVOKEY_CATALOG,
   fetchModels,
   formatKeyStatusSummary,
   formatMicroUsd,
@@ -206,17 +210,19 @@ export async function handleSlashCommand(
       };
 
     case "/model": {
+      const availableCatalog =
+        agent.catalog.length > 0 ? agent.catalog : DEFAULT_AIVOKEY_CATALOG;
       let chosenId = arg
         ? matchCatalogModelId(
             arg,
-            agent.catalog.map((m) => m.id),
+            availableCatalog.map((m) => m.id),
           )
         : "";
-      if (!chosenId && interactive && agent.catalog.length > 0) {
+      if (!chosenId && interactive) {
         const picked = await interactiveSelect({
-          title: "Select Active AivoKey Model",
+          title: "Select Active Primary Model",
           initialValue: agent.config.model,
-          items: agent.catalog.map((m) => {
+          items: availableCatalog.map((m) => {
             const inUsd = (Number(m.inputMicroPer1M) / 1_000_000).toFixed(2);
             const outUsd = (Number(m.outputMicroPer1M) / 1_000_000).toFixed(2);
             const badges: string[] = [];
@@ -241,11 +247,11 @@ export async function handleSlashCommand(
 
       if (!chosenId) {
         return {
-          output: `Current model: ${c.emerald(c.bold(agent.config.model))}. Usage: ${c.cyan("/model <canonical-id>")}`,
+          output: `Current primary model: ${c.emerald(c.bold(agent.config.model))}. Usage: ${c.cyan("/model <canonical-id>")}`,
         };
       }
 
-      const found = agent.catalog.find((m) => m.id === chosenId);
+      const found = availableCatalog.find((m) => m.id === chosenId);
       const warnings: string[] = [];
       if (found && !found.supportsTools) {
         warnings.push(
@@ -266,8 +272,337 @@ export async function handleSlashCommand(
       saveUserConfig({ model: chosenId }, agent.config.globalConfigPath);
       return {
         output: [
-          `${c.emerald("✓")} Switched active model to ${c.bold(c.emerald(chosenId))}`,
+          `${c.emerald("✓")} Switched active primary model to ${c.bold(c.emerald(chosenId))}`,
           ...warnings,
+        ].join("\n"),
+      };
+    }
+
+    case "/subagent":
+    case "/subagent-model":
+    case "/fast-model": {
+      const availableCatalog =
+        agent.catalog.length > 0 ? agent.catalog : DEFAULT_AIVOKEY_CATALOG;
+      const catalogIds = availableCatalog.map((m) => m.id);
+      const tokens = arg.split(/\s+/).filter(Boolean);
+
+      type SubRole = "explore" | "architect" | "builder" | "reviewer" | "all";
+      const roleKeywords = new Set<SubRole>(["explore", "architect", "builder", "reviewer", "all"]);
+
+      let roleTarget: SubRole = "explore";
+      let rawModelArg = "";
+
+      if (tokens.length === 1) {
+        if (roleKeywords.has(tokens[0]!.toLowerCase() as SubRole)) {
+          roleTarget = tokens[0]!.toLowerCase() as SubRole;
+        } else {
+          rawModelArg = tokens[0]!;
+        }
+      } else if (tokens.length >= 2) {
+        const firstTok = tokens[0]!.toLowerCase() as SubRole;
+        if (roleKeywords.has(firstTok)) {
+          roleTarget = firstTok;
+          rawModelArg = tokens.slice(1).join(" ");
+        } else {
+          rawModelArg = tokens.join(" ");
+        }
+      }
+
+      if (!rawModelArg && interactive) {
+        if (tokens.length === 0) {
+          const pickedRole = await interactiveSelect<SubRole>({
+            title: "Select Subagent / Role to Configure",
+            initialValue: "explore",
+            items: [
+              {
+                value: "explore",
+                label: "Explore / Fast Subagent",
+                badge: `[current: ${agent.config.fastModel ?? agent.config.model}]`,
+                detail: "Used by fast read-only explore subagents",
+              },
+              {
+                value: "architect",
+                label: "Architect Role",
+                badge: `[current: ${agent.config.architectModel ?? agent.config.model}]`,
+                detail: "Used by Team Stage 1 (System / UX / 3D / Mobile Architect)",
+              },
+              {
+                value: "builder",
+                label: "Builder / Implementer Role",
+                badge: `[current: ${agent.config.builderModel ?? agent.config.model}]`,
+                detail: "Used by Team Stage 2 (Backend / Frontend / Kotlin / BPY / Gameplay Builder)",
+              },
+              {
+                value: "reviewer",
+                label: "QA & Reviewer Role",
+                badge: `[current: ${agent.config.reviewerModel ?? agent.config.model}]`,
+                detail: "Used by Team Stage 3/4 (Security / A11y / QA / Anti-Slop Reviewer)",
+              },
+              {
+                value: "all",
+                label: "All Subagent Roles",
+                badge: "[sync all]",
+                detail: "Set the same model for Explore, Architect, Builder, and Reviewer",
+              },
+            ],
+          });
+          if (!pickedRole) return { output: c.slate("Subagent configuration cancelled.") };
+          roleTarget = pickedRole;
+        }
+
+        const pickedModel = await interactiveSelect({
+          title: `Select Model for ${roleTarget.toUpperCase()} Subagent`,
+          initialValue: agent.config.fastModel ?? agent.config.model,
+          items: availableCatalog.map((m) => {
+            const inUsd = (Number(m.inputMicroPer1M) / 1_000_000).toFixed(2);
+            const outUsd = (Number(m.outputMicroPer1M) / 1_000_000).toFixed(2);
+            return {
+              value: m.id,
+              label: m.id,
+              badge: `[${formatCompactTokens(m.contextWindow)} ctx]`,
+              detail: `$${inUsd}/$${outUsd} per 1M`,
+            };
+          }),
+        });
+        if (!pickedModel) return { output: c.slate("Subagent model selection cancelled.") };
+        rawModelArg = pickedModel;
+      }
+
+      if (!rawModelArg) {
+        return {
+          output: [
+            `${c.cyan("◆")} ${c.bold("Current Subagent & Role Models:")}`,
+            `  • ${c.bold("explore  ")} (Fast Subagent) : ${c.emerald(agent.config.fastModel ?? `${agent.config.model} (inherited)`)}`,
+            `  • ${c.bold("architect")} (Stage 1 Design): ${c.emerald(agent.config.architectModel ?? `${agent.config.model} (inherited)`)}`,
+            `  • ${c.bold("builder  ")} (Stage 2 Code)  : ${c.emerald(agent.config.builderModel ?? `${agent.config.model} (inherited)`)}`,
+            `  • ${c.bold("reviewer ")} (Stage 3/4 QA)  : ${c.emerald(agent.config.reviewerModel ?? `${agent.config.model} (inherited)`)}`,
+            `  • ${c.bold("effort   ")} (Subagent)      : ${c.violet(agent.config.subagentEffort ?? "low")}`,
+            "",
+            `Usage: ${c.cyan("/subagent <model-id>")} or ${c.cyan("/subagent <explore|architect|builder|reviewer|all> <model-id>")}`,
+          ].join("\n"),
+        };
+      }
+
+      const resolvedModel = matchCatalogModelId(rawModelArg, catalogIds);
+      if (roleTarget === "explore") {
+        agent.config.fastModel = resolvedModel;
+        saveUserConfig({ fastModel: resolvedModel }, agent.config.globalConfigPath);
+      } else if (roleTarget === "architect") {
+        agent.config.architectModel = resolvedModel;
+        saveUserConfig({ architectModel: resolvedModel }, agent.config.globalConfigPath);
+      } else if (roleTarget === "builder") {
+        agent.config.builderModel = resolvedModel;
+        saveUserConfig({ builderModel: resolvedModel }, agent.config.globalConfigPath);
+      } else if (roleTarget === "reviewer") {
+        agent.config.reviewerModel = resolvedModel;
+        saveUserConfig({ reviewerModel: resolvedModel }, agent.config.globalConfigPath);
+      } else if (roleTarget === "all") {
+        agent.config.fastModel = resolvedModel;
+        agent.config.architectModel = resolvedModel;
+        agent.config.builderModel = resolvedModel;
+        agent.config.reviewerModel = resolvedModel;
+        saveUserConfig(
+          {
+            fastModel: resolvedModel,
+            architectModel: resolvedModel,
+            builderModel: resolvedModel,
+            reviewerModel: resolvedModel,
+          },
+          agent.config.globalConfigPath,
+        );
+      }
+
+      return {
+        output: `${c.emerald("✓")} Set ${c.bold(roleTarget)} subagent model to ${c.bold(c.emerald(resolvedModel))}`,
+      };
+    }
+
+    case "/strategy": {
+      let strat = arg.toLowerCase() as ExecutionStrategy;
+      if (!arg && interactive) {
+        const picked = await interactiveSelect<ExecutionStrategy>({
+          title: "Select Execution Strategy",
+          initialValue: agent.config.strategy ?? "auto",
+          items: [
+            {
+              value: "auto",
+              label: "auto",
+              detail: "Automatically detect team, seed live tasks, and run build + Review-Fix gate",
+            },
+            {
+              value: "subagent-driven",
+              label: "subagent-driven",
+              detail: "Always run multi-stage specialist workflow (Architect → Builder → QA Reviewer)",
+            },
+            {
+              value: "native",
+              label: "native",
+              detail: "Always run fast single-session build + automated Review-Fix gate",
+            },
+            {
+              value: "ask",
+              label: "ask",
+              detail: "Prompt me to choose Subagent-Driven vs Native before substantial builds",
+            },
+          ],
+        });
+        if (!picked) return { output: c.slate("Strategy selection cancelled.") };
+        strat = picked;
+      }
+      if (!VALID_STRATEGIES.has(strat)) {
+        return {
+          output: `Current strategy: ${c.cyan(agent.config.strategy ?? "auto")}. Valid strategies: auto, subagent-driven, native, ask`,
+        };
+      }
+      agent.config.strategy = strat;
+      saveUserConfig({ strategy: strat }, agent.config.globalConfigPath);
+      return {
+        output: `${c.emerald("✓")} Execution strategy set to: ${c.bold(c.cyan(strat))}`,
+      };
+    }
+
+    case "/config":
+    case "/settings": {
+      const tokens = arg.split(/\s+/).filter(Boolean);
+      if (tokens.length >= 2) {
+        const keyName = tokens[0]!;
+        const val = tokens.slice(1).join(" ").trim();
+        const availableIds = (
+          agent.catalog.length > 0 ? agent.catalog : DEFAULT_AIVOKEY_CATALOG
+        ).map((m) => m.id);
+
+        switch (keyName) {
+          case "model": {
+            const m = matchCatalogModelId(val, availableIds);
+            agent.config.model = m;
+            agent.session.model = m;
+            saveUserConfig({ model: m }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.model = ${c.bold(c.emerald(m))}` };
+          }
+          case "fastModel":
+          case "subagentModel": {
+            const m = matchCatalogModelId(val, availableIds);
+            agent.config.fastModel = m;
+            saveUserConfig({ fastModel: m }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.fastModel = ${c.bold(c.emerald(m))}` };
+          }
+          case "architectModel": {
+            const m = matchCatalogModelId(val, availableIds);
+            agent.config.architectModel = m;
+            saveUserConfig({ architectModel: m }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.architectModel = ${c.bold(c.emerald(m))}` };
+          }
+          case "builderModel": {
+            const m = matchCatalogModelId(val, availableIds);
+            agent.config.builderModel = m;
+            saveUserConfig({ builderModel: m }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.builderModel = ${c.bold(c.emerald(m))}` };
+          }
+          case "reviewerModel": {
+            const m = matchCatalogModelId(val, availableIds);
+            agent.config.reviewerModel = m;
+            saveUserConfig({ reviewerModel: m }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.reviewerModel = ${c.bold(c.emerald(m))}` };
+          }
+          case "reasoningEffort":
+          case "effort": {
+            if (!VALID_EFFORTS.has(val as ReasoningEffort)) {
+              return { output: c.rose(`Invalid effort '${val}'. Valid: ${[...VALID_EFFORTS].join(", ")}`) };
+            }
+            agent.config.reasoningEffort = val as ReasoningEffort;
+            saveUserConfig({ reasoningEffort: val as ReasoningEffort }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.reasoningEffort = ${c.bold(c.violet(val))}` };
+          }
+          case "subagentEffort": {
+            if (!VALID_EFFORTS.has(val as ReasoningEffort)) {
+              return { output: c.rose(`Invalid effort '${val}'. Valid: ${[...VALID_EFFORTS].join(", ")}`) };
+            }
+            agent.config.subagentEffort = val as ReasoningEffort;
+            saveUserConfig({ subagentEffort: val as ReasoningEffort }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.subagentEffort = ${c.bold(c.violet(val))}` };
+          }
+          case "strategy": {
+            if (!VALID_STRATEGIES.has(val as ExecutionStrategy)) {
+              return { output: c.rose(`Invalid strategy '${val}'. Valid: auto, subagent-driven, native, ask`) };
+            }
+            agent.config.strategy = val as ExecutionStrategy;
+            saveUserConfig({ strategy: val as ExecutionStrategy }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.strategy = ${c.bold(c.cyan(val))}` };
+          }
+          case "team": {
+            if (!VALID_TEAMS.has(val as TeamId)) {
+              return { output: c.rose(`Invalid team '${val}'. Valid: ${[...VALID_TEAMS].join(", ")}`) };
+            }
+            agent.config.team = val as TeamId;
+            saveUserConfig({ team: val as TeamId }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.team = ${c.bold(c.amber(val))}` };
+          }
+          case "mode": {
+            if (!VALID_MODES.has(val as PermissionMode)) {
+              return { output: c.rose(`Invalid mode '${val}'. Valid: auto, plan, safe`) };
+            }
+            agent.config.mode = val as PermissionMode;
+            saveUserConfig({ mode: val as PermissionMode }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.mode = ${c.bold(c.amber(val))}` };
+          }
+          case "wire": {
+            if (!VALID_WIRES.has(val as AivoWire)) {
+              return { output: c.rose(`Invalid wire '${val}'. Valid: chat, messages, responses`) };
+            }
+            agent.config.wire = val as AivoWire;
+            agent.session.wire = val as AivoWire;
+            saveUserConfig({ wire: val as AivoWire }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.wire = ${c.bold(c.cyan(val))}` };
+          }
+          case "autoReviewFix": {
+            const b = val === "true" || val === "on" || val === "1";
+            agent.config.autoReviewFix = b;
+            saveUserConfig({ autoReviewFix: b }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.autoReviewFix = ${b}` };
+          }
+          case "baseUrl": {
+            const norm = normalizeGatewayOrigin(val);
+            agent.config.baseUrl = norm;
+            saveUserConfig({ baseUrl: norm }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.baseUrl = ${norm}` };
+          }
+          case "apiKey": {
+            agent.config.apiKey = val;
+            saveUserConfig({ apiKey: val }, agent.config.globalConfigPath);
+            return { output: `${c.emerald("✓")} Set config.apiKey = ${maskApiKey(val)}` };
+          }
+          default:
+            return { output: c.amber(`Unknown config key '${keyName}'.`) };
+        }
+      }
+
+      const cfg = agent.config;
+      return {
+        output: [
+          `${c.cyan("╭─")} ${c.bold("AivoCode Configuration & Subagent Routing")} ${c.cyan("─".repeat(31))}`,
+          `${c.cyan("│")} ${c.slate("Config File     :")} ${c.white(cfg.globalConfigPath)}`,
+          `${c.cyan("│")} ${c.slate("Gateway Base URL:")} ${c.white(cfg.baseUrl)} · Key: ${c.white(maskApiKey(cfg.apiKey))}`,
+          `${c.cyan("├" + "─".repeat(74))}`,
+          `${c.cyan("│")} ${c.bold("Models & Subagents:")}`,
+          `${c.cyan("│")}   • ${c.bold("model          ")} (Primary Agent)   : ${c.emerald(c.bold(cfg.model))}`,
+          `${c.cyan("│")}   • ${c.bold("fastModel      ")} (Explore Subagent): ${c.teal(cfg.fastModel ?? `${cfg.model} (inherited)`)}`,
+          `${c.cyan("│")}   • ${c.bold("architectModel ")} (Stage 1 Design)  : ${c.teal(cfg.architectModel ?? `${cfg.model} (inherited)`)}`,
+          `${c.cyan("│")}   • ${c.bold("builderModel   ")} (Stage 2 Builder) : ${c.teal(cfg.builderModel ?? `${cfg.model} (inherited)`)}`,
+          `${c.cyan("│")}   • ${c.bold("reviewerModel  ")} (Stage 3/4 QA)    : ${c.teal(cfg.reviewerModel ?? `${cfg.model} (inherited)`)}`,
+          `${c.cyan("├" + "─".repeat(74))}`,
+          `${c.cyan("│")} ${c.bold("Execution & Behavior:")}`,
+          `${c.cyan("│")}   • ${c.bold("strategy       ")} (Workflow Mode)   : ${c.cyan(cfg.strategy ?? "auto")} ${c.slate("(auto | subagent-driven | native | ask)")}`,
+          `${c.cyan("│")}   • ${c.bold("team           ")} (Specialist Team) : ${c.amber(cfg.team ?? "fullstack")}`,
+          `${c.cyan("│")}   • ${c.bold("mode           ")} (Permissions)     : ${c.amber(cfg.mode)} ${c.slate("(auto | plan | safe)")}`,
+          `${c.cyan("│")}   • ${c.bold("wire           ")} (Protocol Wire)   : ${c.cyan(cfg.wire)} ${c.slate("(chat | messages | responses)")}`,
+          `${c.cyan("│")}   • ${c.bold("reasoningEffort")} (Primary Effort)  : ${c.violet(cfg.reasoningEffort)}`,
+          `${c.cyan("│")}   • ${c.bold("subagentEffort ")} (Subagent Effort) : ${c.violet(cfg.subagentEffort ?? "low")}`,
+          `${c.cyan("│")}   • ${c.bold("autoReviewFix  ")} (Review-Fix Gate) : ${cfg.autoReviewFix !== false ? c.emerald("true") : c.slate("false")}`,
+          `${c.cyan("├" + "─".repeat(74))}`,
+          `${c.cyan("│")} ${c.slate("Quick Commands:")}`,
+          `${c.cyan("│")}   ${c.cyan("/model <id>")} · ${c.cyan("/subagent <explore|architect|builder|reviewer|all> <id>")}`,
+          `${c.cyan("│")}   ${c.cyan("/strategy <auto|subagent-driven|native|ask>")} · ${c.cyan("/config <key> <value>")}`,
+          `${c.cyan("╰" + "─".repeat(74))}`,
         ].join("\n"),
       };
     }

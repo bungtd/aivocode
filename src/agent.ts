@@ -226,20 +226,27 @@ export class AivoAgent {
         );
       },
       executeStageAgent: async (_stage, role, stagePrompt) => {
-        const stageModel =
-          role.preferredTier === "fast" && this.config.fastModel
-            ? this.config.fastModel
-            : this.config.model;
+        let stageModel = this.config.model;
+        if (role.badge === "ARCH" || role.id.includes("architect") || role.id.includes("director") || role.id.includes("designer")) {
+          stageModel = this.config.architectModel || this.config.model;
+        } else if (role.badge === "QA" || role.badge === "SEC" || role.badge === "A11Y" || role.badge === "3D-QA" || role.id.includes("reviewer") || role.id.includes("auditor") || role.id.includes("validator") || role.id.includes("qa")) {
+          stageModel = this.config.reviewerModel || this.config.model;
+        } else if (role.preferredTier === "fast") {
+          stageModel = this.config.fastModel || this.config.model;
+        } else {
+          stageModel = this.config.builderModel || this.config.model;
+        }
+
+        const stageEffort =
+          this.config.subagentEffort ??
+          (this.config.reasoningEffort === "off" ? "off" : role.preferredEffort);
 
         const stageAgent = new AivoAgent({
           config: {
             ...this.config,
             model: stageModel,
             team: team.id,
-            reasoningEffort:
-              this.config.reasoningEffort === "off"
-                ? "off"
-                : role.preferredEffort,
+            reasoningEffort: stageEffort,
           },
           catalog: this.catalog,
           sessionStore: this.sessionStore,
@@ -267,31 +274,41 @@ export class AivoAgent {
     // 1. Strategy Selection & Initial Live Task Seeding for substantial builds
     if (this.allowSubagents && !this.readOnlyOnly) {
       const strategy = classifyTaskStrategy(rawPrompt, this.config.cwd);
-      if (strategy.isSubstantialBuild) {
-        this.config.team = strategy.teamId;
+      const configuredStrat = this.config.strategy ?? "auto";
+
+      if (strategy.isSubstantialBuild || configuredStrat === "subagent-driven") {
+        if (!this.config.team) {
+          this.config.team = strategy.teamId;
+        }
         if (this.todos.length === 0 && strategy.autoTodos.length > 0) {
           this.todos.push(...strategy.autoTodos);
           this.callbacks.onTodoUpdate?.(this.todos);
         }
 
         let chosenStrategy: "subagent-driven" | "native" = "native";
-        if (this.config.mode === "safe" && this.callbacks.chooseStrategy) {
+        if (configuredStrat === "subagent-driven") {
+          chosenStrategy = "subagent-driven";
+        } else if (configuredStrat === "native") {
+          chosenStrategy = "native";
+        } else if (
+          (configuredStrat === "ask" || this.config.mode === "safe") &&
+          this.callbacks.chooseStrategy
+        ) {
           chosenStrategy = await this.callbacks.chooseStrategy({
             teamName: strategy.teamName,
             recommendedMode: strategy.recommendedMode,
           });
         } else {
-          // In AUTO mode, announce active specialist team & live task board automatically
           this.callbacks.onNotice?.(
-            `Active Team: ${strategy.teamName} [${strategy.teamId}] · Live Tasks initialized (${this.todos.length} stages)`,
+            `Active Team: ${strategy.teamName} [${this.config.team}] · Live Tasks initialized (${this.todos.length} stages)`,
           );
         }
 
-        if (chosenStrategy === "subagent-driven" && this.callbacks.chooseStrategy) {
-          const wfText = await this.executeTeamWorkflow(rawPrompt, strategy.teamId, signal);
+        if (chosenStrategy === "subagent-driven") {
+          const wfText = await this.executeTeamWorkflow(rawPrompt, this.config.team, signal);
           return {
             finalText: wfText,
-            steps: strategy.autoTodos.length,
+            steps: Math.max(1, strategy.autoTodos.length),
             turnUsage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
             turnCostMicro: 0n,
             turnCacheSavedMicro: 0n,
@@ -340,15 +357,16 @@ export class AivoAgent {
         ? async ({ agent, description, prompt }) => {
             this.callbacks.onNotice?.(`Spawning ${agent} subagent: ${description}`);
             const subModel =
-              agent === "explore" && this.config.fastModel
-                ? this.config.fastModel
-                : this.config.model;
-            const subEffort =
               agent === "explore"
+                ? (this.config.fastModel || this.config.model)
+                : (this.config.builderModel || this.config.model);
+            const subEffort =
+              this.config.subagentEffort ??
+              (agent === "explore"
                 ? this.config.reasoningEffort === "off"
                   ? "off"
                   : "low"
-                : this.config.reasoningEffort;
+                : this.config.reasoningEffort);
 
             const subAgent = new AivoAgent({
               config: {
@@ -479,7 +497,12 @@ export class AivoAgent {
       if (stepRes.toolCalls.length === 0) {
         // Automated Review & Fix Gate when files were modified in this turn
         const touched = this.checkpoints.listModifiedFiles();
-        if (touched.length > 0 && !reviewFixPassDone && !this.readOnlyOnly) {
+        if (
+          touched.length > 0 &&
+          !reviewFixPassDone &&
+          !this.readOnlyOnly &&
+          this.config.autoReviewFix !== false
+        ) {
           reviewFixPassDone = true;
           const verification = verifyWorkspaceArtifacts(this.config.cwd, touched);
           if (!verification.clean) {

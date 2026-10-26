@@ -4,6 +4,9 @@ import type { AivoWire, PermissionMode, ReasoningEffort } from "../config.js";
 import { c, padEndVisible, renderStatusBar, visibleLength } from "./theme.js";
 import { SLASH_COMMANDS } from "./select.js";
 
+import { DEFAULT_AIVOKEY_CATALOG } from "../aivokey-client.js";
+import { AGENT_TEAMS } from "../teams.js";
+
 export interface SuggestionItem {
   value: string;
   label: string;
@@ -11,7 +14,7 @@ export interface SuggestionItem {
 }
 
 export interface ComposerSuggestions {
-  kind: "none" | "slash" | "file";
+  kind: "none" | "slash" | "arg" | "file";
   query: string;
   items: SuggestionItem[];
 }
@@ -80,7 +83,13 @@ function fileCategoryTag(filePath: string): string {
 export function computeComposerSuggestions(
   buffer: string,
   workspaceFiles: string[],
+  catalogModelIds?: string[],
 ): ComposerSuggestions {
+  const modelIds =
+    catalogModelIds && catalogModelIds.length > 0
+      ? catalogModelIds
+      : DEFAULT_AIVOKEY_CATALOG.map((m) => m.id);
+
   // 1. Live `/` Command Palette when buffer starts with `/` and has no space yet
   if (buffer.startsWith("/") && !buffer.includes(" ")) {
     const q = buffer.slice(1).toLowerCase();
@@ -101,7 +110,183 @@ export function computeComposerSuggestions(
     };
   }
 
-  // 2. Live `@file` Fuzzy Finder when the active token starts with `@`
+  // 2. Live Slash Argument Autocomplete (`/model ...`, `/subagent ...`, `/team ...`, `/effort ...`, `/mode ...`, `/wire ...`, `/strategy ...`, `/config ...`)
+  if (buffer.startsWith("/") && buffer.includes(" ")) {
+    const firstSpace = buffer.indexOf(" ");
+    const cmd = buffer.slice(0, firstSpace).toLowerCase();
+    const argQuery = buffer.slice(firstSpace + 1).trim().toLowerCase();
+
+    if (cmd === "/model" || cmd === "/subagent" || cmd === "/fast-model" || cmd === "/subagent-model") {
+      const subParts = argQuery.split(/\s+/).filter(Boolean);
+      const roleKeywords = ["explore", "architect", "builder", "reviewer", "all"];
+      let prefixCmd = cmd;
+      let modelFilter = argQuery;
+      if (
+        (cmd === "/subagent" || cmd === "/subagent-model") &&
+        subParts.length >= 1 &&
+        roleKeywords.includes(subParts[0]!) &&
+        buffer.slice(firstSpace + 1).includes(" ")
+      ) {
+        prefixCmd = `${cmd} ${subParts[0]}`;
+        modelFilter = subParts.slice(1).join(" ");
+      }
+
+      const matchedModels = modelIds.filter((id) => !modelFilter || id.toLowerCase().includes(modelFilter));
+      const roleSuggestions: SuggestionItem[] =
+        (cmd === "/subagent" || cmd === "/subagent-model") && !buffer.slice(firstSpace + 1).trim().includes(" ")
+          ? roleKeywords
+              .filter((r) => !argQuery || r.startsWith(argQuery))
+              .map((r) => ({
+                value: `${cmd} ${r} `,
+                label: `${r} <model>`,
+                description: `Configure ${r} subagent role model`,
+              }))
+          : [];
+
+      const items: SuggestionItem[] = [
+        ...matchedModels.slice(0, 7).map((id) => ({
+          value: `${prefixCmd} ${id}`,
+          label: id,
+          description:
+            prefixCmd === "/model" ? "Switch primary model" : `Set ${prefixCmd.replace(/^\//, "")} model`,
+        })),
+        ...roleSuggestions,
+      ].slice(0, 8);
+
+      if (items.length > 0) {
+        return { kind: "arg", query: argQuery, items };
+      }
+    }
+
+    if (cmd === "/team" || cmd === "/agents") {
+      const matched = AGENT_TEAMS.filter(
+        (t) => !argQuery || t.id.includes(argQuery) || t.name.toLowerCase().includes(argQuery),
+      );
+      if (matched.length > 0) {
+        return {
+          kind: "arg",
+          query: argQuery,
+          items: matched.map((t) => ({
+            value: `/team ${t.id}`,
+            label: t.id,
+            description: `${t.name} [${t.roles.map((r) => r.badge).join("→")}]`,
+          })),
+        };
+      }
+    }
+
+    if (cmd === "/effort") {
+      const efforts: Array<{ id: string; desc: string }> = [
+        { id: "off", desc: "Fastest direct streaming (no thinking delay)" },
+        { id: "minimal", desc: "Minimal thinking tokens" },
+        { id: "low", desc: "Light reasoning for quick code edits" },
+        { id: "medium", desc: "Balanced reasoning for multi-file tasks" },
+        { id: "high", desc: "Deep architectural reasoning" },
+        { id: "xhigh", desc: "Extended reasoning for complex bugs" },
+        { id: "max", desc: "Maximum thinking budget" },
+      ];
+      const matched = efforts.filter((e) => !argQuery || e.id.includes(argQuery));
+      if (matched.length > 0) {
+        return {
+          kind: "arg",
+          query: argQuery,
+          items: matched.map((e) => ({
+            value: `/effort ${e.id}`,
+            label: e.id,
+            description: e.desc,
+          })),
+        };
+      }
+    }
+
+    if (cmd === "/mode") {
+      const modes = [
+        { id: "auto", desc: "Full autonomous coding agent (read, edit, write, shell)" },
+        { id: "plan", desc: "Read-only Architect Mode (explores & plans only)" },
+        { id: "safe", desc: "Confirm before every file edit or shell command" },
+      ].filter((m) => !argQuery || m.id.includes(argQuery));
+      if (modes.length > 0) {
+        return {
+          kind: "arg",
+          query: argQuery,
+          items: modes.map((m) => ({
+            value: `/mode ${m.id}`,
+            label: m.id,
+            description: m.desc,
+          })),
+        };
+      }
+    }
+
+    if (cmd === "/wire") {
+      const wires = [
+        { id: "chat", desc: "POST /v1/chat/completions (OpenAI Chat Completions)" },
+        { id: "messages", desc: "POST /v1/messages (Anthropic Messages + ephemeral cache)" },
+        { id: "responses", desc: "POST /v1/responses (OpenAI Responses wire)" },
+      ].filter((w) => !argQuery || w.id.includes(argQuery));
+      if (wires.length > 0) {
+        return {
+          kind: "arg",
+          query: argQuery,
+          items: wires.map((w) => ({
+            value: `/wire ${w.id}`,
+            label: w.id,
+            description: w.desc,
+          })),
+        };
+      }
+    }
+
+    if (cmd === "/strategy") {
+      const strategies = [
+        { id: "auto", desc: "Auto-detect strategy & specialist team from prompt" },
+        { id: "subagent-driven", desc: "Always run multi-stage Architect → Builder → QA team workflow" },
+        { id: "native", desc: "Always run fast single-session build + automated Review-Fix gate" },
+        { id: "ask", desc: "Ask me to choose Subagent-Driven vs Native before substantial builds" },
+      ].filter((s) => !argQuery || s.id.includes(argQuery));
+      if (strategies.length > 0) {
+        return {
+          kind: "arg",
+          query: argQuery,
+          items: strategies.map((s) => ({
+            value: `/strategy ${s.id}`,
+            label: s.id,
+            description: s.desc,
+          })),
+        };
+      }
+    }
+
+    if (cmd === "/config" || cmd === "/settings") {
+      const keys = [
+        { k: "model", desc: "Primary coding model" },
+        { k: "fastModel", desc: "Subagent / Explorer fast model" },
+        { k: "architectModel", desc: "Architect stage model" },
+        { k: "builderModel", desc: "Builder stage model" },
+        { k: "reviewerModel", desc: "QA Reviewer stage model" },
+        { k: "reasoningEffort", desc: "Primary reasoning effort (off..max)" },
+        { k: "subagentEffort", desc: "Subagent reasoning effort (off..max)" },
+        { k: "strategy", desc: "Execution strategy (auto|subagent-driven|native|ask)" },
+        { k: "team", desc: "Active specialist team" },
+        { k: "mode", desc: "Permission mode (auto|plan|safe)" },
+        { k: "wire", desc: "AivoKey wire protocol (chat|messages|responses)" },
+        { k: "autoReviewFix", desc: "Toggle automated Review & Fix gate (true|false)" },
+      ].filter((x) => !argQuery || x.k.toLowerCase().includes(argQuery));
+      if (keys.length > 0 && !argQuery.includes(" ")) {
+        return {
+          kind: "arg",
+          query: argQuery,
+          items: keys.map((x) => ({
+            value: `/config ${x.k} `,
+            label: x.k,
+            description: x.desc,
+          })),
+        };
+      }
+    }
+  }
+
+  // 3. Live `@file` Fuzzy Finder when the active token starts with `@`
   const atMatch = buffer.match(/(?:^|\s)@([^\s]*)$/);
   if (atMatch) {
     const query = atMatch[1] ?? "";
@@ -335,7 +520,7 @@ export async function readInteractiveComposerLine(opts: {
   const acceptSuggestion = (suggestions: ComposerSuggestions): boolean => {
     const chosen = suggestions.items[selectedSuggestionIdx];
     if (!chosen) return false;
-    if (suggestions.kind === "slash") {
+    if (suggestions.kind === "slash" || suggestions.kind === "arg") {
       buffer = chosen.value;
       cursorPos = buffer.length;
       selectedSuggestionIdx = 0;
@@ -527,11 +712,18 @@ export async function readInteractiveComposerLine(opts: {
           render();
           return;
         }
-        if (suggestions.kind === "slash" && suggestions.items.length > 0) {
+        if (
+          (suggestions.kind === "slash" || suggestions.kind === "arg") &&
+          suggestions.items.length > 0
+        ) {
           const chosen = suggestions.items[selectedSuggestionIdx];
           if (chosen && buffer.trim() !== chosen.value) {
             buffer = chosen.value;
             cursorPos = buffer.length;
+            if (chosen.value.endsWith(" ")) {
+              render();
+              return;
+            }
           }
         }
         const finalLine = buffer.trim();

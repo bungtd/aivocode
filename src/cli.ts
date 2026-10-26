@@ -39,6 +39,7 @@ export type CliCommand =
   | "run"
   | "workflow"
   | "teams"
+  | "config"
   | "models"
   | "status"
   | "doctor"
@@ -73,8 +74,16 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       explicitPrompt = argv[++i] ?? "";
     } else if (arg === "-m" || arg === "--model") {
       cliConfig.model = normalizeModelId(argv[++i]);
-    } else if (arg === "--fast-model") {
+    } else if (arg === "--fast-model" || arg === "--subagent-model") {
       cliConfig.fastModel = normalizeModelId(argv[++i]);
+    } else if (arg === "--architect-model") {
+      cliConfig.architectModel = normalizeModelId(argv[++i]);
+    } else if (arg === "--builder-model") {
+      cliConfig.builderModel = normalizeModelId(argv[++i]);
+    } else if (arg === "--reviewer-model") {
+      cliConfig.reviewerModel = normalizeModelId(argv[++i]);
+    } else if (arg === "--strategy") {
+      cliConfig.strategy = (argv[++i] ?? "auto") as UserConfigFile["strategy"];
     } else if (arg === "--wire") {
       cliConfig.wire = (argv[++i] ?? "chat") as AivoWire;
     } else if (arg === "--effort") {
@@ -149,6 +158,18 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     return {
       command: "teams",
       prompt: "",
+      filter: filterFlag,
+      sessionId,
+      continueLast,
+      mini,
+      json,
+      cliConfig,
+    };
+  }
+  if (first === "config" || first === "settings") {
+    return {
+      command: "config",
+      prompt: positionals.slice(1).join(" "),
       filter: filterFlag,
       sessionId,
       continueLast,
@@ -526,6 +547,20 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
 
   if (parsed.command === "status") {
     writeOut(formatDetailedStatus(agent, keyStatus));
+    return 0;
+  }
+
+  if (parsed.command === "config") {
+    const { handleSlashCommand } = await import("./repl.js");
+    const cleanArg = parsed.prompt.replace(/^set\s+/i, "").trim();
+    const res = await handleSlashCommand(
+      cleanArg ? `/config ${cleanArg}` : "/config",
+      agent,
+      keyStatus,
+      fetchFn,
+      false,
+    );
+    writeOut(res.output);
     return 0;
   }
 

@@ -1,11 +1,12 @@
 import { emitKeypressEvents } from "node:readline";
 import { stdin, stdout } from "node:process";
 import { execSync } from "node:child_process";
-import type { AivoWire, PermissionMode, ReasoningEffort } from "../config.js";
+import type { AivoWire, ExecutionStrategy, PermissionMode, ReasoningEffort } from "../config.js";
 import { saveUserConfig } from "../config.js";
 import { AGENT_TEAMS, getAgentTeam, type TeamId } from "../teams.js";
 import { SLASH_COMMANDS } from "./select.js";
 import {
+  DEFAULT_AIVOKEY_CATALOG,
   formatMicroUsd,
   type KeyInspectStatus,
 } from "../aivokey-client.js";
@@ -128,7 +129,11 @@ export async function startFullScreenTui(
       cursorPos,
       suggestions: modal
         ? { kind: "none", query: "", items: [] }
-        : computeComposerSuggestions(buffer, workspaceFiles),
+        : computeComposerSuggestions(
+            buffer,
+            workspaceFiles,
+            (agent.catalog.length > 0 ? agent.catalog : DEFAULT_AIVOKEY_CATALOG).map((m) => m.id),
+          ),
       selectedSuggestionIdx,
       modal,
       notice,
@@ -342,8 +347,13 @@ export async function startFullScreenTui(
     },
   };
 
-  const openModelModal = () => {
-    const items: ModalOption[] = agent.catalog.map((m) => {
+  let activeSubagentRoleTarget: "explore" | "architect" | "builder" | "reviewer" | "all" = "explore";
+
+  const getAvailableCatalog = () =>
+    agent.catalog.length > 0 ? agent.catalog : DEFAULT_AIVOKEY_CATALOG;
+
+  const buildModelModalItems = (): ModalOption[] =>
+    getAvailableCatalog().map((m) => {
       const inUsd = (Number(m.inputMicroPer1M) / 1_000_000).toFixed(2);
       const outUsd = (Number(m.outputMicroPer1M) / 1_000_000).toFixed(2);
       const badges: string[] = [];
@@ -357,16 +367,238 @@ export async function startFullScreenTui(
         detail: `${formatCompactTokens(m.contextWindow)} ctx · $${inUsd}/$${outUsd}`,
       };
     });
+
+  const openModelModal = () => {
+    const items = buildModelModalItems();
     const curIdx = Math.max(
       0,
       items.findIndex((i) => i.value === agent.config.model),
     );
     modal = {
       id: "model",
-      title: `Select Active AivoKey Model (${items.length} models)`,
+      title: `Select Primary AivoKey Model (${items.length} models · Ctrl+K)`,
       filter: "",
       selectedIdx: curIdx,
       items,
+    };
+    render();
+  };
+
+  const openSubagentModelModal = (
+    role: "explore" | "architect" | "builder" | "reviewer" | "all",
+  ) => {
+    activeSubagentRoleTarget = role;
+    const items = buildModelModalItems();
+    const curModel =
+      role === "architect"
+        ? (agent.config.architectModel ?? agent.config.model)
+        : role === "builder"
+          ? (agent.config.builderModel ?? agent.config.model)
+          : role === "reviewer"
+            ? (agent.config.reviewerModel ?? agent.config.model)
+            : (agent.config.fastModel ?? agent.config.model);
+    const curIdx = Math.max(
+      0,
+      items.findIndex((i) => i.value === curModel),
+    );
+    modal = {
+      id: "subagent_model",
+      title: `Select Model for ${role.toUpperCase()} Subagent`,
+      filter: "",
+      selectedIdx: curIdx,
+      items,
+    };
+    render();
+  };
+
+  const openSubagentEffortModal = () => {
+    const efforts: Array<{ value: ReasoningEffort; detail: string }> = [
+      { value: "off", detail: "No thinking delay on subagents" },
+      { value: "minimal", detail: "Very brief thinking" },
+      { value: "low", detail: "Light reasoning (recommended for fast subagents)" },
+      { value: "medium", detail: "Balanced reasoning" },
+      { value: "high", detail: "Deep reasoning for Architect/QA subagents" },
+      { value: "xhigh", detail: "Extended reasoning" },
+      { value: "max", detail: "Maximum thinking budget" },
+    ];
+    const cur = agent.config.subagentEffort ?? "low";
+    modal = {
+      id: "subagent_effort",
+      title: "Select Subagent Reasoning Effort",
+      filter: "",
+      selectedIdx: Math.max(0, efforts.findIndex((e) => e.value === cur)),
+      items: efforts.map((e) => ({ value: e.value, label: e.value, detail: e.detail })),
+    };
+    render();
+  };
+
+  const openSubagentRoleModal = () => {
+    const cfg = agent.config;
+    modal = {
+      id: "subagent_role",
+      title: "Configure Subagent & Specialist Role Models (Ctrl+G)",
+      filter: "",
+      selectedIdx: 0,
+      items: [
+        {
+          value: "explore",
+          label: "Explore / Fast Subagent",
+          badge: `[${cfg.fastModel ?? `${cfg.model} (inherit)`}]`,
+          detail: "Fast read-only codebase search subagent",
+        },
+        {
+          value: "architect",
+          label: "Architect Role (Stage 1)",
+          badge: `[${cfg.architectModel ?? `${cfg.model} (inherit)`}]`,
+          detail: "System, UX, Android, 3D & Game Systems Architect",
+        },
+        {
+          value: "builder",
+          label: "Builder Role (Stage 2)",
+          badge: `[${cfg.builderModel ?? `${cfg.model} (inherit)`}]`,
+          detail: "Backend, Frontend, Kotlin, Blender BPY & Gameplay Builder",
+        },
+        {
+          value: "reviewer",
+          label: "QA & Reviewer Role (Stage 3/4)",
+          badge: `[${cfg.reviewerModel ?? `${cfg.model} (inherit)`}]`,
+          detail: "Security, Accessibility, Anti-Slop & Test Reviewer",
+        },
+        {
+          value: "all",
+          label: "Set All Subagent Roles Together",
+          badge: "[sync all]",
+          detail: "Assign one model across Explore, Architect, Builder & Reviewer",
+        },
+        {
+          value: "effort",
+          label: "Subagent Reasoning Effort",
+          badge: `[${cfg.subagentEffort ?? "low"}]`,
+          detail: "Configure thinking effort used by child subagents",
+        },
+      ],
+    };
+    render();
+  };
+
+  const openStrategyConfigModal = () => {
+    const cur = agent.config.strategy ?? "auto";
+    const items: Array<{ value: ExecutionStrategy; detail: string }> = [
+      {
+        value: "auto",
+        label: "auto",
+        detail: "Auto-detect team, seed live tasks & run build + Review-Fix gate",
+      } as unknown as { value: ExecutionStrategy; detail: string },
+      {
+        value: "subagent-driven",
+        detail: "Always run multi-stage Architect → Builder → QA team workflow",
+      },
+      {
+        value: "native",
+        detail: "Always run fast single-session build + automated Review-Fix gate",
+      },
+      {
+        value: "ask",
+        detail: "Ask me to choose Subagent-Driven vs Native before substantial builds",
+      },
+    ];
+    modal = {
+      id: "strategy_config",
+      title: "Select Execution Strategy (/strategy)",
+      filter: "",
+      selectedIdx: Math.max(0, items.findIndex((i) => i.value === cur)),
+      items: items.map((i) => ({ value: i.value, label: i.value, detail: i.detail })),
+    };
+    render();
+  };
+
+  const openConfigModal = () => {
+    const cfg = agent.config;
+    modal = {
+      id: "config",
+      title: "AivoCode Settings & Configuration Center (/config · Ctrl+O)",
+      filter: "",
+      selectedIdx: 0,
+      items: [
+        {
+          value: "model",
+          label: "Primary Agent Model",
+          badge: `[${cfg.model}]`,
+          detail: "Main model for conversation & coding",
+        },
+        {
+          value: "subagent_explore",
+          label: "Explore Subagent Model",
+          badge: `[${cfg.fastModel ?? `${cfg.model} (inherit)`}]`,
+          detail: "Fast model for read-only explore subagents",
+        },
+        {
+          value: "subagent_architect",
+          label: "Architect Role Model",
+          badge: `[${cfg.architectModel ?? `${cfg.model} (inherit)`}]`,
+          detail: "Model for Stage 1 Architecture & Design",
+        },
+        {
+          value: "subagent_builder",
+          label: "Builder Role Model",
+          badge: `[${cfg.builderModel ?? `${cfg.model} (inherit)`}]`,
+          detail: "Model for Stage 2 Code Implementation",
+        },
+        {
+          value: "subagent_reviewer",
+          label: "QA Reviewer Role Model",
+          badge: `[${cfg.reviewerModel ?? `${cfg.model} (inherit)`}]`,
+          detail: "Model for Stage 3/4 QA, Security & Anti-Slop Review",
+        },
+        {
+          value: "subagent_all",
+          label: "Sync All Subagent Models",
+          badge: "[all roles]",
+          detail: "Set one model for Explore, Architect, Builder & Reviewer",
+        },
+        {
+          value: "strategy",
+          label: "Execution Strategy",
+          badge: `[${cfg.strategy ?? "auto"}]`,
+          detail: "auto · subagent-driven · native · ask",
+        },
+        {
+          value: "team",
+          label: "Specialist Agent Team",
+          badge: `[${cfg.team ?? "fullstack"}]`,
+          detail: "fullstack · backend · frontend · android · blender3d · gamedev · autopilot",
+        },
+        {
+          value: "mode",
+          label: "Permission Mode",
+          badge: `[${cfg.mode.toUpperCase()}]`,
+          detail: "auto (Build) · plan (Read-only) · safe (Confirm)",
+        },
+        {
+          value: "effort",
+          label: "Primary Reasoning Effort",
+          badge: `[${cfg.reasoningEffort}]`,
+          detail: "off · minimal · low · medium · high · xhigh · max",
+        },
+        {
+          value: "subagent_effort",
+          label: "Subagent Reasoning Effort",
+          badge: `[${cfg.subagentEffort ?? "low"}]`,
+          detail: "off · minimal · low · medium · high · xhigh · max",
+        },
+        {
+          value: "wire",
+          label: "Protocol Wire",
+          badge: `[${cfg.wire}]`,
+          detail: "chat (/v1/chat/completions) · messages (/v1/messages) · responses (/v1/responses)",
+        },
+        {
+          value: "autoReviewFix",
+          label: "Automated Review & Fix Gate",
+          badge: `[${cfg.autoReviewFix !== false ? "ON" : "OFF"}]`,
+          detail: "Toggle automatic post-edit verification & review-fix pass",
+        },
+      ],
     };
     render();
   };
@@ -490,8 +722,20 @@ export async function startFullScreenTui(
 
     if (line.startsWith("/")) {
       const cmdOnly = line.toLowerCase();
-      if (cmdOnly === "/model" && agent.catalog.length > 0) {
+      if (cmdOnly === "/model" || cmdOnly === "/models") {
         openModelModal();
+        return;
+      }
+      if (cmdOnly === "/subagent" || cmdOnly === "/subagent-model" || cmdOnly === "/fast-model") {
+        openSubagentRoleModal();
+        return;
+      }
+      if (cmdOnly === "/config" || cmdOnly === "/settings") {
+        openConfigModal();
+        return;
+      }
+      if (cmdOnly === "/strategy") {
+        openStrategyConfigModal();
         return;
       }
       if (cmdOnly === "/effort") {
@@ -689,7 +933,107 @@ export async function startFullScreenTui(
             agent.config.model = chosen.value;
             agent.session.model = chosen.value;
             saveUserConfig({ model: chosen.value }, agent.config.globalConfigPath);
-            notice = `Model switched to ${chosen.value}`;
+            notice = `Primary model switched to ${chosen.value}`;
+          } else if (modalId === "subagent_role") {
+            if (chosen.value === "effort") {
+              openSubagentEffortModal();
+              return;
+            }
+            openSubagentModelModal(
+              chosen.value as "explore" | "architect" | "builder" | "reviewer" | "all",
+            );
+            return;
+          } else if (modalId === "subagent_model") {
+            const role = activeSubagentRoleTarget;
+            if (role === "explore") {
+              agent.config.fastModel = chosen.value;
+              saveUserConfig({ fastModel: chosen.value }, agent.config.globalConfigPath);
+            } else if (role === "architect") {
+              agent.config.architectModel = chosen.value;
+              saveUserConfig({ architectModel: chosen.value }, agent.config.globalConfigPath);
+            } else if (role === "builder") {
+              agent.config.builderModel = chosen.value;
+              saveUserConfig({ builderModel: chosen.value }, agent.config.globalConfigPath);
+            } else if (role === "reviewer") {
+              agent.config.reviewerModel = chosen.value;
+              saveUserConfig({ reviewerModel: chosen.value }, agent.config.globalConfigPath);
+            } else if (role === "all") {
+              agent.config.fastModel = chosen.value;
+              agent.config.architectModel = chosen.value;
+              agent.config.builderModel = chosen.value;
+              agent.config.reviewerModel = chosen.value;
+              saveUserConfig(
+                {
+                  fastModel: chosen.value,
+                  architectModel: chosen.value,
+                  builderModel: chosen.value,
+                  reviewerModel: chosen.value,
+                },
+                agent.config.globalConfigPath,
+              );
+            }
+            notice = `Set ${role} subagent model to ${chosen.value}`;
+          } else if (modalId === "subagent_effort") {
+            agent.config.subagentEffort = chosen.value as ReasoningEffort;
+            saveUserConfig(
+              { subagentEffort: chosen.value as ReasoningEffort },
+              agent.config.globalConfigPath,
+            );
+            notice = `Subagent reasoning effort set to ${chosen.value}`;
+          } else if (modalId === "strategy_config") {
+            agent.config.strategy = chosen.value as ExecutionStrategy;
+            saveUserConfig(
+              { strategy: chosen.value as ExecutionStrategy },
+              agent.config.globalConfigPath,
+            );
+            notice = `Execution strategy set to ${chosen.value}`;
+          } else if (modalId === "config") {
+            switch (chosen.value) {
+              case "model":
+                openModelModal();
+                return;
+              case "subagent_explore":
+                openSubagentModelModal("explore");
+                return;
+              case "subagent_architect":
+                openSubagentModelModal("architect");
+                return;
+              case "subagent_builder":
+                openSubagentModelModal("builder");
+                return;
+              case "subagent_reviewer":
+                openSubagentModelModal("reviewer");
+                return;
+              case "subagent_all":
+                openSubagentModelModal("all");
+                return;
+              case "strategy":
+                openStrategyConfigModal();
+                return;
+              case "team":
+                openTeamModal();
+                return;
+              case "mode":
+                openModeModal();
+                return;
+              case "effort":
+                openEffortModal();
+                return;
+              case "subagent_effort":
+                openSubagentEffortModal();
+                return;
+              case "wire":
+                openWireModal();
+                return;
+              case "autoReviewFix": {
+                const nextVal = agent.config.autoReviewFix === false;
+                agent.config.autoReviewFix = nextVal;
+                saveUserConfig({ autoReviewFix: nextVal }, agent.config.globalConfigPath);
+                notice = `Auto Review & Fix Gate: ${nextVal ? "ON" : "OFF"}`;
+                openConfigModal();
+                return;
+              }
+            }
           } else if (modalId === "effort") {
             agent.config.reasoningEffort = chosen.value as ReasoningEffort;
             saveUserConfig(
@@ -763,9 +1107,21 @@ export async function startFullScreenTui(
       return;
     }
 
-    // Ctrl+K -> Open Model Switcher Modal
+    // Ctrl+K -> Open Primary Model Switcher Modal
     if (key?.ctrl && key.name === "k") {
       openModelModal();
+      return;
+    }
+
+    // Ctrl+G -> Open Subagent & Role Model Picker Modal
+    if (key?.ctrl && key.name === "g") {
+      openSubagentRoleModal();
+      return;
+    }
+
+    // Ctrl+O -> Open Settings & Configuration Center Modal
+    if (key?.ctrl && key.name === "o") {
+      openConfigModal();
       return;
     }
 
@@ -835,7 +1191,8 @@ export async function startFullScreenTui(
       return;
     }
 
-    const suggestions = computeComposerSuggestions(buffer, workspaceFiles);
+    const catalogIds = getAvailableCatalog().map((m) => m.id);
+    const suggestions = computeComposerSuggestions(buffer, workspaceFiles, catalogIds);
 
     // Up / Down arrows: navigate suggestion dropdown or prompt history
     if (key?.name === "up") {
@@ -898,12 +1255,16 @@ export async function startFullScreenTui(
       return;
     }
 
-    // Tab: complete highlighted `/` command or `@file`
+    // Tab: complete highlighted `/` command, argument, or `@file`
     if (key?.name === "tab" && !key.shift) {
       const chosen = suggestions.items[selectedSuggestionIdx];
       if (chosen) {
         if (suggestions.kind === "slash") {
           buffer = `${chosen.value} `;
+          cursorPos = buffer.length;
+          selectedSuggestionIdx = 0;
+        } else if (suggestions.kind === "arg") {
+          buffer = chosen.value;
           cursorPos = buffer.length;
           selectedSuggestionIdx = 0;
         } else if (suggestions.kind === "file") {
@@ -928,11 +1289,19 @@ export async function startFullScreenTui(
           return;
         }
       }
-      if (suggestions.kind === "slash" && suggestions.items.length > 0) {
+      if (
+        (suggestions.kind === "slash" || suggestions.kind === "arg") &&
+        suggestions.items.length > 0
+      ) {
         const chosen = suggestions.items[selectedSuggestionIdx];
         if (chosen && buffer.trim() !== chosen.value) {
           buffer = chosen.value;
           cursorPos = buffer.length;
+          if (chosen.value.endsWith(" ")) {
+            selectedSuggestionIdx = 0;
+            render();
+            return;
+          }
         }
       }
       const lineToRun = buffer.trim();
@@ -1002,7 +1371,21 @@ export interface ModalOption {
 }
 
 export interface FullScreenModalState {
-  id?: "model" | "effort" | "mode" | "wire" | "team" | "command" | "sessions" | "confirm" | "strategy";
+  id?:
+    | "model"
+    | "subagent_role"
+    | "subagent_model"
+    | "subagent_effort"
+    | "strategy_config"
+    | "config"
+    | "effort"
+    | "mode"
+    | "wire"
+    | "team"
+    | "command"
+    | "sessions"
+    | "confirm"
+    | "strategy";
   title: string;
   filter: string;
   selectedIdx: number;
@@ -1397,7 +1780,7 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
   const compBot = borderColor(`╰${"─".repeat(Math.max(2, cols - 2))}╯`);
 
   const footerBar = fitLineToWidth(
-    ` ${c.bold("Shift+Tab:")} Mode ${c.slate("│")} ${c.bold("Ctrl+K:")} Models ${c.slate("│")} ${c.bold("Ctrl+A:")} Team(${c.amber(state.team ?? "fullstack")}) ${c.slate("│")} ${c.bold("Ctrl+E:")} Effort(${c.violet(state.effort)}) ${c.slate("│")} ${c.bold("Ctrl+P:")} Palette ${c.slate("│")} ${c.bold("Ctrl+B:")} Sidebar ${c.slate("│")} ${c.bold("/:")} Cmds ${c.slate("│")} ${c.bold("@:")} Files`,
+    ` ${c.bold("Shift+Tab:")} Mode ${c.slate("│")} ${c.bold("Ctrl+K:")} Model ${c.slate("│")} ${c.bold("Ctrl+G:")} Subagents ${c.slate("│")} ${c.bold("Ctrl+O:")} Config ${c.slate("│")} ${c.bold("Ctrl+A:")} Team(${c.amber(state.team ?? "fullstack")}) ${c.slate("│")} ${c.bold("Ctrl+P:")} Palette ${c.slate("│")} ${c.bold("/:")} Cmds`,
     cols,
   );
 

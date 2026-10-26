@@ -3,7 +3,10 @@ import { stdin, stdout } from "node:process";
 import { c } from "./theme.js";
 
 export const SLASH_COMMANDS: Array<{ cmd: string; description: string }> = [
-  { cmd: "/model", description: "Interactive model picker or switch model (/model <id>)" },
+  { cmd: "/model", description: "Interactive Primary Model Picker or switch model (/model <id>)" },
+  { cmd: "/subagent", description: "Select model for Subagents & Specialist Roles (/subagent [explore|architect|builder|reviewer] <id>)" },
+  { cmd: "/config", description: "Open Interactive Settings & Configuration Center (/config [key] [value])" },
+  { cmd: "/strategy", description: "Choose execution strategy (auto · subagent-driven · native · ask)" },
   { cmd: "/team", description: "Switch specialist Agent Team (fullstack · backend · frontend · android · blender3d · gamedev · autopilot)" },
   { cmd: "/workflow", description: "Run multi-stage specialist team workflow (/workflow <goal>)" },
   { cmd: "/models", description: "Browse live AivoKey catalog (--tools, --free)" },
