@@ -18,11 +18,12 @@ export interface UndoResult {
 }
 
 /**
- * Tracks pre-modification file snapshots per turn so `/undo` can cleanly
- * revert file edits or newly created files without running destructive git resets.
+ * Tracks pre-modification file snapshots per turn so `/undo` and `/redo` can cleanly
+ * revert and restore file edits without running destructive git resets.
  */
 export class CheckpointManager {
   private turns: TurnCheckpoint[] = [];
+  private redoStack: TurnCheckpoint[] = [];
   private activeTurn: TurnCheckpoint | null = null;
 
   beginTurn(turnId: string = `turn_${Date.now()}`): void {
@@ -32,6 +33,7 @@ export class CheckpointManager {
       files: new Map(),
     };
     this.turns.push(turn);
+    this.redoStack.length = 0;
     this.activeTurn = turn;
   }
 
@@ -40,7 +42,6 @@ export class CheckpointManager {
       this.beginTurn();
     }
     const turn = this.activeTurn!;
-    // Only record the first state before any modification in this turn
     if (turn.files.has(absPath)) return;
 
     if (existsSync(absPath)) {
@@ -55,8 +56,42 @@ export class CheckpointManager {
     }
   }
 
+  private captureCurrentStateForTurn(turn: TurnCheckpoint): TurnCheckpoint {
+    const inverse: TurnCheckpoint = {
+      turnId: turn.turnId,
+      createdAt: Date.now(),
+      files: new Map(),
+    };
+    for (const absPath of turn.files.keys()) {
+      if (existsSync(absPath)) {
+        try {
+          inverse.files.set(absPath, { existed: true, content: readFileSync(absPath) });
+        } catch {
+          inverse.files.set(absPath, { existed: false, content: null });
+        }
+      } else {
+        inverse.files.set(absPath, { existed: false, content: null });
+      }
+    }
+    return inverse;
+  }
+
+  private applySnapshotMap(files: Map<string, FileSnapshot>): string[] {
+    const restoredFiles: string[] = [];
+    for (const [absPath, snap] of files.entries()) {
+      if (snap.existed && snap.content !== null) {
+        mkdirSync(dirname(absPath), { recursive: true });
+        writeFileSync(absPath, snap.content);
+        restoredFiles.push(absPath);
+      } else if (!snap.existed && existsSync(absPath)) {
+        rmSync(absPath, { force: true });
+        restoredFiles.push(absPath);
+      }
+    }
+    return restoredFiles;
+  }
+
   undoLastTurn(): UndoResult {
-    // Find the most recent turn that actually touched files
     while (this.turns.length > 0) {
       const turn = this.turns.pop()!;
       if (this.activeTurn === turn) {
@@ -64,20 +99,24 @@ export class CheckpointManager {
       }
       if (turn.files.size === 0) continue;
 
-      const restoredFiles: string[] = [];
-      for (const [absPath, snap] of turn.files.entries()) {
-        if (snap.existed && snap.content !== null) {
-          mkdirSync(dirname(absPath), { recursive: true });
-          writeFileSync(absPath, snap.content);
-          restoredFiles.push(absPath);
-        } else if (!snap.existed && existsSync(absPath)) {
-          rmSync(absPath, { force: true });
-          restoredFiles.push(absPath);
-        }
-      }
+      const redoTurn = this.captureCurrentStateForTurn(turn);
+      const restoredFiles = this.applySnapshotMap(turn.files);
+      this.redoStack.push(redoTurn);
       return { turnId: turn.turnId, restoredFiles };
     }
     return { turnId: null, restoredFiles: [] };
+  }
+
+  redoLastUndo(): UndoResult {
+    const redoTurn = this.redoStack.pop();
+    if (!redoTurn) {
+      return { turnId: null, restoredFiles: [] };
+    }
+    const undoAgainTurn = this.captureCurrentStateForTurn(redoTurn);
+    const restoredFiles = this.applySnapshotMap(redoTurn.files);
+    this.turns.push(undoAgainTurn);
+    this.activeTurn = undoAgainTurn;
+    return { turnId: redoTurn.turnId, restoredFiles };
   }
 
   listModifiedFiles(): string[] {

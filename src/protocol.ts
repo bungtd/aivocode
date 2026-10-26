@@ -1,6 +1,7 @@
 import { endpointUrl, type AivoWire, type ReasoningEffort } from "./config.js";
 import type { TurnUsageMetrics } from "./aivokey-client.js";
 import { parseAivoErrorResponse } from "./errors.js";
+import { buildMultimodalContentForWire, type ImageAttachment } from "./vision.js";
 
 export interface ToolCall {
   id: string;
@@ -12,6 +13,7 @@ export interface ToolCall {
 export interface ChatMessage {
   role: "user" | "assistant" | "tool";
   content: string;
+  images?: ImageAttachment[];
   reasoning?: string;
   toolCalls?: ToolCall[];
   toolCallId?: string;
@@ -117,7 +119,14 @@ function buildChatCompletionsBody(opts: StreamTurnOptions): Record<string, unkno
 
   for (const m of opts.messages) {
     if (m.role === "user") {
-      apiMessages.push({ role: "user", content: m.content });
+      if (m.images && m.images.length > 0) {
+        apiMessages.push({
+          role: "user",
+          content: buildMultimodalContentForWire(m.content, m.images, "chat"),
+        });
+      } else {
+        apiMessages.push({ role: "user", content: m.content });
+      }
     } else if (m.role === "assistant") {
       const msg: Record<string, unknown> = {
         role: "assistant",
@@ -182,9 +191,13 @@ function buildAnthropicMessagesBody(opts: StreamTurnOptions): Record<string, unk
 
   for (const m of opts.messages) {
     if (m.role === "user") {
+      const blocks =
+        m.images && m.images.length > 0
+          ? buildMultimodalContentForWire(m.content, m.images, "messages")
+          : [{ type: "text", text: m.content }];
       anthropicMessages.push({
         role: "user",
-        content: [{ type: "text", text: m.content }],
+        content: blocks,
       });
     } else if (m.role === "assistant") {
       const blocks: Array<Record<string, unknown>> = [];
@@ -223,7 +236,6 @@ function buildAnthropicMessagesBody(opts: StreamTurnOptions): Record<string, unk
     }
   }
 
-  // Add ephemeral cache_control breakpoint to the last message block for prompt cache hits
   if (anthropicMessages.length > 0) {
     const lastMsg = anthropicMessages[anthropicMessages.length - 1]!;
     if (Array.isArray(lastMsg.content) && lastMsg.content.length > 0) {
@@ -232,18 +244,12 @@ function buildAnthropicMessagesBody(opts: StreamTurnOptions): Record<string, unk
     }
   }
 
+  // Note: We strictly use client-side web_search and web_fetch tools, never AivoKey server-side web_search_20250305
   const tools: Array<Record<string, unknown>> = opts.tools.map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: t.parameters,
   }));
-
-  if (opts.webSearch) {
-    tools.push(
-      { type: "web_search_20250305", name: "web_search", max_uses: 5 },
-      { type: "web_fetch_20250910", name: "web_fetch", max_uses: 5 },
-    );
-  }
 
   const body: Record<string, unknown> = {
     model: opts.model,
@@ -276,7 +282,14 @@ function buildResponsesBody(opts: StreamTurnOptions): Record<string, unknown> {
 
   for (const m of opts.messages) {
     if (m.role === "user") {
-      input.push({ role: "user", content: m.content });
+      if (m.images && m.images.length > 0) {
+        input.push({
+          role: "user",
+          content: buildMultimodalContentForWire(m.content, m.images, "responses"),
+        });
+      } else {
+        input.push({ role: "user", content: m.content });
+      }
     } else if (m.role === "assistant") {
       if (m.content) {
         input.push({ role: "assistant", content: m.content });
@@ -300,16 +313,13 @@ function buildResponsesBody(opts: StreamTurnOptions): Record<string, unknown> {
     }
   }
 
+  // Client-side tools only; never inject server-side { type: "web_search" }
   const tools: Array<Record<string, unknown>> = opts.tools.map((t) => ({
     type: "function",
     name: t.name,
     description: t.description,
     parameters: t.parameters,
   }));
-
-  if (opts.webSearch) {
-    tools.push({ type: "web_search" });
-  }
 
   const body: Record<string, unknown> = {
     model: opts.model,

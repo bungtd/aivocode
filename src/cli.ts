@@ -21,6 +21,8 @@ import {
 } from "./aivokey-client.js";
 import { AivoAgent } from "./agent.js";
 import { formatDetailedStatus, formatModelsTable, startInteractiveRepl } from "./repl.js";
+import { startFullScreenTui } from "./ui/fullscreen.js";
+import { AGENT_TEAMS, type TeamId } from "./teams.js";
 import { SessionStore } from "./session.js";
 import {
   c,
@@ -33,7 +35,10 @@ import { interactiveConfirmBar } from "./ui/composer.js";
 
 export type CliCommand =
   | "repl"
+  | "mini"
   | "run"
+  | "workflow"
+  | "teams"
   | "models"
   | "status"
   | "doctor"
@@ -47,6 +52,7 @@ export interface ParsedCliArgs {
   filter: string;
   sessionId?: string;
   continueLast?: boolean;
+  mini?: boolean;
   json?: boolean;
   cliConfig: Partial<UserConfigFile>;
 }
@@ -56,6 +62,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   const positionals: string[] = [];
   let sessionId: string | undefined;
   let continueLast = false;
+  let mini = false;
   let json = false;
   let explicitPrompt: string | undefined;
   let filterFlag = "";
@@ -71,9 +78,13 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     } else if (arg === "--wire") {
       cliConfig.wire = (argv[++i] ?? "chat") as AivoWire;
     } else if (arg === "--effort") {
-      cliConfig.reasoningEffort = (argv[++i] ?? "medium") as ReasoningEffort;
+      cliConfig.reasoningEffort = (argv[++i] ?? "off") as ReasoningEffort;
     } else if (arg === "--mode") {
       cliConfig.mode = (argv[++i] ?? "auto") as PermissionMode;
+    } else if (arg === "--team" || arg === "-t") {
+      cliConfig.team = (argv[++i] ?? "fullstack") as TeamId;
+    } else if (arg === "--mini") {
+      mini = true;
     } else if (arg === "--base-url") {
       cliConfig.baseUrl = normalizeGatewayOrigin(argv[++i]);
     } else if (arg === "--api-key") {
@@ -110,6 +121,42 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   }
 
   const first = (positionals[0] ?? "").toLowerCase();
+  if (first === "mini") {
+    return {
+      command: "mini",
+      prompt: positionals.slice(1).join(" "),
+      filter: filterFlag,
+      sessionId,
+      continueLast,
+      mini: true,
+      json,
+      cliConfig,
+    };
+  }
+  if (first === "workflow") {
+    return {
+      command: "workflow",
+      prompt: positionals.slice(1).join(" "),
+      filter: filterFlag,
+      sessionId,
+      continueLast,
+      mini,
+      json,
+      cliConfig,
+    };
+  }
+  if (first === "teams") {
+    return {
+      command: "teams",
+      prompt: "",
+      filter: filterFlag,
+      sessionId,
+      continueLast,
+      mini,
+      json,
+      cliConfig,
+    };
+  }
   if (first === "run") {
     return {
       command: "run",
@@ -189,11 +236,12 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   }
 
   return {
-    command: "repl",
+    command: mini ? "mini" : "repl",
     prompt: positionals.join(" "),
     filter: filterFlag,
     sessionId,
     continueLast,
+    mini,
     json,
     cliConfig,
   };
@@ -222,12 +270,15 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
   if (parsed.command === "help") {
     writeOut(
       [
-        `${c.cyan(c.bold("◆ AivoCode (`aivo`)"))} — Native CLI Coding Harness for AivoKey`,
+        `${c.cyan(c.bold("◆ AivoCode (`aivo`) v1.0"))} — Native Full-Screen AI Coding Studio for AivoKey`,
         "",
         c.bold("Usage:"),
-        "  aivo                          Start interactive TUI coding studio",
+        "  aivo                          Launch Full-Screen Alt-Buffer TUI Studio (100% viewport)",
+        "  aivo mini                     Launch compact inline terminal mode",
         "  aivo run \"<prompt>\"           Run a coding task non-interactively",
         "  aivo -p \"<prompt>\"            Alias for `aivo run`",
+        "  aivo workflow \"<goal>\"        Execute a multi-stage Specialist Agent Team workflow",
+        "  aivo teams                    List all 7 specialist Agent Teams (Full-Stack, Backend, Frontend, Android, Blender 3D, GameDev, Autopilot)",
         "  aivo models [--tools|--free]  List live AivoKey models, prices & capabilities",
         "  aivo status                   Inspect live AivoKey balance, free tokens & plan quota",
         "  aivo doctor                   Verify AivoKey gateway connectivity, key & model setup",
@@ -235,18 +286,35 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         "  aivo sessions                 List recent saved sessions",
         "",
         c.bold("Flags:"),
-        "  -m, --model <id>              Canonical model ID (e.g. deepseek-v4-pro, glm-5.3)",
+        "  -m, --model <id>              Canonical model ID (default: deepseek-v4-flash)",
         "  --fast-model <id>             Fast model for explore subagents",
+        "  -t, --team <id>               Specialist team (fullstack|backend|frontend|android|blender3d|gamedev|autopilot)",
         "  --wire <chat|messages|responses> Protocol wire (default: chat)",
-        "  --effort <minimal..max|off>   Reasoning effort level (default: medium)",
+        "  --effort <off|minimal..max>   Reasoning effort level (default: off for instant streaming)",
         "  --mode <auto|safe|plan>       Permission mode (default: auto)",
+        "  --mini                        Use inline terminal mode instead of full-screen TUI",
         "  --base-url <url>              AivoKey gateway URL (default: https://api.aivokey.dev)",
         "  --api-key <key>               AivoKey API key (or set AIVOKEY_API_KEY)",
-        "  --web-search                  Enable AivoKey server-side web search",
         "  -c, --continue                Resume most recent session",
         "  -s, --session <id>            Resume specific session ID",
       ].join("\n"),
     );
+    return 0;
+  }
+
+  if (parsed.command === "teams") {
+    writeOut(`${c.cyan("╭─")} ${c.bold("AivoCode Specialist Agent Teams & Workflows")} ${c.cyan("─".repeat(28))}`);
+    for (const t of AGENT_TEAMS) {
+      writeOut(
+        `${c.cyan("│")} ${c.bold(c.emerald(t.id.padEnd(11)))} ${c.bold(c.white(t.name))} ${c.slate(`[${t.roles.map((r) => r.badge).join(" → ")}]`)}`,
+      );
+      writeOut(`${c.cyan("│")}   ${c.slate(t.description)}`);
+      writeOut(
+        `${c.cyan("│")}   ${c.teal("Stages:")} ${c.dim(t.workflowStages.map((s) => s.title).join("  →  "))}`,
+      );
+      writeOut(`${c.cyan("├" + "─".repeat(74))}`);
+    }
+    writeOut(`${c.cyan("╰" + "─".repeat(74))}`);
     return 0;
   }
 
@@ -456,6 +524,18 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     return 0;
   }
 
+  if (parsed.command === "workflow") {
+    if (!config.apiKey) {
+      writeOut(
+        "Error: AIVOKEY_API_KEY is not set. Run `aivo login <sk-aivo_...>` or pass `--api-key`.",
+      );
+      return 1;
+    }
+    const out = await agent.executeTeamWorkflow(parsed.prompt, config.team);
+    writeOut(out);
+    return 0;
+  }
+
   if (parsed.command === "run") {
     if (!config.apiKey) {
       writeOut(
@@ -482,12 +562,17 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     return 0;
   }
 
-  await startInteractiveRepl(
-    agent,
-    keyStatus,
-    fetchFn,
-    (label) => turnSpinner.start(label),
-    () => turnSpinner.stop(),
-  );
+  if (parsed.command === "mini" || parsed.mini) {
+    await startInteractiveRepl(
+      agent,
+      keyStatus,
+      fetchFn,
+      (label) => turnSpinner.start(label),
+      () => turnSpinner.stop(),
+    );
+    return 0;
+  }
+
+  await startFullScreenTui(agent, keyStatus, fetchFn);
   return 0;
 }

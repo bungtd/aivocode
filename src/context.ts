@@ -3,6 +3,8 @@ import { join, resolve } from "node:path";
 import type { PermissionMode } from "./config.js";
 import type { ChatMessage } from "./protocol.js";
 import type { TodoItem } from "./tools/index.js";
+import { getAgentTeam, type TeamId } from "./teams.js";
+import { isImageFilePath, loadImageAttachment, type ImageAttachment } from "./vision.js";
 
 const INSTRUCTION_CANDIDATES = [
   "AGENTS.md",
@@ -15,24 +17,35 @@ const INSTRUCTION_CANDIDATES = [
  * Builds a 100% deterministic system prompt (no dynamic timestamps or random tokens)
  * so AivoKey's sticky-session upstream prompt cache hits across every turn.
  */
-export function buildSystemPrompt(cwd: string, mode: PermissionMode): string {
+export function buildSystemPrompt(
+  cwd: string,
+  mode: PermissionMode,
+  teamId?: TeamId,
+): string {
   const sections: string[] = [
     `You are AivoCode, a fast, disciplined CLI coding agent purpose-built for AivoKey.`,
     `Workspace directory: ${cwd}`,
     `Platform: ${process.platform}`,
     `Permission mode: ${mode}`,
     [
-      "## Core Rules",
-      "- Prefer dedicated tools (`read_file`, `edit_file`, `write_file`, `glob_files`, `grep_search`) over shell commands whenever possible.",
+      "## Core Engineering & Anti-AI-Slop Rules",
+      "- Prefer dedicated tools (`read_file`, `edit_file`, `write_file`, `apply_patch`, `glob_files`, `grep_search`, `web_search`, `web_fetch`, `vision_analyze`, `computer_use`, `memory_remember`, `memory_search`, `skill_load`, `skill_create`, `team_workflow`, `anti_slop_audit`) over raw shell commands whenever possible.",
       "- Before editing a file, read the relevant lines with `read_file`. Never include the `1: ` line-number prefix in `edit_file` oldString or newString.",
-      "- Keep changes minimal, focused, and consistent with surrounding code style.",
+      "- Anti-AI-Slop Mandate: NEVER leave `// TODO: implement`, `// ... rest of code`, fake mocked data, or unverified claims. Write complete, production-ready code and run `anti_slop_audit` + tests to verify.",
       "- Track multi-step tasks using `todo_write`.",
-      "- Use `subagent` with `agent: \"explore\"` to delegate broad codebase searches to a fast subagent and keep the main context compact.",
+      "- Use `subagent` with `agent: \"explore\"` for fast codebase searches, or `team_workflow` for multi-stage specialist workflows (Full-Stack, Backend, Frontend, Android, Blender 3D, GameDev, Autopilot).",
       mode === "plan"
-        ? "- You are currently in PLAN mode (read-only). Do NOT call `write_file`, `edit_file`, or `run_shell`. Analyze the codebase and present a clear implementation plan."
+        ? "- You are currently in PLAN mode (read-only). Do NOT call `write_file`, `edit_file`, `apply_patch`, or `run_shell`. Analyze the codebase and present a clear implementation plan."
         : "- Verify your changes by running relevant tests or typechecks via `run_shell`.",
     ].join("\n"),
   ];
+
+  if (teamId) {
+    const team = getAgentTeam(teamId);
+    if (team) {
+      sections.push(team.systemPromptAddendum);
+    }
+  }
 
   for (const rel of INSTRUCTION_CANDIDATES) {
     const full = join(cwd, rel);
@@ -55,11 +68,61 @@ export function buildSystemPrompt(cwd: string, mode: PermissionMode): string {
 }
 
 /**
- * Expands `@path/to/file` mentions in user prompts by appending numbered file contents.
+ * Expands `@path/to/file.ts` and `@path/to/file.ts#10-40` line-range mentions in user prompts.
  */
 export function expandFileMentions(prompt: string, cwd: string): string {
-  const mentionRegex = /(?:^|\s)@([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+)\b/g;
+  const mentionRegex = /(?:^|\s)@([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+)(?:#(\d+)(?:-(\d+))?)?/g;
   const attachments: string[] = [];
+  const seen = new Set<string>();
+
+  let match: RegExpExecArray | null;
+  while ((match = mentionRegex.exec(prompt)) !== null) {
+    const relPath = match[1]!;
+    const startLineRaw = match[2] ? Number(match[2]) : null;
+    const endLineRaw = match[3] ? Number(match[3]) : startLineRaw;
+    const cacheKey = `${relPath}#${startLineRaw ?? ""}-${endLineRaw ?? ""}`;
+    if (seen.has(cacheKey)) continue;
+    seen.add(cacheKey);
+
+    // Skip image files here (they are attached as multimodal Vision blocks via extractPromptImageAttachments)
+    if (isImageFilePath(relPath)) continue;
+
+    const absPath = resolve(cwd, relPath);
+    if (!existsSync(absPath)) continue;
+    try {
+      const st = statSync(absPath);
+      if (!st.isFile() || st.size > 256_000) continue;
+      const content = readFileSync(absPath, "utf8");
+      const allLines = content.split(/\r?\n/);
+
+      if (startLineRaw !== null && Number.isFinite(startLineRaw)) {
+        const s = Math.max(1, startLineRaw);
+        const e = Math.min(allLines.length, Math.max(s, endLineRaw ?? s));
+        const slice = allLines.slice(s - 1, e);
+        const numbered = slice.map((line, idx) => `${s + idx}: ${line}`).join("\n");
+        attachments.push(`<file path="${relPath}" lines="${s}-${e}">\n${numbered}\n</file>`);
+      } else {
+        const numbered = allLines
+          .slice(0, 500)
+          .map((line, idx) => `${idx + 1}: ${line}`)
+          .join("\n");
+        attachments.push(`<file path="${relPath}">\n${numbered}\n</file>`);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (attachments.length === 0) return prompt;
+  return `${prompt}\n\n${attachments.join("\n\n")}`;
+}
+
+/**
+ * Extracts `@path/to/image.png` mentions from the prompt and loads them as multimodal Vision attachments.
+ */
+export function extractPromptImageAttachments(prompt: string, cwd: string): ImageAttachment[] {
+  const mentionRegex = /(?:^|\s)@([a-zA-Z0-9_./\\-]+\.(?:png|jpe?g|gif|webp))\b/gi;
+  const images: ImageAttachment[] = [];
   const seen = new Set<string>();
 
   let match: RegExpExecArray | null;
@@ -71,22 +134,12 @@ export function expandFileMentions(prompt: string, cwd: string): string {
     const absPath = resolve(cwd, relPath);
     if (!existsSync(absPath)) continue;
     try {
-      const st = statSync(absPath);
-      if (!st.isFile() || st.size > 256_000) continue;
-      const content = readFileSync(absPath, "utf8");
-      const numbered = content
-        .split(/\r?\n/)
-        .slice(0, 500)
-        .map((line, idx) => `${idx + 1}: ${line}`)
-        .join("\n");
-      attachments.push(`<file path="${relPath}">\n${numbered}\n</file>`);
+      images.push(loadImageAttachment(absPath));
     } catch {
-      /* ignore */
+      /* ignore invalid image */
     }
   }
-
-  if (attachments.length === 0) return prompt;
-  return `${prompt}\n\n${attachments.join("\n\n")}`;
+  return images;
 }
 
 export function estimateConversationTokens(
@@ -97,6 +150,9 @@ export function estimateConversationTokens(
   for (const m of messages) {
     chars += m.content.length;
     if (m.reasoning) chars += m.reasoning.length;
+    if (m.images && m.images.length > 0) {
+      chars += m.images.length * 4000; // ~1000 tokens per image estimate
+    }
     if (m.toolCalls) {
       for (const tc of m.toolCalls) {
         chars += tc.name.length + tc.rawArguments.length + 24;
@@ -112,17 +168,12 @@ export interface CompactOptions {
   modifiedFiles?: string[];
 }
 
-/**
- * Compacts conversation history when approaching `context_length` or recovering
- * from AivoKey `400 context_length_exceeded`.
- */
 export function compactConversation(
   messages: ChatMessage[],
   opts: CompactOptions = {},
 ): ChatMessage[] {
   const keepCount = Math.max(2, opts.keepRecentMessages ?? 6);
   if (messages.length <= keepCount) {
-    // Still trim any huge tool outputs in-place
     return messages.map((m) =>
       m.role === "tool" && m.content.length > 2000
         ? {
@@ -136,7 +187,6 @@ export function compactConversation(
   }
 
   let splitIdx = messages.length - keepCount;
-  // Avoid splitting right on a `tool` message so assistant toolCalls and their tool results stay paired
   while (splitIdx > 0 && messages[splitIdx]?.role === "tool") {
     splitIdx--;
   }

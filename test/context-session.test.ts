@@ -24,8 +24,8 @@ describe("Context manager, @file mentions, compaction, and JSONL sessions", () =
       expect(p1).toBe(p2);
       expect(p1).toContain("Always use pnpm test.");
 
-      const expanded = expandFileMentions("Please review @src-hello.ts now", dir);
-      expect(expanded).toContain('<file path="src-hello.ts">');
+      const expanded = expandFileMentions("Please review @src-hello.ts#1-1 now", dir);
+      expect(expanded).toContain('<file path="src-hello.ts" lines="1-1">');
       expect(expanded).toContain("1: export const greeting = 'Halo AivoKey';");
     } finally {
       rmSync(dir, { recursive: true, force: true });

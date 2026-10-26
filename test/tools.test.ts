@@ -58,6 +58,14 @@ describe("File Checkpoints (/undo) & Coding Tools", () => {
         "const a = 1;\r\nconst b = 2;\r\nexport const sum = a + b;\r\n",
       );
       expect(existsSync(join(dir, "nested/newfile.ts"))).toBe(false);
+
+      // Now redo the undone turn!
+      const redoSummary = checkpoints.redoLastUndo();
+      expect(redoSummary.restoredFiles).toHaveLength(2);
+      expect(readFileSync(target, "utf8")).toBe(
+        "const a = 1;\r\nconst b = 42;\r\nexport const sum = a + b;\r\n",
+      );
+      expect(existsSync(join(dir, "nested/newfile.ts"))).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -125,9 +133,51 @@ describe("File Checkpoints (/undo) & Coding Tools", () => {
         confirmAction: async () => false,
       });
 
-      const deniedShell = await safeTools.execute("run_shell", { command: "echo hi" });
-      expect(deniedShell.isError).toBe(true);
-      expect(deniedShell.output).toContain("declined");
+      constDenied: {
+        const deniedShell = await safeTools.execute("run_shell", { command: "echo hi" });
+        expect(deniedShell.isError).toBe(true);
+        expect(deniedShell.output).toContain("declined");
+        break constDenied;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("supports apply_patch, anti_slop_audit, memory_remember/search, skill_create/load, and client-side web_search", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "aivo-adv-tools-"));
+    try {
+      const checkpoints = new CheckpointManager();
+      checkpoints.beginTurn("turn_patch");
+
+      const tools = createToolset({
+        cwd: dir,
+        mode: "auto",
+        checkpoints,
+        todos: [],
+        fetchFn: async () =>
+          new Response(
+            `<html><body><a class="result__a" href="https://blender.org/api">Blender Python API</a></body></html>`,
+            { status: 200, headers: { "content-type": "text/html" } },
+          ),
+      });
+
+      const patchRes = await tools.execute("apply_patch", {
+        patchText: [
+          "*** Add File: src/hello.ts",
+          "+export const msg = 'hello patch';",
+        ].join("\n"),
+      });
+      expect(patchRes.isError).toBeFalsy();
+      expect(readFileSync(join(dir, "src/hello.ts"), "utf8")).toContain("hello patch");
+
+      const auditRes = await tools.execute("anti_slop_audit", { path: "src/hello.ts" });
+      expect(auditRes.isError).toBeFalsy();
+      expect(auditRes.output).toContain("clean");
+
+      const searchRes = await tools.execute("web_search", { query: "blender bpy api" });
+      expect(searchRes.isError).toBeFalsy();
+      expect(searchRes.output).toContain("Blender Python API");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

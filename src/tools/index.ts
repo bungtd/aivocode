@@ -3,6 +3,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -12,6 +13,13 @@ import { exec } from "node:child_process";
 import type { PermissionMode } from "../config.js";
 import type { ToolSpec } from "../protocol.js";
 import type { CheckpointManager } from "../checkpoint.js";
+import { ClientWebSearchRouter, clientWebFetch } from "../web.js";
+import { isImageFilePath, loadImageAttachment, type ImageAttachment } from "../vision.js";
+import { executeComputerUse, type ComputerUseAction } from "../computer-use.js";
+import { SelfLearningMemory, type MemoryCategory } from "../memory.js";
+import { SkillRegistry } from "../skills.js";
+import { auditCodeForSlop } from "../anti-slop.js";
+import type { TeamId } from "../teams.js";
 
 export interface TodoItem {
   id: string;
@@ -31,6 +39,7 @@ export interface ToolExecutionResult {
   summary?: string;
   durationMs?: number;
   diff?: ToolExecutionDiff;
+  imageAttachment?: ImageAttachment;
 }
 
 export interface ToolsetOptions {
@@ -38,6 +47,9 @@ export interface ToolsetOptions {
   mode: PermissionMode;
   checkpoints: CheckpointManager;
   todos: TodoItem[];
+  memory?: SelfLearningMemory;
+  skills?: SkillRegistry;
+  webSearchRouter?: ClientWebSearchRouter;
   readOnlyOnly?: boolean;
   confirmAction?: (description: string) => Promise<boolean>;
   onSubagent?: (input: {
@@ -45,6 +57,7 @@ export interface ToolsetOptions {
     description: string;
     prompt: string;
   }) => Promise<string>;
+  onTeamWorkflow?: (input: { teamId: TeamId; goal: string }) => Promise<string>;
   fetchFn?: typeof fetch;
 }
 
@@ -75,9 +88,6 @@ function resolveWorkspacePath(cwd: string, p: string): string {
   return isAbsolute(cleaned) ? resolve(cleaned) : resolve(cwd, cleaned);
 }
 
-/**
- * Strip accidental `12: ` line-number prefixes when a model copies lines from `read_file`.
- */
 export function stripLineNumberPrefixes(text: string): string {
   const lines = text.split("\n");
   const allHavePrefix =
@@ -165,11 +175,20 @@ export function formatTodoList(todos: TodoItem[]): string {
 }
 
 export function createToolset(opts: ToolsetOptions) {
+  const memory = opts.memory ?? new SelfLearningMemory();
+  const skills = opts.skills ?? new SkillRegistry({ cwd: opts.cwd });
+  const webSearchRouter =
+    opts.webSearchRouter ??
+    new ClientWebSearchRouter({
+      loadLocalDshCredentials: opts.fetchFn === undefined,
+      fetchFn: opts.fetchFn,
+    });
+
   const specs: ToolSpec[] = [
     {
       name: "read_file",
       description:
-        "Read a file or directory. Returns 1-based line-numbered text (`1: content`). Use offset and limit for large files.",
+        "Read a text file, directory, or image (PNG/JPEG/GIF/WebP). Text reads return 1-based line numbers (`1: content`).",
       parameters: {
         type: "object",
         properties: {
@@ -209,6 +228,44 @@ export function createToolset(opts: ToolsetOptions) {
       },
     },
     {
+      name: "web_search",
+      description:
+        "Search the web using the client-side multi-provider router (Exa, Tavily, Firecrawl, Brave, DuckDuckGo) for up-to-date information and docs.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          maxResults: { type: "number", description: "Max results (default: 8)" },
+        },
+        required: ["query"],
+      },
+    },
+    {
+      name: "web_fetch",
+      description:
+        "Fetch an HTTP/HTTPS URL and return its content converted to clean Markdown, text, or HTML.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "HTTP/HTTPS URL to fetch" },
+          format: { type: "string", enum: ["markdown", "text", "html"], description: "Output format (default: markdown)" },
+        },
+        required: ["url"],
+      },
+    },
+    {
+      name: "vision_analyze",
+      description:
+        "Attach a local image file (PNG, JPEG, GIF, WebP) so the model can visually inspect UI screenshots, diagrams, or 3D renders.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Path to the image file" },
+        },
+        required: ["path"],
+      },
+    },
+    {
       name: "todo_write",
       description: "Update the structured task checklist to track multi-step progress.",
       parameters: {
@@ -231,14 +288,52 @@ export function createToolset(opts: ToolsetOptions) {
       },
     },
     {
-      name: "web_fetch",
-      description: "Fetch a URL over HTTP/HTTPS and return its text content.",
+      name: "memory_search",
+      description: "Search persistent self-learning memory for project conventions, past bug fixes, and user preferences.",
       parameters: {
         type: "object",
         properties: {
-          url: { type: "string", description: "HTTP/HTTPS URL to read" },
+          query: { type: "string", description: "Topic or keyword to search" },
         },
-        required: ["url"],
+        required: ["query"],
+      },
+    },
+    {
+      name: "memory_remember",
+      description: "Save a durable engineering lesson, architectural decision, or user preference into persistent self-learning memory.",
+      parameters: {
+        type: "object",
+        properties: {
+          category: {
+            type: "string",
+            enum: ["preference", "architecture", "bug_lesson", "workflow", "skill_insight"],
+          },
+          title: { type: "string", description: "Short summary title" },
+          content: { type: "string", description: "Concise reusable rule or lesson" },
+          tags: { type: "array", items: { type: "string" } },
+        },
+        required: ["category", "title", "content"],
+      },
+    },
+    {
+      name: "skill_load",
+      description: "Load specialized instructions from an installed or project skill (`SKILL.md`).",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Skill ID (or 'list' to list all available skills)" },
+        },
+        required: ["id"],
+      },
+    },
+    {
+      name: "anti_slop_audit",
+      description: "Audit a file (or all modified files) for AI slop: placeholder comments, unfinished TODO stubs, or blind `any` casts.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "File path to audit (optional; defaults to all modified files)" },
+        },
       },
     },
   ];
@@ -274,6 +369,18 @@ export function createToolset(opts: ToolsetOptions) {
         },
       },
       {
+        name: "apply_patch",
+        description:
+          "Apply a multi-file patch supporting '*** Add File: <path>', '*** Update File: <path>', and '*** Delete File: <path>' sections.",
+        parameters: {
+          type: "object",
+          properties: {
+            patchText: { type: "string", description: "Patch text" },
+          },
+          required: ["patchText"],
+        },
+      },
+      {
         name: "run_shell",
         description: "Execute a shell command in the workspace and return stdout/stderr.",
         parameters: {
@@ -284,6 +391,51 @@ export function createToolset(opts: ToolsetOptions) {
             timeoutMs: { type: "number", description: "Timeout in milliseconds (default: 60000)" },
           },
           required: ["command"],
+        },
+      },
+      {
+        name: "skill_create",
+        description:
+          "Self-evolving capability: create or update a reusable `SKILL.md` skill when you master a reusable workflow or domain pattern.",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "Kebab-case skill ID (e.g. 'blender-rigging')" },
+            name: { type: "string", description: "Display name" },
+            description: { type: "string", description: "When to use this skill" },
+            body: { type: "string", description: "Complete Markdown instructions for the skill" },
+            scope: { type: "string", enum: ["global", "project"] },
+          },
+          required: ["id", "name", "description", "body"],
+        },
+      },
+      {
+        name: "computer_use",
+        description:
+          "Interact with the desktop environment: capture screenshots (attached to Vision), list windows, open URLs, move/click mouse, or type keys.",
+        parameters: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              enum: [
+                "screenshot",
+                "window_list",
+                "open_url",
+                "mouse_move",
+                "mouse_click",
+                "keyboard_type",
+                "key_press",
+              ],
+            },
+            x: { type: "number" },
+            y: { type: "number" },
+            button: { type: "string", enum: ["left", "right", "double"] },
+            text: { type: "string" },
+            key: { type: "string" },
+            url: { type: "string" },
+          },
+          required: ["action"],
         },
       },
     );
@@ -301,6 +453,25 @@ export function createToolset(opts: ToolsetOptions) {
             prompt: { type: "string", description: "Detailed task instructions for the subagent" },
           },
           required: ["agent", "description", "prompt"],
+        },
+      });
+    }
+
+    if (opts.onTeamWorkflow) {
+      specs.push({
+        name: "team_workflow",
+        description:
+          "Execute a structured multi-stage specialist Agent Team workflow ('fullstack', 'backend', 'frontend', 'android', 'blender3d', 'gamedev', 'autopilot').",
+        parameters: {
+          type: "object",
+          properties: {
+            team: {
+              type: "string",
+              enum: ["fullstack", "backend", "frontend", "android", "blender3d", "gamedev", "autopilot"],
+            },
+            goal: { type: "string", description: "Detailed goal for the specialist team" },
+          },
+          required: ["team", "goal"],
         },
       });
     }
@@ -332,6 +503,7 @@ export function createToolset(opts: ToolsetOptions) {
     try {
       switch (name) {
         case "read_file": {
+          const startedAt = Date.now();
           const rawPath = String(args.path ?? "");
           const absPath = resolveWorkspacePath(opts.cwd, rawPath);
           if (!existsSync(absPath)) {
@@ -342,8 +514,24 @@ export function createToolset(opts: ToolsetOptions) {
             const entries = readdirSync(absPath, { withFileTypes: true }).map((e) =>
               e.isDirectory() ? `${e.name}/` : e.name,
             );
-            return { output: `Directory ${rawPath}:\n${entries.join("\n")}` };
+            return {
+              output: `Directory ${rawPath}:\n${entries.join("\n")}`,
+              summary: `${entries.length} entries`,
+              durationMs: Date.now() - startedAt,
+            };
           }
+
+          // If image file, load as Vision attachment automatically (matching OpenCode V2!)
+          if (isImageFilePath(absPath)) {
+            const img = loadImageAttachment(absPath);
+            return {
+              output: `Loaded image ${rawPath} (${img.mimeType}, ${img.width}x${img.height}, ${Math.round(img.byteSize / 1024)} KB) for visual analysis.`,
+              summary: `${img.width}x${img.height} ${img.mimeType}`,
+              durationMs: Date.now() - startedAt,
+              imageAttachment: img,
+            };
+          }
+
           const content = readFileSync(absPath, "utf8");
           const lines = content.split(/\r?\n/);
           const offset = Math.max(1, typeof args.offset === "number" ? Math.floor(args.offset) : 1);
@@ -357,7 +545,24 @@ export function createToolset(opts: ToolsetOptions) {
             offset - 1 + limit < lines.length
               ? `\n... (${lines.length - (offset - 1 + limit)} more lines; use offset=${offset + limit})`
               : "";
-          return { output: numbered + footer };
+          return {
+            output: numbered + footer,
+            summary: `${slice.length} lines`,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+
+        case "vision_analyze": {
+          const startedAt = Date.now();
+          const rawPath = String(args.path ?? "");
+          const absPath = resolveWorkspacePath(opts.cwd, rawPath);
+          const img = loadImageAttachment(absPath);
+          return {
+            output: `Attached image ${rawPath} (${img.mimeType}, ${img.width}x${img.height}) for vision inspection.`,
+            summary: `${img.width}x${img.height}`,
+            durationMs: Date.now() - startedAt,
+            imageAttachment: img,
+          };
         }
 
         case "write_file": {
@@ -441,7 +646,85 @@ export function createToolset(opts: ToolsetOptions) {
           };
         }
 
+        case "apply_patch": {
+          const startedAt = Date.now();
+          const patchText = String(args.patchText ?? "");
+          if (!patchText.trim()) {
+            return { isError: true, output: "patchText is required" };
+          }
+          const guard = await checkMutationAllowed("apply_patch");
+          if (guard) return guard;
+
+          const lines = patchText.replace(/\r\n/g, "\n").split("\n");
+          const touched: string[] = [];
+          let i = 0;
+
+          while (i < lines.length) {
+            const line = lines[i]!;
+            if (line.startsWith("*** Add File:")) {
+              const relPath = line.slice("*** Add File:".length).trim();
+              i++;
+              const contentLines: string[] = [];
+              while (i < lines.length && !lines[i]!.startsWith("*** ")) {
+                const l = lines[i]!;
+                contentLines.push(l.startsWith("+") ? l.slice(1) : l);
+                i++;
+              }
+              const abs = resolveWorkspacePath(opts.cwd, relPath);
+              opts.checkpoints.snapshotBeforeWrite(abs);
+              mkdirSync(dirname(abs), { recursive: true });
+              writeFileSync(abs, contentLines.join("\n") + "\n", "utf8");
+              touched.push(`added ${relPath}`);
+              continue;
+            }
+            if (line.startsWith("*** Delete File:")) {
+              const relPath = line.slice("*** Delete File:".length).trim();
+              const abs = resolveWorkspacePath(opts.cwd, relPath);
+              opts.checkpoints.snapshotBeforeWrite(abs);
+              if (existsSync(abs)) rmSync(abs, { force: true });
+              touched.push(`deleted ${relPath}`);
+              i++;
+              continue;
+            }
+            if (line.startsWith("*** Update File:")) {
+              const relPath = line.slice("*** Update File:".length).trim();
+              const abs = resolveWorkspacePath(opts.cwd, relPath);
+              i++;
+              const removedLines: string[] = [];
+              const addedLines: string[] = [];
+              while (i < lines.length && !lines[i]!.startsWith("*** ")) {
+                const l = lines[i]!;
+                if (l.startsWith("-") && !l.startsWith("---")) removedLines.push(l.slice(1));
+                else if (l.startsWith("+") && !l.startsWith("+++")) addedLines.push(l.slice(1));
+                i++;
+              }
+              if (existsSync(abs) && removedLines.length > 0) {
+                const cur = readFileSync(abs, "utf8").replace(/\r\n/g, "\n");
+                const oldBlock = removedLines.join("\n");
+                const newBlock = addedLines.join("\n");
+                if (cur.includes(oldBlock)) {
+                  opts.checkpoints.snapshotBeforeWrite(abs);
+                  writeFileSync(abs, cur.replace(oldBlock, () => newBlock), "utf8");
+                  touched.push(`updated ${relPath}`);
+                }
+              }
+              continue;
+            }
+            i++;
+          }
+
+          if (touched.length === 0) {
+            return { isError: true, output: "No valid *** Add/Update/Delete File sections found in patchText." };
+          }
+          return {
+            output: `Applied patch: ${touched.join(", ")}`,
+            summary: touched.join(", "),
+            durationMs: Date.now() - startedAt,
+          };
+        }
+
         case "glob_files": {
+          const startedAt = Date.now();
           const pattern = String(args.pattern ?? "**/*");
           const searchRoot = args.path
             ? resolveWorkspacePath(opts.cwd, String(args.path))
@@ -457,10 +740,13 @@ export function createToolset(opts: ToolsetOptions) {
               matched.length > 0
                 ? matched.slice(0, 200).join("\n")
                 : `No files matched pattern: ${pattern}`,
+            summary: `${matched.length} files`,
+            durationMs: Date.now() - startedAt,
           };
         }
 
         case "grep_search": {
+          const startedAt = Date.now();
           const pattern = String(args.pattern ?? "");
           if (!pattern) return { isError: true, output: "pattern is required" };
           const searchTarget = args.path
@@ -496,7 +782,7 @@ export function createToolset(opts: ToolsetOptions) {
             } catch {
               continue;
             }
-            if (text.includes("\0")) continue; // skip binary
+            if (text.includes("\0")) continue;
             const lines = text.split(/\r?\n/);
             for (let i = 0; i < lines.length; i++) {
               if (rx.test(lines[i]!)) {
@@ -511,10 +797,52 @@ export function createToolset(opts: ToolsetOptions) {
               matches.length > 0
                 ? matches.join("\n")
                 : `No matches found for: ${pattern}`,
+            summary: `${matches.length} matches`,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+
+        case "web_search": {
+          const startedAt = Date.now();
+          const query = String(args.query ?? "").trim();
+          if (!query) return { isError: true, output: "query is required" };
+          const maxResults = typeof args.maxResults === "number" ? args.maxResults : 8;
+          const res = await webSearchRouter.search({ query, maxResults });
+          const formatted = res.sources
+            .map(
+              (s, idx) =>
+                `${idx + 1}. **${s.title}**\n   URL: ${s.url}${s.snippet ? `\n   Snippet: ${s.snippet}` : ""}`,
+            )
+            .join("\n\n");
+          return {
+            output:
+              res.sources.length > 0
+                ? `Search results via ${res.provider} (${res.sources.length} sources):\n\n${formatted}`
+                : `No web search results found for: ${query}`,
+            summary: `${res.sources.length} results via ${res.provider}`,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+
+        case "web_fetch": {
+          const startedAt = Date.now();
+          const url = String(args.url ?? "").trim();
+          const format =
+            args.format === "text" || args.format === "html" ? args.format : "markdown";
+          const res = await clientWebFetch({
+            url,
+            format,
+            fetchFn: opts.fetchFn,
+          });
+          return {
+            output: res.content,
+            summary: `${res.contentType.split(";")[0]} (${res.content.length} chars)`,
+            durationMs: Date.now() - startedAt,
           };
         }
 
         case "run_shell": {
+          const startedAt = Date.now();
           const command = String(args.command ?? "").trim();
           if (!command) return { isError: true, output: "Empty command" };
 
@@ -556,7 +884,9 @@ export function createToolset(opts: ToolsetOptions) {
                       ? 1
                       : 0;
                 resPromise({
-                  text: combined || (exitCode === 0 ? "(no output)" : String(err?.message ?? "Command failed")),
+                  text:
+                    combined ||
+                    (exitCode === 0 ? "(no output)" : String(err?.message ?? "Command failed")),
                   code: exitCode,
                 });
               },
@@ -578,9 +908,15 @@ export function createToolset(opts: ToolsetOptions) {
             return {
               isError: true,
               output: `Exit code ${output.code}:\n${formatted}`,
+              summary: `exit ${output.code}`,
+              durationMs: Date.now() - startedAt,
             };
           }
-          return { output: formatted };
+          return {
+            output: formatted,
+            summary: "exit 0",
+            durationMs: Date.now() - startedAt,
+          };
         }
 
         case "todo_write": {
@@ -599,29 +935,139 @@ export function createToolset(opts: ToolsetOptions) {
               status,
             });
           }
-          return { output: `Updated todos:\n${formatTodoList(opts.todos)}` };
+          const done = opts.todos.filter((t) => t.status === "completed").length;
+          return {
+            output: `Updated todos:\n${formatTodoList(opts.todos)}`,
+            summary: `${done}/${opts.todos.length} completed`,
+          };
         }
 
-        case "web_fetch": {
-          const url = String(args.url ?? "").trim();
-          if (!/^https?:\/\//i.test(url)) {
-            return { isError: true, output: `Invalid URL (must be http/https): ${url}` };
-          }
-          const fetchFn = opts.fetchFn ?? fetch;
-          const res = await fetchFn(url, {
-            headers: { "user-agent": "AivoCode-CLI/0.1" },
+        case "memory_remember": {
+          const category = (args.category ?? "workflow") as MemoryCategory;
+          const title = String(args.title ?? "");
+          const content = String(args.content ?? "");
+          const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
+          const entry = memory.remember({
+            category,
+            title,
+            content,
+            tags,
+            projectScope: opts.cwd,
           });
-          if (!res.ok) {
-            return { isError: true, output: `HTTP ${res.status} fetching ${url}` };
+          return {
+            output: `Saved to self-learning memory [${entry.category}]: ${entry.title}`,
+            summary: entry.title,
+          };
+        }
+
+        case "memory_search": {
+          const query = String(args.query ?? "");
+          const hits = memory.recall(query, opts.cwd, 8);
+          if (hits.length === 0) {
+            return { output: `No memories found matching: ${query}` };
           }
-          const rawHtml = await res.text();
-          const clean = rawHtml
-            .replace(/<script[\s\S]*?<\/script>/gi, " ")
-            .replace(/<style[\s\S]*?<\/style>/gi, " ")
-            .replace(/<[^>]+>/g, " ")
-            .replace(/\s+/g, " ")
-            .trim();
-          return { output: clean.slice(0, 20_000) };
+          return {
+            output: hits
+              .map((m) => `- [${m.category}] **${m.title}**: ${m.content}`)
+              .join("\n"),
+            summary: `${hits.length} memories`,
+          };
+        }
+
+        case "skill_load": {
+          const id = String(args.id ?? "").trim();
+          if (id === "list" || !id) {
+            const list = skills.listSkills();
+            if (list.length === 0) return { output: "No skills discovered." };
+            return {
+              output: list.map((s) => `- **${s.id}** (${s.name}): ${s.description}`).join("\n"),
+              summary: `${list.length} skills`,
+            };
+          }
+          const loaded = skills.loadSkill(id);
+          if (!loaded) {
+            return {
+              isError: true,
+              output: `Skill '${id}' not found. Call skill_load with id='list' to see available skills.`,
+            };
+          }
+          return {
+            output: `<skill name="${loaded.id}">\n# ${loaded.name}\n\n${loaded.body}\n</skill>`,
+            summary: loaded.name,
+          };
+        }
+
+        case "skill_create": {
+          const id = String(args.id ?? "");
+          const skillName = String(args.name ?? id);
+          const description = String(args.description ?? "");
+          const body = String(args.body ?? "");
+          const scope = args.scope === "project" ? "project" : "global";
+          const created = skills.createOrEvolveSkill({
+            id,
+            name: skillName,
+            description,
+            body,
+            scope,
+          });
+          return {
+            output: `Created/evolved skill '${created.id}' at ${created.sourcePath}`,
+            summary: created.id,
+          };
+        }
+
+        case "anti_slop_audit": {
+          const targetRel = typeof args.path === "string" ? args.path.trim() : "";
+          const filesToAudit = targetRel
+            ? [resolveWorkspacePath(opts.cwd, targetRel)]
+            : opts.checkpoints.listModifiedFiles();
+
+          if (filesToAudit.length === 0) {
+            return { output: "No files to audit (clean)." };
+          }
+
+          const reports = filesToAudit
+            .filter((f) => existsSync(f) && statSync(f).isFile())
+            .map((f) => auditCodeForSlop(relative(opts.cwd, f), readFileSync(f, "utf8")));
+
+          const allIssues = reports.flatMap((r) =>
+            r.issues.map((iss) => `${r.filePath}:${iss.line} [${iss.severity}] ${iss.message}: ${iss.excerpt}`),
+          );
+
+          if (allIssues.length === 0) {
+            return {
+              output: `Anti-AI-Slop Audit passed: ${reports.length} file(s) clean.`,
+              summary: "clean",
+            };
+          }
+          return {
+            output: `Anti-AI-Slop Audit found ${allIssues.length} issue(s):\n${allIssues.join("\n")}`,
+            summary: `${allIssues.length} issues`,
+          };
+        }
+
+        case "computer_use": {
+          const action = String(args.action ?? "window_list") as ComputerUseAction;
+          if (action !== "window_list" && action !== "screenshot") {
+            const guard = await checkMutationAllowed(`computer_use(${action})`);
+            if (guard) return guard;
+          }
+          const res = await executeComputerUse({
+            action,
+            x: typeof args.x === "number" ? args.x : undefined,
+            y: typeof args.y === "number" ? args.y : undefined,
+            button:
+              args.button === "right" || args.button === "double" ? args.button : "left",
+            text: typeof args.text === "string" ? args.text : undefined,
+            key: typeof args.key === "string" ? args.key : undefined,
+            url: typeof args.url === "string" ? args.url : undefined,
+          });
+          return {
+            output: res.output,
+            isError: res.isError,
+            summary: action,
+            imageAttachment: res.screenshotAttachment,
+          };
         }
 
         case "subagent": {
@@ -632,7 +1078,17 @@ export function createToolset(opts: ToolsetOptions) {
           const description = String(args.description ?? "subtask");
           const prompt = String(args.prompt ?? "");
           const subResult = await opts.onSubagent({ agent, description, prompt });
-          return { output: subResult };
+          return { output: subResult, summary: `${agent}: ${description}` };
+        }
+
+        case "team_workflow": {
+          if (!opts.onTeamWorkflow) {
+            return { isError: true, output: "Team workflow execution is not enabled in this context." };
+          }
+          const teamId = (args.team ?? "fullstack") as TeamId;
+          const goal = String(args.goal ?? "");
+          const out = await opts.onTeamWorkflow({ teamId, goal });
+          return { output: out, summary: `team: ${teamId}` };
         }
 
         default:
@@ -646,5 +1102,5 @@ export function createToolset(opts: ToolsetOptions) {
     }
   }
 
-  return { specs, execute };
+  return { specs, execute, memory, skills, webSearchRouter };
 }

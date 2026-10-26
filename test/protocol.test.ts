@@ -131,7 +131,7 @@ describe("Multi-wire AivoKey protocol engine (chat, messages, responses)", () =>
     expect(result.requestId).toBe("req_stream_123");
   });
 
-  it("streams /v1/messages (Anthropic wire) with cache_control, server web_search, thinking, and tool_use", async () => {
+  it("streams /v1/messages (Anthropic wire) with cache_control, thinking, tool_use, and client-side tools only (no server web_search)", async () => {
     let capturedBody: Record<string, unknown> | null = null;
 
     const mockFetch: typeof fetch = async (_input, init) => {
@@ -185,12 +185,12 @@ describe("Multi-wire AivoKey protocol engine (chat, messages, responses)", () =>
       messages: [{ role: "user", content: "Read README.md" }],
       tools: SAMPLE_TOOLS,
       reasoningEffort: "medium",
-      webSearch: true,
       fetchFn: mockFetch,
     });
 
     const toolsSent = capturedBody!.tools as Array<Record<string, unknown>>;
-    expect(toolsSent.some((t) => t.type === "web_search_20250305")).toBe(true);
+    // Must NEVER inject AivoKey server-side web_search_20250305
+    expect(toolsSent.some((t) => t.type === "web_search_20250305")).toBe(false);
     expect(result.reasoning).toBe("Deep thought...");
     expect(result.text).toBe("Checking file.");
     expect(result.toolCalls).toEqual([
@@ -206,7 +206,7 @@ describe("Multi-wire AivoKey protocol engine (chat, messages, responses)", () =>
     expect(result.usage.outputTokens).toBe(60);
   });
 
-  it("streams /v1/responses (OpenAI Responses wire) with hosted web_search, reasoning summary, and function calls", async () => {
+  it("streams /v1/responses (OpenAI Responses wire) with reasoning summary and function calls (no hosted server web_search)", async () => {
     let capturedBody: Record<string, unknown> | null = null;
 
     const mockFetch: typeof fetch = async (_input, init) => {
@@ -246,12 +246,11 @@ describe("Multi-wire AivoKey protocol engine (chat, messages, responses)", () =>
       messages: [{ role: "user", content: "Check package.json" }],
       tools: SAMPLE_TOOLS,
       reasoningEffort: "xhigh",
-      webSearch: true,
       fetchFn: mockFetch,
     });
 
     const toolsSent = capturedBody!.tools as Array<Record<string, unknown>>;
-    expect(toolsSent.some((t) => t.type === "web_search")).toBe(true);
+    expect(toolsSent.some((t) => t.type === "web_search")).toBe(false);
     expect(result.reasoning).toBe("Planning step...");
     expect(result.text).toBe("Reading package.json");
     expect(result.toolCalls).toEqual([

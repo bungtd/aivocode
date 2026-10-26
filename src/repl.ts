@@ -8,11 +8,17 @@ import {
   saveUserConfig,
   VALID_EFFORTS,
   VALID_MODES,
+  VALID_TEAMS,
   VALID_WIRES,
   type AivoWire,
   type PermissionMode,
   type ReasoningEffort,
 } from "./config.js";
+import { AGENT_TEAMS, getAgentTeam, type TeamId } from "./teams.js";
+import { auditCodeForSlop } from "./anti-slop.js";
+import { executeComputerUse } from "./computer-use.js";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { relative } from "node:path";
 import {
   fetchModels,
   formatKeyStatusSummary,
@@ -412,8 +418,142 @@ export async function handleSlashCommand(
         return { output: c.slate("Nothing to undo.") };
       }
       return {
-        output: `${c.emerald("✓")} Reverted ${res.restoredFiles.length} file(s) from ${res.turnId}:\n${res.restoredFiles.map((f) => `  • ${c.white(f)}`).join("\n")}`,
+        output: `${c.emerald("✓")} Reverted ${res.restoredFiles.length} file(s) from ${res.turnId} (use /redo to restore):\n${res.restoredFiles.map((f) => `  • ${c.white(f)}`).join("\n")}`,
       };
+    }
+
+    case "/redo": {
+      const res = agent.checkpoints.redoLastUndo();
+      if (res.restoredFiles.length === 0) {
+        return { output: c.slate("Nothing to redo.") };
+      }
+      return {
+        output: `${c.emerald("✓")} Restored ${res.restoredFiles.length} file(s) from ${res.turnId}:\n${res.restoredFiles.map((f) => `  • ${c.white(f)}`).join("\n")}`,
+      };
+    }
+
+    case "/team":
+    case "/agents": {
+      let chosenTeam = arg.toLowerCase() as TeamId;
+      if (!arg && interactive) {
+        const picked = await interactiveSelect<TeamId>({
+          title: "Select Specialist Agent Team & Workflow",
+          initialValue: agent.config.team ?? "fullstack",
+          items: AGENT_TEAMS.map((t) => ({
+            value: t.id,
+            label: t.id,
+            badge: `[${t.roles.map((r) => r.badge).join("→")}]`,
+            detail: `${t.name} — ${t.description.slice(0, 56)}`,
+          })),
+        });
+        if (!picked) return { output: c.slate("Team selection cancelled.") };
+        chosenTeam = picked;
+      }
+      if (!VALID_TEAMS.has(chosenTeam)) {
+        const list = AGENT_TEAMS.map(
+          (t) =>
+            `  ${t.id === (agent.config.team ?? "fullstack") ? c.emerald("❯") : " "} ${c.bold(c.cyan(t.id.padEnd(12)))} ${c.white(t.name)} ${c.slate(`[${t.roles.map((r) => r.badge).join(" → ")}]`)}`,
+        ).join("\n");
+        return {
+          output: `Active team: ${c.emerald(agent.config.team ?? "fullstack")}\nAvailable Specialist Teams:\n${list}\nUsage: ${c.cyan("/team <fullstack|backend|frontend|android|blender3d|gamedev|autopilot>")}`,
+        };
+      }
+      agent.config.team = chosenTeam;
+      saveUserConfig({ team: chosenTeam }, agent.config.globalConfigPath);
+      const t = getAgentTeam(chosenTeam)!;
+      return {
+        output: [
+          `${c.emerald("✓")} Activated Specialist Team: ${c.bold(c.emerald(t.name))} (${t.id})`,
+          `  Roles   : ${t.roles.map((r) => `${c.cyan(r.name)} [${r.badge}]`).join(" → ")}`,
+          `  Workflow: ${t.workflowStages.map((s) => s.title).join(" → ")}`,
+        ].join("\n"),
+      };
+    }
+
+    case "/workflow": {
+      if (!arg) {
+        return {
+          output: `Usage: ${c.cyan("/workflow <goal>")} — runs the active team's (${agent.config.team ?? "fullstack"}) multi-stage Architect → Builder → QA workflow.`,
+        };
+      }
+      const summary = await agent.executeTeamWorkflow(arg, agent.config.team);
+      return { output: summary };
+    }
+
+    case "/btw": {
+      if (!arg) {
+        return {
+          output: `Usage: ${c.cyan("/btw <question>")} — asks a quick side question without adding to session history.`,
+        };
+      }
+      const answer = await agent.askSideQuestion(arg);
+      return {
+        output: `${c.cyan("╭─ /btw Side Answer ───────────────────────────────────────────────────────")}\n${answer}\n${c.cyan("╰──────────────────────────────────────────────────────────────────────────")}`,
+      };
+    }
+
+    case "/skills": {
+      agent.skills.refresh();
+      const list = agent.skills.listSkills();
+      if (list.length === 0) {
+        return { output: c.slate("No skills discovered in .aivokey, .opencode, .dsh, or .claude.") };
+      }
+      return {
+        output: [
+          `${c.cyan("◆")} ${c.bold(`Discovered Skills (${list.length}):`)}`,
+          ...list.map(
+            (s) => `  • ${c.bold(c.emerald(s.id.padEnd(28)))} ${c.slate(s.description.slice(0, 72))}`,
+          ),
+        ].join("\n"),
+      };
+    }
+
+    case "/memory": {
+      const entries = arg
+        ? agent.memory.recall(arg, agent.config.cwd, 10)
+        : agent.memory.listAll().slice(-10);
+      if (entries.length === 0) {
+        return { output: c.slate("No self-learning memories recorded yet.") };
+      }
+      return {
+        output: [
+          `${c.cyan("◆")} ${c.bold(`Self-Learning Memory (${entries.length}):`)}`,
+          ...entries.map(
+            (m) => `  • [${c.violet(m.category)}] ${c.bold(c.white(m.title))}: ${c.slate(m.content)}`,
+          ),
+        ].join("\n"),
+      };
+    }
+
+    case "/audit": {
+      const files = agent.checkpoints.listModifiedFiles();
+      if (files.length === 0) {
+        return { output: c.emerald("✓ No modified files in session (clean).") };
+      }
+      const issues = files
+        .filter((f) => existsSync(f) && statSync(f).isFile())
+        .flatMap((f) => {
+          const rep = auditCodeForSlop(relative(agent.config.cwd, f), readFileSync(f, "utf8"));
+          return rep.issues.map((i) => `  • ${rep.filePath}:${i.line} [${i.severity}] ${i.message}`);
+        });
+      if (issues.length === 0) {
+        return { output: c.emerald(`✓ Anti-AI-Slop Audit passed (${files.length} file(s) clean).`) };
+      }
+      return {
+        output: `${c.amber(`⚠ Anti-AI-Slop Audit found ${issues.length} issue(s):`)}\n${issues.join("\n")}`,
+      };
+    }
+
+    case "/screenshot": {
+      const res = await executeComputerUse({ action: "screenshot" });
+      if (res.screenshotAttachment) {
+        agent.session.messages.push({
+          role: "user",
+          content: "Desktop screenshot attached by user via /screenshot:",
+          images: [res.screenshotAttachment],
+        });
+      }
+      return { output: `${c.emerald("✓")} ${res.output}` };
     }
 
     case "/diff": {

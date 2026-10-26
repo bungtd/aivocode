@@ -1,110 +1,88 @@
-# AivoCode (`@aivokey/cli` / `aivo`)
+# AivoCode (`@aivokey/cli` / `aivo`) v1.0
 
-**AivoCode (`aivo`)** adalah CLI coding harness mandiri yang dirancang khusus untuk ekosistem **AivoKey** (`https://api.aivokey.dev`).
+**AivoCode (`aivo`)** adalah Full-Screen AI Coding Studio & Agent Harness di terminal yang dirancang khusus untuk ekosistem **AivoKey** (`https://api.aivokey.dev`).
 
-Dirancang dengan mempelajari kelebihan dan memperbaiki kelemahan dari coding harness besar (**Claude Code**, **OpenCode**, **Pi**, **DeepSeek Harness / Codex CLI**, **CommandCode**, dan **Hermes Agent**) saat digunakan di atas AivoKey.
+Menggabungkan arsitektur terbaik dari **OpenCode V2**, **Claude Code**, **DeepSeek Harness (`dsh`)**, **Pi (`pi-coding-agent`)**, **Codex CLI**, **CommandCode**, dan **Hermes Agent**, sekaligus memperbaiki seluruh kelemahannya saat berjalan di atas AivoKey.
 
 ---
 
-## Mengapa AivoCode? (Perbandingan dengan Harness Lain di AivoKey)
+## Fitur Utama AivoCode v1.0
 
-| Masalah di Harness Umum saat memakai AivoKey | Solusi Native di AivoCode (`aivo`) |
+### 1. Full-Screen Alt-Buffer TUI Studio (100% Viewport Terminal)
+- Menggunakan **Alternate Screen Buffer (`\x1b[?1049h`)** yang mengisi **100% lebar × tinggi (`columns × rows`)** terminal Anda dan otomatis menyesuaikan ukuran saat window di-resize.
+- **Split-Pane Studio Layout:**
+  - **Top Header Bar:** Menampilkan versi, path workspace, branch Git (`⎇ main*`), mode aktif (`AUTO · BUILD`, `PLAN · ARCHITECT`, `SAFE · CONFIRM`), dan model aktif.
+  - **Main Conversation & Streaming Pane (Kiri ~72%):** Menampilkan percakapan, *Thinking block* (`💭`), kartu eksekusi tool (`● Read`, `● Edit`, `● Bash`), **Colored Unified Diff** bernomor baris (`+` hijau, `-` merah), dan output Markdown.
+  - **Right Telemetry & Workspace Sidebar (Kanan ~28%, toggle `Ctrl+B`):** Menampilkan saldo live `/v1/key`, kuota Plan/Faucet, persentase pemakaian *Context Window*, *Prompt Cache Hit %*, biaya mikro-USD, **Active Specialist Team (`[ARCH → BACK → FRONT → QA]`)**, **Task Board (`todo_write`)**, dan **Touched Files**.
+  - **Bottom Docked Composer Box + Floating Overlays:**
+    - Ketik **`/`** → langsung memunculkan **Floating Slash Command Palette** secara *real-time*.
+    - Ketik **`@`** → langsung memunculkan **Floating `@file` Fuzzy Finder** (mendukung `@file.ts#10-40` rentang baris & `@image.png` lampiran gambar Vision).
+- **Mode Ringkas (`aivo mini` / `--mini`):** Tersedia juga mode inline seperti `opencode mini`.
+
+### 2. Pintasan Keyboard Global (Single-Keystroke Hotkeys)
+| Tombol | Fungsi |
 |---|---|
-| **Claude Code** diam-diam memanggil model background `claude-3-5-haiku` jika 6 env var tidak di-set manual → memicu error `403 model_not_in_plan` atau `404 not_found`. | **Smart Model & Subagent Routing:** Memeriksa `/v1/models` dan `/v1/key` secara otomatis. Subagent `explore` otomatis memilih model cepat yang diizinkan oleh paket/free token Anda. |
-| **Jebakan `/v1` di Base URL:** Claude Code gagal (`404`) jika diberi `/v1`, sedangkan OpenCode/Codex gagal (`404`) jika lupa menambahkan `/v1`. | **Auto-Normalized Gateway Origin:** Mau diisi `https://api.aivokey.dev`, `https://api.aivokey.dev/`, atau `https://api.aivokey.dev/v1`, AivoCode otomatis menormalisasi setiap endpoint (`/v1/models`, `/v1/key`, `/v1/chat/completions`, `/v1/messages`, `/v1/responses`). |
-| **OpenCode / Aider** mengharuskan prefix `aivokey/model` atau `openai/model` serta mendaftarkan daftar model secara manual di file JSON, padahal AivoKey menggunakan *bare canonical model ID* (`deepseek-v4-pro`, `glm-5.3`). | **Zero-Config Bare Canonical Discovery:** Otomatis menyinkronkan katalog `/v1/models` secara live dan membersihkan prefix provider yang tidak sengaja diketik (`aivokey/deepseek-v4-pro` → `deepseek-v4-pro`). |
-| **Prompt Cache Miss:** Harness yang menyisipkan timestamp/reminder dinamis di awal percakapan merusak *message-hash* dan *prefix prompt cache* upstream. | **Deterministic Prefix + Sticky Session Header:** Mengirim `x-opencode-session`, `x-session-id`, `x-claude-code-session-id` yang stabil per sesi serta menjaga prefix `systemPrompt` + `AGENTS.md` 100% deterministik agar *cache read* maksimal. |
-| **Tidak tahu sisa kuota/faucet/paket AivoKey:** Pengguna harus bolak-balik membuka web console untuk mengecek sisa saldo, free token faucet, atau jendela kuota 5 jam / 7 hari / bulanan. | **Live `/v1/key` Inspector:** Perintah `aivo status` atau `/status` menampilkan saldo mikro-USD, sisa *Free Faucet Tokens* per model, *Purchased Token Packs*, dan progres kuota `5h` / `7d` / `month` langsung di terminal. |
-| **Retry buta saat error:** Harness lain terus melakukan retry saat `503 no_supply` tanpa `Retry-After` (padahal itu masalah konfigurasi *discount floor*). | **Canonical AivoKey Error Recovery:** Auto-compact saat `400 context_length_exceeded`, menghormati `Retry-After` pada `429`/`503`, dan berhenti cepat (*fail-fast*) dengan menampilkan `x-air-request-id` saat `503 no_supply` tanpa `Retry-After`. |
+| **`Shift+Tab`** / **`Ctrl+T`** | Memutar mode izin secara *live*: `AUTO (Build)` → `PLAN (Architect)` → `SAFE (Confirm)` |
+| **`Ctrl+K`** | Membuka **Interactive Model Switcher Modal** (43+ model live AivoKey) |
+| **`Ctrl+A`** | Membuka **Specialist Agent Team & Workflow Modal** |
+| **`Ctrl+P`** | Membuka **Command Palette Modal** (semua perintah & aksi) |
+| **`Ctrl+E`** | Memutar *Reasoning Effort* secara *live* (`off` → `minimal` → `low` → `medium` → `high` → `xhigh` → `max`) |
+| **`Ctrl+W`** | Memutar protokol Wire AivoKey (`chat` → `messages` → `responses`) |
+| **`Ctrl+B`** | Menampilkan / menyembunyikan *Right Telemetry Sidebar* |
+| **`F2`** | Memutar cepat antar model di katalog |
+| **`PgUp` / `PgDn`** | Menggulir (*scroll*) riwayat percakapan di viewport utama |
+| **`Esc`** | Membatalkan streaming LLM yang sedang berjalan atau menutup modal |
+
+### 3. 7 Specialist Agent Teams & Multi-Stage Workflows (`src/teams.ts`)
+Pilih tim lewat **`Ctrl+A`**, perintah **`/team <id>`**, atau jalankan workflow penuh lewat **`/workflow <tujuan>`** / **`aivo workflow "<tujuan>"`**:
+1. **`fullstack` — Full-Stack Engineering Team (`[ARCH → BACK → FRONT → QA]`)**:
+   - *Full-Stack System Architect* → *Backend & Database Engineer* → *Frontend & UX Engineer* → *Full-Stack QA & Anti-Slop Reviewer*.
+2. **`backend` — Backend, API & Distributed Systems Team (`[ARCH → IMPL → SEC]`)**:
+   - *Distributed Systems Architect* → *API & Database Implementer* → *Security, Egress & Performance Auditor*.
+3. **`frontend` — Frontend, Design System & Web UX Team (`[UX → UI → A11Y]`)**:
+   - *UX & Design System Director* → *Frontend Component Engineer* → *Accessibility & Web Perf Reviewer*.
+4. **`android` — Android & Mobile Engineering Team (`[ARCH → KT → QA]`)**:
+   - *Android Clean Architecture Lead* → *Kotlin & Jetpack Compose Developer* → *Android Lifecycle & Build QA*.
+5. **`blender3d` — 3D Blender & Procedural Asset Team (`[3D-ART → BPY → 3D-QA]`)**:
+   - *3D Technical Art Director* → *Blender Python (`bpy`/`bmesh`) Engineer* → *3D Mesh & Vision QA Validator*.
+6. **`gamedev` — Game Development Team (`[DESIGN → GAME → QA]`)**:
+   - *Lead Game Systems Designer* → *Gameplay & Shader Programmer* → *Frame-Budget & Playability QA* (Godot, Unity, Unreal, Three.js, WebGL).
+7. **`autopilot` — Guided Beginner Autopilot Team (`[GUIDE → BUILD → LAUNCH]`)**:
+   - Dirancang khusus untuk pengguna **tanpa latar belakang IT/coding**: menerjemahkan ide bahasa sehari-hari menjadi aplikasi siap pakai dan memberikan panduan penggunaan bebas jargon teknis.
+
+### 4. Client-Side WebSearch Router & HTML-to-Markdown WebFetch (`src/web.ts`)
+- **Tidak menggunakan server-side websearch AivoKey.**
+- **`web_search`:** Merutekan pencarian secara client-side lintas **Exa (`EXA_API_KEY`)**, **Tavily (`TAVILY_API_KEY`)**, **Firecrawl (`FIRECRAWL_API_KEY`)**, **Brave (`BRAVE_API_KEY`)**, dan **Zero-Key DuckDuckGo HTML Fallback** (otomatis berfungsi meskipun tanpa API key pencari tambahan!), lengkap dengan *cooldown* `Retry-After` saat HTTP 429 dan rotasi otomatis.
+- **`web_fetch`:** Mengambil halaman web (`markdown` | `text` | `html`) dan mengonversi HTML menjadi Markdown bersih (headings, links, code blocks, lists) seperti OpenCode V2.
+
+### 5. Multimodal Vision & Computer Use (`src/vision.ts`, `src/computer-use.ts`)
+- **Multimodal Vision:** Mendeteksi PNG, JPEG, GIF, dan WebP dari *magic bytes*, membaca dimensi piksel (`width × height`), dan mengirimkannya pada wire `chat`, `messages`, maupun `responses`. Jika model aktif belum mendukung vision, otomatis merutekan langkah tersebut ke model vision AivoKey (`deepseek-v4-flash`, `gemini-3.8-flash`, `claude-sonnet-5-5`).
+- **Computer Use (`computer_use` / `/screenshot`):** Mengambil *screenshot* layar desktop secara langsung ke Vision, melihat daftar window aplikasi yang terbuka (`window_list`), membuka URL di browser (`open_url`), serta menggerakkan/klik mouse dan mengetik keyboard.
+
+### 6. Self-Learning Memory, Self-Evolving Skills & Anti-AI-Slop Guard
+- **Self-Learning Memory (`~/.aivokey/memory/memories.jsonl`):** Menyimpan pelajaran bug, arsitektur proyek, dan preferensi pengguna (`memory_remember`, `memory_search`, `/memory`) serta menyuntikkannya sebagai konteks pre-step tanpa merusak *prompt cache* AivoKey.
+- **Multi-Harness Skill Loader & Self-Evolving Skill Creator (`src/skills.ts`):** Memuat skill dari `.aivokey/skills`, `.opencode/skills`, `.dsh/skills`, `.claude/skills`, dan memungkinkan AivoCode menciptakan skill baru sendiri lewat tool `skill_create`!
+- **Anti-AI-Slop Quality Guard (`src/anti-slop.ts` / `/audit`):** Mendeteksi dan menolak *placeholder* malas (`// TODO: implement`, `// ... rest of code`), fungsi stub belum selesai, dan penggunaan `as any` buta.
+- **Snapshots `/undo` & `/redo` (`src/checkpoint.ts`) + `/btw` Side Questions:** Membatalkan atau mengembalikan perubahan file per giliran tanpa `git reset --hard`, serta menjawab pertanyaan sampingan cepat lewat `/btw <pertanyaan>` tanpa mengotori riwayat sesi.
 
 ---
 
-## Instalasi & Menjalankan
-
-Repositori ini berada di `C:\Dev\Projects\aivokey-cli` (terpisah sepenuhnya dari repositori `aivokey`).
-
-```bash
-cd C:\Dev\Projects\aivokey-cli
-pnpm install
-pnpm build
-```
-
-Untuk memasang perintah `aivo` secara global di mesin lokal Anda:
-
-```bash
-npm link
-```
-
-Atau jalankan langsung:
-
-```bash
-node C:\Dev\Projects\aivokey-cli\dist\bin.js --help
-```
-
----
-
-## Quickstart
-
-### 1. Simpan API Key AivoKey Anda
-
-```bash
-aivo login sk-aivo_YOUR_KEY
-```
-
-Atau gunakan environment variable:
+## Cara Menggunakan
 
 ```powershell
-$env:AIVOKEY_API_KEY="sk-aivo_YOUR_KEY"
-$env:AIVOKEY_BASE_URL="https://api.aivokey.dev"
-```
-
-### 2. Cek Koneksi, Kuota & Model (`doctor` / `status` / `models`)
-
-```bash
-aivo doctor
-aivo status
-aivo models --tools
-aivo models --free
-```
-
-### 3. Mode Interaktif (REPL)
-
-```bash
+# 1. Buka Full-Screen TUI Studio (100% layar terminal)
 aivo
+
+# 2. Atau buka mode inline ringkas
+aivo mini
+
+# 3. Lihat daftar 7 Specialist Agent Teams
+aivo teams
+
+# 4. Jalankan workflow tim spesialis secara langsung
+aivo workflow "Buat REST API autentikasi JWT beserta unit test" --team backend
+aivo workflow "Buat script Blender Python meja kayu low-poly" --team blender3d
+
+# 5. Perintah one-shot cepat
+aivo -p "Analisa @src/agent.ts#1-60"
 ```
-
-Di dalam sesi interaktif:
-- Ketik tugas coding seperti biasa.
-- Gunakan `@path/to/file.ts` untuk melampirkan isi file bernomor baris langsung ke prompt.
-- Gunakan `!git status` atau `!pnpm test` untuk menjalankan perintah shell langsung tanpa memakai token LLM.
-- Gunakan `/undo` kapan saja untuk membatalkan perubahan file pada giliran terakhir (menggunakan *File Checkpoint* otomatis tanpa `git reset --hard`).
-
-### 4. Mode Non-Interaktif (One-Shot / Otomasi)
-
-```bash
-aivo -p "Perbaiki bug validasi di @src/index.ts dan jalankan test"
-aivo run "Refactor router" --model deepseek-v4-pro --effort xhigh --wire chat
-```
-
----
-
-## Daftar Slash Commands di Mode Interaktif
-
-| Perintah | Fungsi |
-|---|---|
-| `/help` | Menampilkan daftar perintah & pintasan |
-| `/models [filter]` | Menampilkan katalog model live dari `/v1/models` (`--tools`, `--free`, atau kata kunci) |
-| `/model <id>` | Mengganti model aktif (mis. `/model deepseek-v4-pro`, `/model glm-5.3`) |
-| `/effort <level>` | Mengatur *reasoning effort* (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `off`) |
-| `/wire <wire>` | Mengganti protokol wire AivoKey (`chat`, `messages`, `responses`) |
-| `/mode <mode>` | Mengganti mode izin: `auto` (eksekusi penuh), `safe` (konfirmasi sebelum edit/shell), `plan` (read-only arsitek) |
-| `/web <on\|off>` | Mengaktifkan/menonaktifkan server-side web search AivoKey |
-| `/status` / `/key` | Menampilkan saldo `/v1/key`, token faucet gratis, token pack, kuota plan (`5h`/`7d`/`month`), & statistik cache sesi |
-| `/compact` | Memadatkan riwayat percakapan untuk menghemat *context window* dan biaya |
-| `/undo` | Mengembalikan file yang diubah/dibuat pada giliran terakhir melalui *CheckpointManager* |
-| `/diff` | Menampilkan daftar file yang disentuh sesi ini beserta `git status -s` |
-| `/todo` | Menampilkan checklist tugas agen saat ini |
-| `/fork` | Mencabangkan percakapan saat ini ke *sticky session ID* baru |
-| `/clear` / `/new` | Memulai sesi baru yang bersih |
-| `/sessions` | Menampilkan daftar sesi yang tersimpan di `~/.aivokey/sessions` |
-| `/exit` / `/quit` | Keluar dari AivoCode |

@@ -1,9 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import type { TeamId } from "./teams.js";
 
 export const DEFAULT_GATEWAY_ORIGIN = "https://api.aivokey.dev";
-export const DEFAULT_MODEL = "deepseek-v4-pro";
+export const DEFAULT_MODEL = "deepseek-v4-flash";
 
 export type AivoWire = "chat" | "messages" | "responses";
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "off";
@@ -20,6 +21,15 @@ export const VALID_EFFORTS = new Set<ReasoningEffort>([
   "off",
 ]);
 export const VALID_MODES = new Set<PermissionMode>(["auto", "safe", "plan"]);
+export const VALID_TEAMS = new Set<TeamId>([
+  "fullstack",
+  "backend",
+  "frontend",
+  "android",
+  "blender3d",
+  "gamedev",
+  "autopilot",
+]);
 
 export interface UserConfigFile {
   apiKey?: string;
@@ -29,6 +39,7 @@ export interface UserConfigFile {
   wire?: AivoWire;
   reasoningEffort?: ReasoningEffort;
   mode?: PermissionMode;
+  team?: TeamId;
   webSearch?: boolean;
 }
 
@@ -40,6 +51,7 @@ export interface AivoConfig {
   wire: AivoWire;
   reasoningEffort: ReasoningEffort;
   mode: PermissionMode;
+  team?: TeamId;
   webSearch: boolean;
   cwd: string;
   globalConfigPath: string;
@@ -183,6 +195,9 @@ export function loadUserConfig(path: string = defaultGlobalConfigPath()): UserCo
     if (typeof raw.mode === "string" && VALID_MODES.has(raw.mode as PermissionMode)) {
       cfg.mode = raw.mode as PermissionMode;
     }
+    if (typeof raw.team === "string" && VALID_TEAMS.has(raw.team as TeamId)) {
+      cfg.team = raw.team as TeamId;
+    }
     if (typeof raw.webSearch === "boolean") {
       cfg.webSearch = raw.webSearch;
     }
@@ -268,7 +283,7 @@ export function resolveConfig(opts: ResolveConfigOptions = {}): AivoConfig {
     env.AIVOKEY_REASONING_EFFORT ??
     workspaceCfg.reasoningEffort ??
     globalCfg.reasoningEffort ??
-    "medium"
+    "off"
   ) as ReasoningEffort;
 
   const rawMode = (
@@ -279,6 +294,13 @@ export function resolveConfig(opts: ResolveConfigOptions = {}): AivoConfig {
     "auto"
   ) as PermissionMode;
 
+  const rawTeam = (
+    cli.team ??
+    env.AIVOKEY_TEAM ??
+    workspaceCfg.team ??
+    globalCfg.team
+  ) as TeamId | undefined;
+
   const webSearch =
     cli.webSearch ??
     (env.AIVOKEY_WEB_SEARCH === "1" || env.AIVOKEY_WEB_SEARCH === "true"
@@ -288,7 +310,7 @@ export function resolveConfig(opts: ResolveConfigOptions = {}): AivoConfig {
         : undefined) ??
     workspaceCfg.webSearch ??
     globalCfg.webSearch ??
-    false;
+    true;
 
   return {
     apiKey: rawApiKey.trim(),
@@ -296,8 +318,9 @@ export function resolveConfig(opts: ResolveConfigOptions = {}): AivoConfig {
     model: normalizeModelId(rawModel),
     fastModel: rawFastModel ? normalizeModelId(rawFastModel) : null,
     wire: VALID_WIRES.has(rawWire) ? rawWire : "chat",
-    reasoningEffort: VALID_EFFORTS.has(rawEffort) ? rawEffort : "medium",
+    reasoningEffort: VALID_EFFORTS.has(rawEffort) ? rawEffort : "off",
     mode: VALID_MODES.has(rawMode) ? rawMode : "auto",
+    ...(rawTeam && VALID_TEAMS.has(rawTeam) ? { team: rawTeam } : {}),
     webSearch,
     cwd,
     globalConfigPath,
