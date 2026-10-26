@@ -7,7 +7,7 @@ import {
 import { AivoApiError } from "./errors.js";
 import { streamTurn, type ChatMessage } from "./protocol.js";
 import { CheckpointManager } from "./checkpoint.js";
-import { createToolset, type TodoItem } from "./tools/index.js";
+import { createToolset, type TodoItem, type ToolExecutionResult } from "./tools/index.js";
 import {
   buildSystemPrompt,
   compactConversation,
@@ -20,7 +20,13 @@ export interface AgentCallbacks {
   onReasoningDelta?: (delta: string) => void;
   onTextDelta?: (delta: string) => void;
   onToolCall?: (name: string, args: Record<string, unknown>) => void;
-  onToolResult?: (name: string, output: string, isError?: boolean) => void;
+  onToolResult?: (
+    name: string,
+    output: string,
+    isError?: boolean,
+    details?: ToolExecutionResult,
+    args?: Record<string, unknown>,
+  ) => void;
   onNotice?: (message: string) => void;
   confirmAction?: (description: string) => Promise<boolean>;
 }
@@ -254,9 +260,11 @@ export class AivoAgent {
       if (allReadOnly && stepRes.toolCalls.length > 1) {
         const results = await Promise.all(
           stepRes.toolCalls.map(async (tc) => {
+            const t0 = Date.now();
             this.callbacks.onToolCall?.(tc.name, tc.arguments);
             const execRes = await toolset.execute(tc.name, tc.arguments);
-            this.callbacks.onToolResult?.(tc.name, execRes.output, execRes.isError);
+            if (execRes.durationMs === undefined) execRes.durationMs = Date.now() - t0;
+            this.callbacks.onToolResult?.(tc.name, execRes.output, execRes.isError, execRes, tc.arguments);
             return { tc, execRes };
           }),
         );
@@ -271,9 +279,11 @@ export class AivoAgent {
         }
       } else {
         for (const tc of stepRes.toolCalls) {
+          const t0 = Date.now();
           this.callbacks.onToolCall?.(tc.name, tc.arguments);
           const execRes = await toolset.execute(tc.name, tc.arguments);
-          this.callbacks.onToolResult?.(tc.name, execRes.output, execRes.isError);
+          if (execRes.durationMs === undefined) execRes.durationMs = Date.now() - t0;
+          this.callbacks.onToolResult?.(tc.name, execRes.output, execRes.isError, execRes, tc.arguments);
           this.session.messages.push({
             role: "tool",
             toolCallId: tc.id,

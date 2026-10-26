@@ -35,6 +35,10 @@ describe("File Checkpoints (/undo) & Coding Tools", () => {
         newString: "const b = 42;",
       });
       expect(editRes.isError).toBeFalsy();
+      expect(editRes.diff).toBeDefined();
+      expect(editRes.diff?.filePath).toBe("sample.ts");
+      expect(editRes.diff?.before).toContain("const b = 2;");
+      expect(editRes.diff?.after).toContain("const b = 42;");
 
       const updatedContent = readFileSync(target, "utf8");
       expect(updatedContent).toBe("const a = 1;\r\nconst b = 42;\r\nexport const sum = a + b;\r\n");

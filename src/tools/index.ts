@@ -19,9 +19,18 @@ export interface TodoItem {
   status: "pending" | "in_progress" | "completed";
 }
 
+export interface ToolExecutionDiff {
+  filePath: string;
+  before: string;
+  after: string;
+}
+
 export interface ToolExecutionResult {
   output: string;
   isError?: boolean;
+  summary?: string;
+  durationMs?: number;
+  diff?: ToolExecutionDiff;
 }
 
 export interface ToolsetOptions {
@@ -105,6 +114,15 @@ function globToRegExp(glob: string): RegExp {
   }
   regexStr += "$";
   return new RegExp(regexStr, "i");
+}
+
+export function walkWorkspaceFiles(
+  rootDir: string,
+  includeHidden: boolean = false,
+  maxFiles: number = 2000,
+): string[] {
+  const absFiles = walkFiles(rootDir, includeHidden, maxFiles);
+  return absFiles.map((f) => relative(rootDir, f).replace(/\\/g, "/"));
 }
 
 function walkFiles(
@@ -343,20 +361,28 @@ export function createToolset(opts: ToolsetOptions) {
         }
 
         case "write_file": {
+          const startedAt = Date.now();
           const rawPath = String(args.path ?? "");
           const content = String(args.content ?? "");
           const guard = await checkMutationAllowed(`write_file(${rawPath})`);
           if (guard) return guard;
 
           const absPath = resolveWorkspacePath(opts.cwd, rawPath);
+          const before = existsSync(absPath) ? readFileSync(absPath, "utf8") : "";
           opts.checkpoints.snapshotBeforeWrite(absPath);
           mkdirSync(dirname(absPath), { recursive: true });
           writeFileSync(absPath, content, "utf8");
           const lineCount = content.split(/\r?\n/).length;
-          return { output: `Wrote ${rawPath} (${lineCount} lines)` };
+          return {
+            output: `Wrote ${rawPath} (${lineCount} lines)`,
+            summary: `${lineCount} lines`,
+            durationMs: Date.now() - startedAt,
+            diff: { filePath: rawPath, before, after: content },
+          };
         }
 
         case "edit_file": {
+          const startedAt = Date.now();
           const rawPath = String(args.path ?? "");
           const rawOld = String(args.oldString ?? "");
           const rawNew = String(args.newString ?? "");
@@ -409,6 +435,9 @@ export function createToolset(opts: ToolsetOptions) {
           writeFileSync(absPath, finalContent, "utf8");
           return {
             output: `Edited ${rawPath} (${replaceAll ? occurrences : 1} replacement${occurrences > 1 && replaceAll ? "s" : ""})`,
+            summary: `${replaceAll ? occurrences : 1} replacement${occurrences > 1 && replaceAll ? "s" : ""}`,
+            durationMs: Date.now() - startedAt,
+            diff: { filePath: rawPath, before: normOriginal, after: updatedLf },
           };
         }
 

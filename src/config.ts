@@ -109,8 +109,7 @@ export function endpointUrl(baseUrlOrOrigin: string, endpoint: GatewayEndpoint):
 /**
  * Normalize model IDs to AivoKey's bare canonical format:
  * - Strips accidental provider prefixes (`aivokey/deepseek-v4-pro` -> `deepseek-v4-pro`)
- * - Normalizes hyphenated Claude version tails (`claude-sonnet-4-5` -> `claude-sonnet-4.5`)
- * - Lowercases and trims.
+ * - Lowercases and trims while preserving exact hyphen/dot canonical slugs (`claude-sonnet-5-5`, `claude-opus-4.6`).
  */
 export function normalizeModelId(raw: string | undefined | null): string {
   let id = (raw ?? "").trim().toLowerCase();
@@ -123,9 +122,23 @@ export function normalizeModelId(raw: string | undefined | null): string {
       id = parts[parts.length - 1]!;
     }
   }
-  // Normalize claude-*-4-5 / claude-*-4-6 style slugs to canonical dot notation
-  id = id.replace(/^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)$/, "$1.$2");
   return id;
+}
+
+/**
+ * Matches a user-supplied model ID against the live catalog, handling dot/hyphen
+ * variations (e.g. `claude-opus-4-6` <-> `claude-opus-4.6`).
+ */
+export function matchCatalogModelId(
+  rawId: string,
+  catalogIds: string[],
+): string {
+  const norm = normalizeModelId(rawId);
+  if (catalogIds.includes(norm)) return norm;
+  const canonicalKey = (s: string) => s.replace(/[._-]/g, "-");
+  const targetKey = canonicalKey(norm);
+  const matched = catalogIds.find((c) => canonicalKey(c) === targetKey);
+  return matched ?? norm;
 }
 
 export function looksLikeApiKey(value: string): boolean {

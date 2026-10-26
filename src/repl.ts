@@ -2,6 +2,8 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { execSync } from "node:child_process";
 import {
+  maskApiKey,
+  matchCatalogModelId,
   normalizeModelId,
   saveUserConfig,
   VALID_EFFORTS,
@@ -12,19 +14,35 @@ import {
   type ReasoningEffort,
 } from "./config.js";
 import {
+  fetchModels,
   formatKeyStatusSummary,
   formatMicroUsd,
   inspectKey,
   isModelUsableByKey,
+  recommendCodingModels,
   type AivoModelInfo,
   type KeyInspectStatus,
 } from "./aivokey-client.js";
-import { formatTodoList } from "./tools/index.js";
+import { walkWorkspaceFiles } from "./tools/index.js";
+import { buildSystemPrompt, estimateConversationTokens } from "./context.js";
 import type { AivoAgent } from "./agent.js";
+import {
+  c,
+  formatCompactTokens,
+  getGitBranchLabel,
+  renderHeaderBanner,
+  renderStatusBar,
+  renderTodoBoard,
+  renderToolCallCard,
+  TerminalSpinner,
+} from "./ui/theme.js";
+import { renderUnifiedDiff } from "./ui/markdown.js";
+import { completeInputToken, interactiveSelect, SLASH_COMMANDS } from "./ui/select.js";
 
 export interface SlashCommandResult {
   output: string;
   shouldExit?: boolean;
+  updatedKeyStatus?: KeyInspectStatus | null;
 }
 
 export function formatModelsTable(
@@ -44,35 +62,54 @@ export function formatModelsTable(
   });
 
   if (filtered.length === 0) {
-    return `No models matched '${filter ?? ""}'.`;
+    return c.amber(`No models matched '${filter ?? ""}'.`);
   }
 
   const lines: string[] = [
-    "Model ID                  Ctx     In/Out ($/1M)   Badges",
-    "──────────────────────────────────────────────────────────────────────────",
+    `${c.cyan("╭─")} ${c.bold(`AivoKey Live Model Catalog (${filtered.length})`)} ${c.cyan("─".repeat(42))}`,
+    `${c.cyan("│")} ${c.slate("Model ID                  Ctx      In / Out ($/1M)   Capabilities & Quota")}`,
+    `${c.cyan("├" + "─".repeat(74))}`,
   ];
 
   for (const m of filtered) {
-    const marker = m.id === activeModel ? "* " : "  ";
-    const idCol = (marker + m.id).padEnd(25).slice(0, 25);
-    const ctxCol = `${Math.round(m.contextWindow / 1000)}K`.padEnd(7);
+    const isCurrent = m.id === activeModel;
+    const marker = isCurrent ? c.emerald("❯ ") : "  ";
+    const idPadded = m.id.padEnd(23).slice(0, 23);
+    const idCol = isCurrent ? c.bold(c.emerald(idPadded)) : c.white(idPadded);
+    const ctxCol = formatCompactTokens(m.contextWindow).padEnd(8);
     const inUsd = (Number(m.inputMicroPer1M) / 1_000_000).toFixed(2);
     const outUsd = (Number(m.outputMicroPer1M) / 1_000_000).toFixed(2);
-    const priceCol = `$${inUsd}/$${outUsd}`.padEnd(15);
+    const priceCol = `$${inUsd} / $${outUsd}`.padEnd(17);
 
     const badges: string[] = [];
-    if (m.supportsTools) badges.push("tools");
-    if (m.supportsReasoning) badges.push("reasoning");
-    if (m.supportsPromptCache) badges.push("cache");
-    if (m.supportsVision) badges.push("vision");
+    if (m.supportsTools) badges.push(c.cyan("tools"));
+    if (m.supportsReasoning) badges.push(c.violet("reasoning"));
+    if (m.supportsPromptCache) badges.push(c.teal("cache"));
+    if (m.supportsVision) badges.push(c.blue("vision"));
     const free = keyStatus?.freeTokens.find((f) => f.model === m.id && f.remainingTokens > 0n);
-    if (free) badges.push(`FREE:${Number(free.remainingTokens).toLocaleString()}`);
-    if (keyStatus && !isModelUsableByKey(m.id, keyStatus)) badges.push("locked");
+    if (free) {
+      badges.push(c.amber(`FREE:${Number(free.remainingTokens).toLocaleString("en-US")}`));
+    }
+    if (keyStatus && !isModelUsableByKey(m.id, keyStatus)) {
+      badges.push(c.rose("locked"));
+    }
 
-    lines.push(`${idCol} ${ctxCol} ${priceCol} [${badges.join(", ")}]`);
+    lines.push(
+      `${c.cyan("│")} ${marker}${idCol} ${c.slate(ctxCol)} ${c.slate(priceCol)} ${badges.join(c.slate(" · "))}`,
+    );
   }
 
+  lines.push(`${c.cyan("╰" + "─".repeat(74))}`);
   return lines.join("\n");
+}
+
+function renderProgressBar(used: bigint, limit: bigint, width: number = 16): string {
+  if (limit <= 0n) return c.slate("─".repeat(width));
+  const ratio = Math.min(1, Math.max(0, Number(used) / Number(limit)));
+  const filled = Math.round(ratio * width);
+  const empty = Math.max(0, width - filled);
+  const barColor = ratio >= 0.9 ? c.rose : ratio >= 0.7 ? c.amber : c.emerald;
+  return `${barColor("█".repeat(filled))}${c.slate("░".repeat(empty))} ${Math.round(ratio * 100)}%`;
 }
 
 export function formatDetailedStatus(
@@ -85,32 +122,42 @@ export function formatDetailedStatus(
     totalPrompt > 0 ? Math.round((s.totalCacheReadTokens / totalPrompt) * 100) : 0;
 
   const lines: string[] = [
-    `── AivoCode Status ────────────────────────────────────────────────────────`,
-    `Gateway     : ${agent.config.baseUrl}`,
-    `Session ID  : ${s.id} (sticky cache affinity active)`,
-    `Model       : ${agent.config.model}${agent.config.fastModel ? ` (fast explorer: ${agent.config.fastModel})` : ""}`,
-    `Wire / Mode : ${agent.config.wire} · mode=${agent.config.mode} · effort=${agent.config.reasoningEffort} · webSearch=${agent.config.webSearch ? "on" : "off"}`,
-    `Session Use : in=${s.totalInputTokens.toLocaleString()} · cache_read=${s.totalCacheReadTokens.toLocaleString()} (${cacheHitPct}% hit) · out=${s.totalOutputTokens.toLocaleString()} · cost=${formatMicroUsd(BigInt(s.totalCostMicro || "0"))}`,
+    `${c.cyan("╭─")} ${c.bold("AivoCode Telemetry & Quota Inspector")} ${c.cyan("─".repeat(36))}`,
+    `${c.cyan("│")} ${c.slate("Gateway     :")} ${c.white(agent.config.baseUrl)}`,
+    `${c.cyan("│")} ${c.slate("Session ID  :")} ${c.white(s.id)} ${c.teal("(sticky prompt-cache affinity)")}`,
+    `${c.cyan("│")} ${c.slate("Active Model:")} ${c.emerald(c.bold(agent.config.model))}${agent.config.fastModel ? c.slate(` (subagent explorer: ${c.teal(agent.config.fastModel)})`) : ""}`,
+    `${c.cyan("│")} ${c.slate("Config      :")} wire=${c.cyan(agent.config.wire)} · mode=${c.amber(agent.config.mode)} · effort=${c.violet(agent.config.reasoningEffort)} · webSearch=${agent.config.webSearch ? c.emerald("on") : c.slate("off")}`,
+    `${c.cyan("│")} ${c.slate("Session Use :")} in=${s.totalInputTokens.toLocaleString("en-US")} · cache_read=${s.totalCacheReadTokens.toLocaleString("en-US")} (${c.teal(`${cacheHitPct}% hit`)}) · out=${s.totalOutputTokens.toLocaleString("en-US")} · cost=${c.emerald(formatMicroUsd(BigInt(s.totalCostMicro || "0")))}`,
   ];
 
   if (keyStatus) {
-    lines.push(`Account     : ${formatKeyStatusSummary(keyStatus)}`);
+    lines.push(`${c.cyan("├" + "─".repeat(74))}`);
+    lines.push(`${c.cyan("│")} ${c.slate("Account     :")} ${formatKeyStatusSummary(keyStatus)}`);
     if (keyStatus.mode === "plan" && keyStatus.models.length > 0) {
-      lines.push(`Plan Windows:`);
+      lines.push(`${c.cyan("│")} ${c.bold("Per-Model Plan Windows:")}`);
       for (const m of keyStatus.models) {
+        const bar5h = renderProgressBar(m.w5h.usedMicro, m.w5h.limitMicro, 12);
+        const barMo = renderProgressBar(m.month.usedMicro, m.month.limitMicro, 12);
         lines.push(
-          `  - ${m.model}: 5h ${formatMicroUsd(m.w5h.usedMicro)}/${formatMicroUsd(m.w5h.limitMicro)} · month ${formatMicroUsd(m.month.usedMicro)}/${formatMicroUsd(m.month.limitMicro)}`,
+          `${c.cyan("│")}   • ${c.bold(m.model.padEnd(20))} 5h [${bar5h}] ${formatMicroUsd(m.w5h.usedMicro)}/${formatMicroUsd(m.w5h.limitMicro)} · 30d [${barMo}] ${formatMicroUsd(m.month.usedMicro)}/${formatMicroUsd(m.month.limitMicro)}`,
         );
       }
     }
     if (keyStatus.mode === "plan" && keyStatus.global) {
       const g = keyStatus.global;
+      const bar5h = renderProgressBar(g.w5h.usedMicro, g.w5h.limitMicro, 12);
+      const barMo = renderProgressBar(g.month.usedMicro, g.month.limitMicro, 12);
       lines.push(
-        `Global Pool : 5h ${formatMicroUsd(g.w5h.usedMicro)}/${formatMicroUsd(g.w5h.limitMicro)} · month ${formatMicroUsd(g.month.usedMicro)}/${formatMicroUsd(g.month.limitMicro)}`,
+        `${c.cyan("│")} ${c.bold("Global Pool :")} 5h [${bar5h}] ${formatMicroUsd(g.w5h.usedMicro)}/${formatMicroUsd(g.w5h.limitMicro)} · 30d [${barMo}] ${formatMicroUsd(g.month.usedMicro)}/${formatMicroUsd(g.month.limitMicro)}`,
       );
     }
+  } else {
+    lines.push(
+      `${c.cyan("│")} ${c.amber("Account     : API key not verified yet. Run /login <sk-aivo_...> to connect.")}`,
+    );
   }
 
+  lines.push(`${c.cyan("╰" + "─".repeat(74))}`);
   return lines.join("\n");
 }
 
@@ -119,6 +166,7 @@ export async function handleSlashCommand(
   agent: AivoAgent,
   keyStatus: KeyInspectStatus | null,
   fetchFn: typeof fetch = fetch,
+  interactive: boolean = false,
 ): Promise<SlashCommandResult> {
   const parts = line.trim().split(/\s+/);
   const cmd = parts[0]!.toLowerCase();
@@ -128,25 +176,15 @@ export async function handleSlashCommand(
     case "/help":
       return {
         output: [
-          "Available Slash Commands:",
-          "  /models [filter]      List AivoKey models (try '/models --tools' or '/models --free')",
-          "  /model <id>           Switch active canonical model (e.g. /model deepseek-v4-pro)",
-          "  /effort <level>       Set reasoning effort (minimal|low|medium|high|xhigh|max|off)",
-          "  /wire <type>          Switch AivoKey wire (chat|messages|responses)",
-          "  /mode <mode>          Switch permission mode (auto|safe|plan)",
-          "  /web <on|off>         Toggle AivoKey server-side web search",
-          "  /status | /key        Inspect live AivoKey balance, free tokens, plan windows & session stats",
-          "  /compact              Compact conversation history to free up context window",
-          "  /undo                 Revert file changes from the last turn via checkpoints",
-          "  /diff                 Show git status & modified files in this session",
-          "  /todo                 Display active task checklist",
-          "  /fork                 Fork current conversation into a new session ID",
-          "  /clear | /new         Start a fresh session",
-          "  /exit | /quit         Exit AivoCode",
-          "",
-          "Shortcuts:",
-          "  @path/to/file.ts      Attach numbered file contents directly to your prompt",
-          "  !<shell command>      Run a terminal command directly without spending tokens",
+          `${c.cyan("╭─")} ${c.bold("AivoCode Command Reference")} ${c.cyan("─".repeat(45))}`,
+          ...SLASH_COMMANDS.map(
+            (s) => `${c.cyan("│")}  ${c.bold(c.emerald(s.cmd.padEnd(14)))} ${c.slate(s.description)}`,
+          ),
+          `${c.cyan("├" + "─".repeat(74))}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("@path/to/file"))}  ${c.slate("Attach numbered file contents directly to your prompt (Tab autocompletes)")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("!<command>"))}     ${c.slate("Run a shell command directly in terminal without spending LLM tokens")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+C"))}         ${c.slate("Cancel in-flight generation stream without exiting AivoCode")}`,
+          `${c.cyan("╰" + "─".repeat(74))}`,
         ].join("\n"),
       };
 
@@ -156,61 +194,150 @@ export async function handleSlashCommand(
       };
 
     case "/model": {
-      if (!arg) {
-        return { output: `Current model: ${agent.config.model}. Usage: /model <canonical-id>` };
+      let chosenId = arg
+        ? matchCatalogModelId(
+            arg,
+            agent.catalog.map((m) => m.id),
+          )
+        : "";
+      if (!chosenId && interactive && agent.catalog.length > 0) {
+        const picked = await interactiveSelect({
+          title: "Select Active AivoKey Model",
+          initialValue: agent.config.model,
+          items: agent.catalog.map((m) => {
+            const inUsd = (Number(m.inputMicroPer1M) / 1_000_000).toFixed(2);
+            const outUsd = (Number(m.outputMicroPer1M) / 1_000_000).toFixed(2);
+            const badges: string[] = [];
+            if (m.supportsTools) badges.push("tools");
+            if (m.supportsReasoning) badges.push("reasoning");
+            if (m.supportsPromptCache) badges.push("cache");
+            const free = keyStatus?.freeTokens.find(
+              (f) => f.model === m.id && f.remainingTokens > 0n,
+            );
+            if (free) badges.push(`FREE:${formatCompactTokens(Number(free.remainingTokens))}`);
+            return {
+              value: m.id,
+              label: m.id,
+              badge: `[${badges.join("·")}]`,
+              detail: `${formatCompactTokens(m.contextWindow)} ctx · $${inUsd}/$${outUsd}`,
+            };
+          }),
+        });
+        if (!picked) return { output: c.slate("Model selection cancelled.") };
+        chosenId = picked;
       }
-      const nextId = normalizeModelId(arg);
-      const found = agent.catalog.find((m) => m.id === nextId);
+
+      if (!chosenId) {
+        return {
+          output: `Current model: ${c.emerald(c.bold(agent.config.model))}. Usage: ${c.cyan("/model <canonical-id>")}`,
+        };
+      }
+
+      const found = agent.catalog.find((m) => m.id === chosenId);
       const warnings: string[] = [];
       if (found && !found.supportsTools) {
-        warnings.push(`Warning: '${nextId}' does not advertise tool calling; agentic file edits may not work.`);
+        warnings.push(
+          c.amber(
+            `  ⚠ '${chosenId}' does not advertise tool calling; agentic file edits may not work.`,
+          ),
+        );
       }
-      if (keyStatus && !isModelUsableByKey(nextId, keyStatus)) {
-        warnings.push(`Warning: '${nextId}' may not be covered by your active plan/free tokens unless balance fallback is on.`);
+      if (keyStatus && !isModelUsableByKey(chosenId, keyStatus)) {
+        warnings.push(
+          c.amber(
+            `  ⚠ '${chosenId}' may not be covered by your active plan/free tokens unless balance fallback is on.`,
+          ),
+        );
       }
-      agent.config.model = nextId;
-      agent.session.model = nextId;
-      saveUserConfig({ model: nextId }, agent.config.globalConfigPath);
+      agent.config.model = chosenId;
+      agent.session.model = chosenId;
+      saveUserConfig({ model: chosenId }, agent.config.globalConfigPath);
       return {
-        output: [`Switched active model to: ${nextId}`, ...warnings].join("\n"),
+        output: [
+          `${c.emerald("✓")} Switched active model to ${c.bold(c.emerald(chosenId))}`,
+          ...warnings,
+        ].join("\n"),
       };
     }
 
     case "/effort": {
-      const level = arg.toLowerCase() as ReasoningEffort;
+      let level = arg.toLowerCase() as ReasoningEffort;
+      if (!arg && interactive) {
+        const picked = await interactiveSelect<ReasoningEffort>({
+          title: "Select Reasoning Effort Level",
+          initialValue: agent.config.reasoningEffort,
+          items: [
+            { value: "minimal", label: "minimal", detail: "Fastest responses, minimal thinking tokens" },
+            { value: "low", label: "low", detail: "Light reasoning for quick edits" },
+            { value: "medium", label: "medium", detail: "Balanced reasoning for daily coding (default)" },
+            { value: "high", label: "high", detail: "Deep multi-file architectural reasoning" },
+            { value: "xhigh", label: "xhigh", detail: "Extended reasoning for complex debugging" },
+            { value: "max", label: "max", detail: "Maximum thinking budget supported by model" },
+            { value: "off", label: "off", detail: "Disable reasoning / thinking blocks" },
+          ],
+        });
+        if (!picked) return { output: c.slate("Effort selection cancelled.") };
+        level = picked;
+      }
       if (!VALID_EFFORTS.has(level)) {
         return {
-          output: `Current effort: ${agent.config.reasoningEffort}. Valid levels: ${[...VALID_EFFORTS].join(", ")}`,
+          output: `Current effort: ${c.violet(agent.config.reasoningEffort)}. Valid levels: ${[...VALID_EFFORTS].join(", ")}`,
         };
       }
       agent.config.reasoningEffort = level;
       saveUserConfig({ reasoningEffort: level }, agent.config.globalConfigPath);
-      return { output: `Reasoning effort set to: ${level}` };
+      return { output: `${c.emerald("✓")} Reasoning effort set to: ${c.bold(c.violet(level))}` };
     }
 
     case "/wire": {
-      const w = arg.toLowerCase() as AivoWire;
+      let w = arg.toLowerCase() as AivoWire;
+      if (!arg && interactive) {
+        const picked = await interactiveSelect<AivoWire>({
+          title: "Select AivoKey Protocol Wire",
+          initialValue: agent.config.wire,
+          items: [
+            { value: "chat", label: "chat", detail: "POST /v1/chat/completions (OpenAI Chat Completions)" },
+            { value: "messages", label: "messages", detail: "POST /v1/messages (Anthropic Messages + ephemeral cache + server web tools)" },
+            { value: "responses", label: "responses", detail: "POST /v1/responses (OpenAI Responses + hosted web_search)" },
+          ],
+        });
+        if (!picked) return { output: c.slate("Wire selection cancelled.") };
+        w = picked;
+      }
       if (!VALID_WIRES.has(w)) {
         return {
-          output: `Current wire: ${agent.config.wire}. Valid wires: chat, messages, responses`,
+          output: `Current wire: ${c.cyan(agent.config.wire)}. Valid wires: chat, messages, responses`,
         };
       }
       agent.config.wire = w;
       agent.session.wire = w;
       saveUserConfig({ wire: w }, agent.config.globalConfigPath);
-      return { output: `Switched AivoKey wire protocol to: ${w}` };
+      return { output: `${c.emerald("✓")} Switched AivoKey wire protocol to: ${c.bold(c.cyan(w))}` };
     }
 
     case "/mode": {
-      const m = arg.toLowerCase() as PermissionMode;
+      let m = arg.toLowerCase() as PermissionMode;
+      if (!arg && interactive) {
+        const picked = await interactiveSelect<PermissionMode>({
+          title: "Select Agent Permission Mode",
+          initialValue: agent.config.mode,
+          items: [
+            { value: "auto", label: "auto", detail: "Full autonomous coding agent (read, edit, write, shell)" },
+            { value: "safe", label: "safe", detail: "Ask confirmation before file mutations or shell commands" },
+            { value: "plan", label: "plan", detail: "Read-only Architect Mode (explores & plans without touching files)" },
+          ],
+        });
+        if (!picked) return { output: c.slate("Mode selection cancelled.") };
+        m = picked;
+      }
       if (!VALID_MODES.has(m)) {
         return {
-          output: `Current mode: ${agent.config.mode}. Valid modes: auto, safe, plan`,
+          output: `Current mode: ${c.amber(agent.config.mode)}. Valid modes: auto, safe, plan`,
         };
       }
       agent.config.mode = m;
       saveUserConfig({ mode: m }, agent.config.globalConfigPath);
-      return { output: `Permission mode set to: ${m}` };
+      return { output: `${c.emerald("✓")} Permission mode set to: ${c.bold(c.amber(m))}` };
     }
 
     case "/web": {
@@ -221,37 +348,65 @@ export async function handleSlashCommand(
           : toggle === "off" || toggle === "false" || toggle === "0"
             ? false
             : !agent.config.webSearch;
-      return { output: `AivoKey server web search: ${agent.config.webSearch ? "ON" : "OFF"}` };
+      saveUserConfig({ webSearch: agent.config.webSearch }, agent.config.globalConfigPath);
+      return {
+        output: `${c.emerald("✓")} AivoKey server web search: ${agent.config.webSearch ? c.emerald("ON") : c.slate("OFF")}`,
+      };
+    }
+
+    case "/login": {
+      if (!arg) {
+        return {
+          output: `Usage: ${c.cyan("/login sk-aivo_YOUR_KEY")} — saves and verifies your AivoKey API key immediately.`,
+        };
+      }
+      const cleanKey = arg.trim();
+      agent.config.apiKey = cleanKey;
+      saveUserConfig({ apiKey: cleanKey }, agent.config.globalConfigPath);
+      try {
+        const verified = await inspectKey(agent.config.baseUrl, cleanKey, fetchFn);
+        return {
+          output: `${c.emerald("✓")} API key saved (${maskApiKey(cleanKey)}) & verified: ${formatKeyStatusSummary(verified)}`,
+          updatedKeyStatus: verified,
+        };
+      } catch (err) {
+        return {
+          output: `${c.amber("⚠")} Saved key (${maskApiKey(cleanKey)}), but verification failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
     }
 
     case "/status":
     case "/usage":
     case "/key": {
       let liveKey = keyStatus;
-      if (!liveKey && agent.config.apiKey) {
+      if (agent.config.apiKey && (!liveKey || interactive)) {
         try {
           liveKey = await inspectKey(agent.config.baseUrl, agent.config.apiKey, fetchFn);
         } catch {
-          /* use cached */
+          /* fall back to cached keyStatus */
         }
       }
-      return { output: formatDetailedStatus(agent, liveKey) };
+      return {
+        output: formatDetailedStatus(agent, liveKey),
+        updatedKeyStatus: liveKey,
+      };
     }
 
     case "/compact": {
-      const c = agent.compactNow();
+      const res = agent.compactNow();
       return {
-        output: `Compacted session history: ${c.beforeTokens.toLocaleString()} -> ${c.afterTokens.toLocaleString()} estimated tokens.`,
+        output: `${c.emerald("✓")} Compacted session history: ${res.beforeTokens.toLocaleString("en-US")} → ${res.afterTokens.toLocaleString("en-US")} estimated tokens.`,
       };
     }
 
     case "/undo": {
       const res = agent.checkpoints.undoLastTurn();
       if (res.restoredFiles.length === 0) {
-        return { output: "Nothing to undo." };
+        return { output: c.slate("Nothing to undo.") };
       }
       return {
-        output: `Reverted ${res.restoredFiles.length} file(s) from ${res.turnId}:\n${res.restoredFiles.map((f) => `  - ${f}`).join("\n")}`,
+        output: `${c.emerald("✓")} Reverted ${res.restoredFiles.length} file(s) from ${res.turnId}:\n${res.restoredFiles.map((f) => `  • ${c.white(f)}`).join("\n")}`,
       };
     }
 
@@ -261,29 +416,31 @@ export async function handleSlashCommand(
         const touched = agent.checkpoints.listModifiedFiles();
         return {
           output: [
-            `Session touched files (${touched.length}):`,
-            ...(touched.length > 0 ? touched.map((f) => `  - ${f}`) : ["  (none)"]),
+            `${c.cyan("◆")} ${c.bold(`Session Checkpointed Files (${touched.length}):`)}`,
+            ...(touched.length > 0 ? touched.map((f) => `  • ${c.white(f)}`) : [`  ${c.slate("(none)")}`]),
             "",
-            "Git status:",
-            diff || "  (working tree clean)",
+            `${c.cyan("◆")} ${c.bold("Git Working Tree:")}`,
+            diff ? diff.split("\n").map((l) => `  ${l}`).join("\n") : `  ${c.slate("(clean)")}`,
           ].join("\n"),
         };
       } catch {
-        return { output: "Unable to run git status in this directory." };
+        return { output: c.amber("Unable to run git status in this directory.") };
       }
     }
 
     case "/todo":
-      return { output: formatTodoList(agent.todos) };
+      return { output: renderTodoBoard(agent.todos) };
 
     case "/fork": {
       agent.sessionStore.saveSession(agent.session);
       const forked = agent.sessionStore.forkSession(agent.session.id);
       if (!forked) {
-        return { output: "Failed to fork session." };
+        return { output: c.rose("Failed to fork session.") };
       }
       agent.session = forked;
-      return { output: `Forked conversation into new sticky session: ${forked.id}` };
+      return {
+        output: `${c.emerald("✓")} Forked conversation into new sticky session: ${c.bold(c.cyan(forked.id))}`,
+      };
     }
 
     case "/clear":
@@ -294,17 +451,38 @@ export async function handleSlashCommand(
         cwd: agent.config.cwd,
       });
       agent.todos.length = 0;
-      return { output: `Started fresh session: ${agent.session.id}` };
+      return { output: `${c.emerald("✓")} Started fresh session: ${c.bold(c.cyan(agent.session.id))}` };
     }
 
     case "/sessions": {
-      const list = agent.sessionStore.listSessions(10);
-      if (list.length === 0) return { output: "No saved sessions found." };
+      const list = agent.sessionStore.listSessions(15);
+      if (list.length === 0) return { output: c.slate("No saved sessions found.") };
+      if (interactive) {
+        const picked = await interactiveSelect({
+          title: "Resume Saved Session",
+          initialValue: agent.session.id,
+          items: list.map((s) => ({
+            value: s.id,
+            label: s.id,
+            badge: `[${s.model}]`,
+            detail: `${s.messageCount} msgs · ${formatMicroUsd(BigInt(s.totalCostMicro || "0"))} · ${s.updatedAt.slice(0, 19).replace("T", " ")}`,
+          })),
+        });
+        if (picked) {
+          const loaded = agent.sessionStore.loadSession(picked);
+          if (loaded) {
+            agent.session = loaded;
+            agent.config.model = loaded.model;
+            return { output: `${c.emerald("✓")} Resumed session ${c.bold(c.cyan(loaded.id))} (${loaded.messages.length} messages)` };
+          }
+        }
+        return { output: c.slate("Session resume cancelled.") };
+      }
       return {
         output: list
           .map(
             (s) =>
-              `${s.id}  [${s.model}]  msgs=${s.messageCount}  cost=${formatMicroUsd(BigInt(s.totalCostMicro || "0"))}  ${s.updatedAt}`,
+              `${c.cyan(s.id)}  [${c.emerald(s.model)}]  msgs=${s.messageCount}  cost=${formatMicroUsd(BigInt(s.totalCostMicro || "0"))}  ${c.slate(s.updatedAt)}`,
           )
           .join("\n"),
       };
@@ -312,11 +490,11 @@ export async function handleSlashCommand(
 
     case "/exit":
     case "/quit":
-      return { output: "Goodbye!", shouldExit: true };
+      return { output: c.slate("Session saved. Goodbye!"), shouldExit: true };
 
     default:
       return {
-        output: `Unknown command '${cmd}'. Type /help for available commands.`,
+        output: c.amber(`Unknown command '${cmd}'. Type /help for available commands.`),
       };
   }
 }
@@ -326,30 +504,128 @@ export async function startInteractiveRepl(
   initialKeyStatus: KeyInspectStatus | null,
   fetchFn: typeof fetch = fetch,
 ): Promise<void> {
-  const rl = createInterface({ input: stdin, output: stdout });
-  const keySummary = initialKeyStatus
-    ? formatKeyStatusSummary(initialKeyStatus)
-    : "API key not verified yet (/status)";
+  let keyStatus = initialKeyStatus;
+  let workspaceFiles = walkWorkspaceFiles(agent.config.cwd);
+  let gitBranch = getGitBranchLabel(agent.config.cwd);
 
   stdout.write(
-    [
-      `╭──────────────────────────────────────────────────────────────────────────╮`,
-      `│ AivoCode — Native CLI Coding Harness for AivoKey                         │`,
-      `╰──────────────────────────────────────────────────────────────────────────╯`,
-      `  Gateway : ${agent.config.baseUrl}`,
-      `  Model   : ${agent.config.model} (wire=${agent.config.wire}, effort=${agent.config.reasoningEffort}, mode=${agent.config.mode})`,
-      `  Account : ${keySummary}`,
-      `  Tip     : Type /help for commands, @file to attach files, !cmd for shell`,
-      ``,
-    ].join("\n") + "\n",
+    "\n" +
+      renderHeaderBanner({
+        version: "0.2.0",
+        cwd: agent.config.cwd,
+        gitBranch,
+        gatewayUrl: agent.config.baseUrl,
+        model: agent.config.model,
+        fastModel: agent.config.fastModel,
+        wire: agent.config.wire,
+        effort: agent.config.reasoningEffort,
+        mode: agent.config.mode,
+        sessionId: agent.session.id,
+        keyStatus,
+      }) +
+      "\n",
   );
+
+  const rl = createInterface({
+    input: stdin,
+    output: stdout,
+    completer: (line: string): [string[], string] => {
+      const res = completeInputToken(line, workspaceFiles);
+      return [res.matches, line];
+    },
+  });
+
+  // First-run onboarding wizard if no API key is configured
+  if (!agent.config.apiKey && stdin.isTTY) {
+    stdout.write(
+      `\n${c.cyan("◆")} ${c.bold("Welcome to AivoCode!")} ${c.slate("Let's connect your AivoKey account.")}\n` +
+        `  ${c.slate("Get your API key at:")} ${c.cyan("https://app.aivokey.dev/console/keys")}\n`,
+    );
+    try {
+      const enteredKey = (
+        await rl.question(`  ${c.emerald("❯")} Paste your AivoKey API Key (${c.dim("sk-aivo_... or Enter to skip")}): `)
+      ).trim();
+      if (enteredKey) {
+        agent.config.apiKey = enteredKey;
+        saveUserConfig({ apiKey: enteredKey }, agent.config.globalConfigPath);
+        const spinner = new TerminalSpinner();
+        spinner.start("Verifying API key & syncing AivoKey catalog...");
+        try {
+          const [models, ks] = await Promise.all([
+            fetchModels(agent.config.baseUrl, fetchFn).catch(() => agent.catalog),
+            inspectKey(agent.config.baseUrl, enteredKey, fetchFn),
+          ]);
+          spinner.stop();
+          if (models.length > 0) agent.catalog = models;
+          keyStatus = ks;
+          const rec = recommendCodingModels(agent.catalog, keyStatus, agent.config.model);
+          agent.config.model = rec.primaryModel;
+          agent.config.fastModel = rec.fastModel;
+          saveUserConfig(
+            { model: rec.primaryModel, fastModel: rec.fastModel },
+            agent.config.globalConfigPath,
+          );
+          stdout.write(
+            `  ${c.emerald("✓")} Connected! ${formatKeyStatusSummary(ks)}\n` +
+              `  ${c.emerald("✓")} Selected model: ${c.bold(c.emerald(agent.config.model))} ${c.slate(`(fast explorer: ${agent.config.fastModel})`)}\n`,
+          );
+        } catch (err) {
+          spinner.stop();
+          stdout.write(
+            `  ${c.amber("⚠")} Could not verify key (${err instanceof Error ? err.message : String(err)}). You can retry anytime with ${c.cyan("/login <key>")}.\n`,
+          );
+        }
+      }
+    } catch {
+      /* user skipped onboarding */
+    }
+  }
+
+  let activeAbort: AbortController | null = null;
+  const sigintHandler = () => {
+    if (activeAbort) {
+      activeAbort.abort();
+      stdout.write(`\n${c.amber("⚠ Interrupted active request.")}\n`);
+    }
+  };
+  process.on("SIGINT", sigintHandler);
 
   try {
     while (true) {
-      const promptLabel = `\n[${agent.config.model} · ${agent.config.mode}] > `;
+      const sysPrompt = buildSystemPrompt(agent.config.cwd, agent.config.mode);
+      const usedCtx = estimateConversationTokens(sysPrompt, agent.session.messages);
+      const modelInfo = agent.getActiveModelInfo();
+      const maxCtx = modelInfo?.contextWindow ?? 128_000;
+      const totalPrompt = agent.session.totalInputTokens + agent.session.totalCacheReadTokens;
+      const cacheHitPct =
+        totalPrompt > 0
+          ? Math.round((agent.session.totalCacheReadTokens / totalPrompt) * 100)
+          : 0;
+
+      const statusBar = renderStatusBar({
+        mode: agent.config.mode,
+        model: agent.config.model,
+        effort: agent.config.reasoningEffort,
+        wire: agent.config.wire,
+        usedContextTokens: usedCtx,
+        maxContextTokens: maxCtx,
+        cacheHitPct,
+        sessionCostMicro: BigInt(agent.session.totalCostMicro || "0"),
+        balanceMicro: keyStatus?.balanceMicro ?? null,
+        gitBranch,
+      });
+
+      stdout.write(`\n${c.slate("─".repeat(76))}\n${statusBar}\n`);
+      const promptGlyph =
+        agent.config.mode === "plan"
+          ? c.violet("❯ ")
+          : agent.config.mode === "safe"
+            ? c.amber("❯ ")
+            : c.cyan("❯ ");
+
       let line: string;
       try {
-        line = (await rl.question(promptLabel)).trim();
+        line = (await rl.question(promptGlyph)).trim();
       } catch {
         break;
       }
@@ -358,48 +634,72 @@ export async function startInteractiveRepl(
       if (line.startsWith("!")) {
         const shellCmd = line.slice(1).trim();
         if (shellCmd) {
+          stdout.write(`${c.slate(`$ ${shellCmd}`)}\n`);
           try {
             const out = execSync(shellCmd, {
               cwd: agent.config.cwd,
               encoding: "utf8",
               stdio: "pipe",
             });
-            if (out) stdout.write(out + "\n");
+            if (out) stdout.write(out.trimEnd() + "\n");
           } catch (err) {
             stdout.write(
-              `Command failed: ${err instanceof Error ? err.message : String(err)}\n`,
+              `${c.rose(`Command failed: ${err instanceof Error ? err.message : String(err)}`)}\n`,
             );
           }
+          gitBranch = getGitBranchLabel(agent.config.cwd);
         }
         continue;
       }
 
       if (line.startsWith("/")) {
-        const res = await handleSlashCommand(line, agent, initialKeyStatus, fetchFn);
+        // Temporarily pause readline while interactive arrow-key select runs
+        const isInteractivePicker =
+          ["/model", "/effort", "/mode", "/wire", "/sessions"].includes(line.trim().toLowerCase());
+        if (isInteractivePicker) rl.pause();
+        const res = await handleSlashCommand(line, agent, keyStatus, fetchFn, true);
+        if (isInteractivePicker) rl.resume();
+        if (res.updatedKeyStatus !== undefined) {
+          keyStatus = res.updatedKeyStatus;
+        }
         stdout.write(res.output + "\n");
         if (res.shouldExit) break;
         continue;
       }
 
+      activeAbort = new AbortController();
       try {
-        let inReasoning = false;
-        const turnRes = await agent.runUserPrompt(line);
-        void inReasoning;
+        const turnRes = await agent.runUserPrompt(line, activeAbort.signal);
+        workspaceFiles = walkWorkspaceFiles(agent.config.cwd);
+        gitBranch = getGitBranchLabel(agent.config.cwd);
+
         const totalIn = turnRes.turnUsage.inputTokens + turnRes.turnUsage.cacheReadTokens;
         const cachePct =
           totalIn > 0 ? Math.round((turnRes.turnUsage.cacheReadTokens / totalIn) * 100) : 0;
+        const savedTag =
+          turnRes.turnCacheSavedMicro > 0n
+            ? ` · ${c.teal(`saved ${formatMicroUsd(turnRes.turnCacheSavedMicro)}`)}`
+            : "";
+
         stdout.write(
-          `\n  [tokens: in=${turnRes.turnUsage.inputTokens} · cache=${turnRes.turnUsage.cacheReadTokens} (${cachePct}%) · out=${turnRes.turnUsage.outputTokens} · cost=${formatMicroUsd(turnRes.turnCostMicro)}${turnRes.turnCacheSavedMicro > 0n ? ` (saved ${formatMicroUsd(turnRes.turnCacheSavedMicro)})` : ""}]\n`,
+          `\n${c.slate(`  ↳ in=${turnRes.turnUsage.inputTokens.toLocaleString("en-US")} · cache=${turnRes.turnUsage.cacheReadTokens.toLocaleString("en-US")} (${cachePct}%) · out=${turnRes.turnUsage.outputTokens.toLocaleString("en-US")} · turn=${formatMicroUsd(turnRes.turnCostMicro)}${savedTag}`)}\n`,
         );
       } catch (err) {
         if (err && typeof (err as { formatUserAdvice?: unknown }).formatUserAdvice === "function") {
-          stdout.write(`\nError: ${(err as { formatUserAdvice(): string }).formatUserAdvice()}\n`);
+          stdout.write(
+            `\n${c.rose("✗")} ${c.bold((err as { formatUserAdvice(): string }).formatUserAdvice())}\n`,
+          );
         } else {
-          stdout.write(`\nError: ${err instanceof Error ? err.message : String(err)}\n`);
+          stdout.write(
+            `\n${c.rose("✗")} ${err instanceof Error ? err.message : String(err)}\n`,
+          );
         }
+      } finally {
+        activeAbort = null;
       }
     }
   } finally {
+    process.off("SIGINT", sigintHandler);
     rl.close();
   }
 }

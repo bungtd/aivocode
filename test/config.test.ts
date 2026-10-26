@@ -36,7 +36,7 @@ describe("config & normalization", () => {
     expect(normalizeModelId("deepseek-v4-pro")).toBe("deepseek-v4-pro");
     expect(normalizeModelId("aivokey/deepseek-v4-pro")).toBe("deepseek-v4-pro");
     expect(normalizeModelId("openai/gpt-5.5")).toBe("gpt-5.5");
-    expect(normalizeModelId("anthropic/claude-sonnet-4-5")).toBe("claude-sonnet-4.5");
+    expect(normalizeModelId("anthropic/claude-sonnet-5-5")).toBe("claude-sonnet-5-5");
     expect(normalizeModelId("  GLM-5.3  ")).toBe("glm-5.3");
   });
 
@@ -85,9 +85,9 @@ describe("config & normalization", () => {
         cwd: dir,
         globalConfigPath: globalFile,
         env: { AIVOKEY_MODEL: "deepseek-v4-pro" },
-        cli: { model: "claude-sonnet-4-5", wire: "messages", mode: "plan" },
+        cli: { model: "anthropic/claude-sonnet-5-5", wire: "messages", mode: "plan" },
       });
-      expect(resolvedFromCli.model).toBe("claude-sonnet-4.5");
+      expect(resolvedFromCli.model).toBe("claude-sonnet-5-5");
       expect(resolvedFromCli.wire).toBe("messages");
       expect(resolvedFromCli.mode).toBe("plan");
       void workspaceDir;

@@ -1,3 +1,5 @@
+import { createInterface } from "node:readline/promises";
+import { stdin, stdout } from "node:process";
 import {
   maskApiKey,
   normalizeGatewayOrigin,
@@ -20,6 +22,13 @@ import {
 import { AivoAgent } from "./agent.js";
 import { formatDetailedStatus, formatModelsTable, startInteractiveRepl } from "./repl.js";
 import { SessionStore } from "./session.js";
+import {
+  c,
+  renderTodoBoard,
+  renderToolCallCard,
+  TerminalSpinner,
+} from "./ui/theme.js";
+import { renderUnifiedDiff } from "./ui/markdown.js";
 
 export type CliCommand =
   | "repl"
@@ -212,10 +221,10 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
   if (parsed.command === "help") {
     writeOut(
       [
-        "AivoCode (`aivo`) — Native CLI Coding Harness for AivoKey",
+        `${c.cyan(c.bold("◆ AivoCode (`aivo`)"))} — Native CLI Coding Harness for AivoKey`,
         "",
-        "Usage:",
-        "  aivo                          Start interactive coding REPL",
+        c.bold("Usage:"),
+        "  aivo                          Start interactive TUI coding studio",
         "  aivo run \"<prompt>\"           Run a coding task non-interactively",
         "  aivo -p \"<prompt>\"            Alias for `aivo run`",
         "  aivo models [--tools|--free]  List live AivoKey models, prices & capabilities",
@@ -224,7 +233,7 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         "  aivo login <sk-aivo_...>      Save your AivoKey API key to ~/.aivokey/config.json",
         "  aivo sessions                 List recent saved sessions",
         "",
-        "Flags:",
+        c.bold("Flags:"),
         "  -m, --model <id>              Canonical model ID (e.g. deepseek-v4-pro, glm-5.3)",
         "  --fast-model <id>             Fast model for explore subagents",
         "  --wire <chat|messages|responses> Protocol wire (default: chat)",
@@ -255,16 +264,20 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       config.globalConfigPath,
     );
     writeOut(
-      `Saved AivoKey configuration to ${config.globalConfigPath} (key: ${maskApiKey(keyToSave)}, gateway: ${config.baseUrl})`,
+      `${c.emerald("✓")} Saved AivoKey configuration to ${config.globalConfigPath} (key: ${maskApiKey(keyToSave)}, gateway: ${config.baseUrl})`,
     );
     return 0;
   }
 
-  // Load live catalog and key status best-effort
   let catalog: AivoModelInfo[] = [];
   let keyStatus = null as KeyInspectStatus | null;
   let catalogErr = null as string | null;
   let keyErr = null as string | null;
+
+  const bootSpinner = new TerminalSpinner();
+  if (!opts.writeOut) {
+    bootSpinner.start("Connecting to AivoKey Gateway...");
+  }
 
   await Promise.all([
     fetchModels(config.baseUrl, fetchFn)
@@ -285,6 +298,8 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       : Promise.resolve(),
   ]);
 
+  bootSpinner.stop();
+
   if (catalog.length > 0 && !config.fastModel) {
     const rec = recommendCodingModels(catalog, keyStatus, config.model);
     config.fastModel = rec.fastModel;
@@ -296,26 +311,35 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
   }
 
   if (parsed.command === "doctor") {
-    writeOut("── AivoCode Doctor ────────────────────────────────────────────────────────");
-    writeOut(`Gateway Origin : ${config.baseUrl}`);
-    writeOut(`API Key        : ${maskApiKey(config.apiKey)}`);
+    writeOut(`${c.cyan("╭─")} ${c.bold("AivoCode Doctor")} ${c.cyan("─".repeat(55))}`);
+    writeOut(`${c.cyan("│")} Gateway Origin : ${c.white(config.baseUrl)}`);
+    writeOut(`${c.cyan("│")} API Key        : ${c.white(maskApiKey(config.apiKey))}`);
     writeOut(
-      `Model Catalog  : ${catalogErr ? `FAILED (${catalogErr})` : `OK (${catalog.length} canonical models loaded)`}`,
+      `${c.cyan("│")} Model Catalog  : ${catalogErr ? c.rose(`FAILED (${catalogErr})`) : c.emerald(`OK (${catalog.length} canonical models loaded)`)}`,
     );
     if (!config.apiKey) {
-      writeOut(`Key Inspection : MISSING (set AIVOKEY_API_KEY or run 'aivo login <key>')`);
+      writeOut(
+        `${c.cyan("│")} Key Inspection : ${c.amber("MISSING (set AIVOKEY_API_KEY or run 'aivo login <key>')")}`,
+      );
     } else if (keyErr) {
-      writeOut(`Key Inspection : FAILED (${keyErr})`);
+      writeOut(`${c.cyan("│")} Key Inspection : ${c.rose(`FAILED (${keyErr})`)}`);
     } else if (keyStatus) {
-      writeOut(`Key Inspection : OK (mode=${keyStatus.mode}, balance=${formatMicroUsd(keyStatus.balanceMicro)})`);
+      writeOut(
+        `${c.cyan("│")} Key Inspection : ${c.emerald(`OK (mode=${keyStatus.mode}, balance=${formatMicroUsd(keyStatus.balanceMicro)})`)}`,
+      );
     }
     const rec = recommendCodingModels(catalog, keyStatus, config.model);
-    writeOut(`Active Model   : ${config.model} (recommended fast subagent: ${rec.fastModel})`);
+    writeOut(
+      `${c.cyan("│")} Active Model   : ${c.emerald(config.model)} (recommended fast subagent: ${c.teal(rec.fastModel)})`,
+    );
+    writeOut(`${c.cyan("╰" + "─".repeat(73))}`);
     return catalogErr || keyErr ? 1 : 0;
   }
 
   const sessionStore = new SessionStore();
-  let initialSession = parsed.sessionId ? sessionStore.loadSession(parsed.sessionId) ?? undefined : undefined;
+  let initialSession = parsed.sessionId
+    ? (sessionStore.loadSession(parsed.sessionId) ?? undefined)
+    : undefined;
   if (!initialSession && parsed.continueLast) {
     const recent = sessionStore.listSessions(1)[0];
     if (recent) initialSession = sessionStore.loadSession(recent.id) ?? undefined;
@@ -328,12 +352,16 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     } else {
       for (const s of list) {
         writeOut(
-          `${s.id}  [${s.model}]  msgs=${s.messageCount}  cost=${formatMicroUsd(BigInt(s.totalCostMicro || "0"))}  ${s.updatedAt}`,
+          `${c.cyan(s.id)}  [${c.emerald(s.model)}]  msgs=${s.messageCount}  cost=${formatMicroUsd(BigInt(s.totalCostMicro || "0"))}  ${c.slate(s.updatedAt)}`,
         );
       }
     }
     return 0;
   }
+
+  let inThinkingBlock = false;
+  let thinkingStartMs = 0;
+  const turnSpinner = new TerminalSpinner();
 
   const agent = new AivoAgent({
     config,
@@ -343,19 +371,88 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     fetchFn,
     callbacks: {
       onReasoningDelta: (d) => {
-        if (!parsed.json) process.stderr.write(`\x1b[2m${d}\x1b[0m`);
+        if (parsed.json) return;
+        turnSpinner.stop();
+        if (!inThinkingBlock) {
+          inThinkingBlock = true;
+          thinkingStartMs = Date.now();
+          process.stderr.write(
+            `\n${c.slate(`╭─ 💭 Thinking (${config.reasoningEffort}) ──────────────────────────────`)}\n${c.slate("│ ")}`,
+          );
+        }
+        const formatted = d.replace(/\n/g, `\n${c.slate("│ ")}`);
+        process.stderr.write(c.dim(formatted));
       },
       onTextDelta: (d) => {
-        if (!parsed.json) process.stdout.write(d);
+        if (parsed.json) return;
+        turnSpinner.stop();
+        if (inThinkingBlock) {
+          const secs = ((Date.now() - thinkingStartMs) / 1000).toFixed(1);
+          process.stderr.write(
+            `\n${c.slate(`╰─ Thought for ${secs}s ───────────────────────────────────────`)}\n\n`,
+          );
+          inThinkingBlock = false;
+        }
+        process.stdout.write(d);
       },
       onToolCall: (name, args) => {
-        if (!parsed.json) {
-          const argPreview = JSON.stringify(args).slice(0, 100);
-          process.stderr.write(`\n\x1b[36m▸ ${name}\x1b[0m(${argPreview})\n`);
+        if (parsed.json) return;
+        turnSpinner.stop();
+        if (inThinkingBlock) {
+          const secs = ((Date.now() - thinkingStartMs) / 1000).toFixed(1);
+          process.stderr.write(
+            `\n${c.slate(`╰─ Thought for ${secs}s ───────────────────────────────────────`)}\n`,
+          );
+          inThinkingBlock = false;
+        }
+        turnSpinner.start(`Running ${name}...`);
+        void args;
+      },
+      onToolResult: (name, _output, isError, details, args) => {
+        if (parsed.json) return;
+        turnSpinner.stop();
+        const card = renderToolCallCard({
+          name,
+          args: args ?? {},
+          status: isError ? "error" : "ok",
+          durationMs: details?.durationMs,
+          summary: details?.summary,
+        });
+        process.stderr.write(`\n${card}\n`);
+        if (!isError && details?.diff) {
+          process.stderr.write(
+            renderUnifiedDiff(
+              details.diff.filePath,
+              details.diff.before,
+              details.diff.after,
+            ) + "\n",
+          );
+        }
+        if (!isError && name === "todo_write") {
+          process.stderr.write(renderTodoBoard(agent.todos) + "\n");
         }
       },
       onNotice: (msg) => {
-        if (!parsed.json) process.stderr.write(`\n\x1b[33m[notice] ${msg}\x1b[0m\n`);
+        if (!parsed.json) {
+          turnSpinner.stop();
+          process.stderr.write(`\n${c.amber(`⚡ ${msg}`)}\n`);
+        }
+      },
+      confirmAction: async (description) => {
+        turnSpinner.stop();
+        const rlConfirm = createInterface({ input: stdin, output: stdout });
+        try {
+          const ans = (
+            await rlConfirm.question(
+              `\n${c.amber("?")} Allow ${c.bold(description)}? ${c.slate("[y/N]")} `,
+            )
+          )
+            .trim()
+            .toLowerCase();
+          return ans === "y" || ans === "yes";
+        } finally {
+          rlConfirm.close();
+        }
       },
     },
   });
@@ -367,7 +464,9 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
 
   if (parsed.command === "run") {
     if (!config.apiKey) {
-      writeOut("Error: AIVOKEY_API_KEY is not set. Run `aivo login <sk-aivo_...>` or pass `--api-key`.");
+      writeOut(
+        "Error: AIVOKEY_API_KEY is not set. Run `aivo login <sk-aivo_...>` or pass `--api-key`.",
+      );
       return 1;
     }
     const res = await agent.runUserPrompt(parsed.prompt);
