@@ -32,7 +32,7 @@ pnpm build
 Untuk memasang perintah `aivo` secara global di mesin lokal Anda:
 
 ```bash
-pnpm link --global
+npm link
 ```
 
 Atau jalankan langsung:
