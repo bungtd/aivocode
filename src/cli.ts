@@ -477,6 +477,11 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         turnSpinner.start(`Running ${name}...`);
         void args;
       },
+      onToolCallProgress: (target, bytes, lines) => {
+        if (parsed.json) return;
+        const kb = (bytes / 1024).toFixed(1);
+        turnSpinner.update(`Streaming ${target} · ${lines} lines (${kb} KB)...`);
+      },
       onToolResult: (name, _output, isError, details, args) => {
         if (parsed.json) return;
         turnSpinner.stop();

@@ -26,11 +26,22 @@ import {
   type StageExecutionRecord,
   type TeamId,
 } from "./teams.js";
+import {
+  autoAdvanceTodos,
+  classifyTaskStrategy,
+  verifyWorkspaceArtifacts,
+} from "./workflow-review.js";
 
 export interface AgentCallbacks {
   onReasoningDelta?: (delta: string) => void;
   onTextDelta?: (delta: string) => void;
   onToolCall?: (name: string, args: Record<string, unknown>) => void;
+  onToolCallProgress?: (
+    name: string,
+    bytes: number,
+    lines: number,
+    preview: string,
+  ) => void;
   onToolResult?: (
     name: string,
     output: string,
@@ -38,8 +49,13 @@ export interface AgentCallbacks {
     details?: ToolExecutionResult,
     args?: Record<string, unknown>,
   ) => void;
+  onTodoUpdate?: (todos: TodoItem[]) => void;
   onNotice?: (message: string) => void;
   confirmAction?: (description: string) => Promise<boolean>;
+  chooseStrategy?: (decision: {
+    teamName: string;
+    recommendedMode: "subagent-driven" | "native";
+  }) => Promise<"subagent-driven" | "native">;
 }
 
 export interface AgentOptions {
@@ -99,7 +115,7 @@ export class AivoAgent {
     this.callbacks = opts.callbacks ?? {};
     this.fetchFn = opts.fetchFn ?? fetch;
     this.sleepFn = opts.sleepFn ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
-    this.maxSteps = opts.maxSteps ?? 25;
+    this.maxSteps = opts.maxSteps ?? 30;
     this.readOnlyOnly = opts.readOnlyOnly ?? false;
     this.allowSubagents = opts.allowSubagents ?? true;
   }
@@ -122,9 +138,28 @@ export class AivoAgent {
   }
 
   /**
-   * OpenCode V2 style `/btw <question>`: answers a quick side question using the current
-   * session context without adding the exchange to `this.session.messages` or running tools.
+   * Prunes base64 image payloads from older messages (keeping only the latest 2 image-bearing messages)
+   * so taking multiple desktop screenshots never bloats the conversation to 800k+ tokens.
    */
+  private pruneOldImagePayloads(): void {
+    const imgIndices: number[] = [];
+    for (let i = 0; i < this.session.messages.length; i++) {
+      const m = this.session.messages[i]!;
+      if (m.images && m.images.length > 0) {
+        imgIndices.push(i);
+      }
+    }
+    if (imgIndices.length <= 2) return;
+    const toStrip = imgIndices.slice(0, imgIndices.length - 2);
+    for (const idx of toStrip) {
+      const msg = this.session.messages[idx]!;
+      delete msg.images;
+      if (!msg.content.includes("[Earlier image attachment pruned")) {
+        msg.content += "\n[Earlier image attachment pruned after visual inspection to save context]";
+      }
+    }
+  }
+
   async askSideQuestion(question: string, signal?: AbortSignal): Promise<string> {
     const sysPrompt = buildSystemPrompt(this.config.cwd, "plan", this.config.team);
     const tempMessages = [
@@ -151,10 +186,6 @@ export class AivoAgent {
     return res.text;
   }
 
-  /**
-   * Executes a multi-stage Specialist Agent Team workflow (`fullstack`, `backend`, `frontend`,
-   * `android`, `blender3d`, `gamedev`, `autopilot`).
-   */
   async executeTeamWorkflow(
     goal: string,
     teamId?: TeamId,
@@ -163,17 +194,33 @@ export class AivoAgent {
     const resolvedTeamId = teamId ?? this.config.team ?? detectRecommendedTeam(goal, this.config.cwd);
     const team = getAgentTeam(resolvedTeamId) ?? getAgentTeam("fullstack")!;
 
+    this.todos.length = 0;
+    for (let i = 0; i < team.workflowStages.length; i++) {
+      this.todos.push({
+        id: String(i + 1),
+        content: team.workflowStages[i]!.title.replace(/^\d+\.\s*/, ""),
+        status: i === 0 ? "in_progress" : "pending",
+      });
+    }
+    this.callbacks.onTodoUpdate?.(this.todos);
     this.callbacks.onNotice?.(`Starting ${team.name} workflow (${team.workflowStages.length} stages)...`);
 
     const wfResult = await runTeamWorkflow({
       team,
       goal,
       onStageStart: (stage, role, idx, total) => {
+        for (let k = 0; k < this.todos.length; k++) {
+          this.todos[k]!.status = k < idx ? "completed" : k === idx ? "in_progress" : "pending";
+        }
+        this.callbacks.onTodoUpdate?.(this.todos);
         this.callbacks.onNotice?.(
           `Stage ${idx + 1}/${total}: ${stage.title} [${role.name}]`,
         );
       },
       onStageComplete: (rec: StageExecutionRecord, idx, total) => {
+        if (this.todos[idx]) this.todos[idx]!.status = "completed";
+        if (this.todos[idx + 1]) this.todos[idx + 1]!.status = "in_progress";
+        this.callbacks.onTodoUpdate?.(this.todos);
         this.callbacks.onNotice?.(
           `Completed Stage ${idx + 1}/${total}: ${rec.stageTitle}`,
         );
@@ -216,10 +263,46 @@ export class AivoAgent {
 
   async runUserPrompt(rawPrompt: string, signal?: AbortSignal): Promise<RunPromptResult> {
     this.checkpoints.beginTurn(`turn_${Date.now()}`);
+
+    // 1. Strategy Selection & Initial Live Task Seeding for substantial builds
+    if (this.allowSubagents && !this.readOnlyOnly) {
+      const strategy = classifyTaskStrategy(rawPrompt, this.config.cwd);
+      if (strategy.isSubstantialBuild) {
+        this.config.team = strategy.teamId;
+        if (this.todos.length === 0 && strategy.autoTodos.length > 0) {
+          this.todos.push(...strategy.autoTodos);
+          this.callbacks.onTodoUpdate?.(this.todos);
+        }
+
+        let chosenStrategy: "subagent-driven" | "native" = "native";
+        if (this.config.mode === "safe" && this.callbacks.chooseStrategy) {
+          chosenStrategy = await this.callbacks.chooseStrategy({
+            teamName: strategy.teamName,
+            recommendedMode: strategy.recommendedMode,
+          });
+        } else {
+          // In AUTO mode, announce active specialist team & live task board automatically
+          this.callbacks.onNotice?.(
+            `Active Team: ${strategy.teamName} [${strategy.teamId}] · Live Tasks initialized (${this.todos.length} stages)`,
+          );
+        }
+
+        if (chosenStrategy === "subagent-driven" && this.callbacks.chooseStrategy) {
+          const wfText = await this.executeTeamWorkflow(rawPrompt, strategy.teamId, signal);
+          return {
+            finalText: wfText,
+            steps: strategy.autoTodos.length,
+            turnUsage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+            turnCostMicro: 0n,
+            turnCacheSavedMicro: 0n,
+          };
+        }
+      }
+    }
+
     let expandedPrompt = expandFileMentions(rawPrompt, this.config.cwd);
     const promptImages = extractPromptImageAttachments(rawPrompt, this.config.cwd);
 
-    // Pre-step memory recall (injected into user message so static systemPrompt cache never breaks)
     const recallBlock = this.memory.formatRecallBlock(rawPrompt, this.config.cwd, 3);
     if (recallBlock) {
       expandedPrompt = `${expandedPrompt}\n\n${recallBlock}`;
@@ -304,11 +387,12 @@ export class AivoAgent {
     let totalCacheSavedMicro = 0n;
     let finalText = "";
     let steps = 0;
+    let reviewFixPassDone = false;
 
     while (steps < this.maxSteps) {
       steps++;
+      this.pruneOldImagePayloads();
 
-      // Check if any message in the conversation carries images; if so, ensure vision-capable model
       const hasImagesInConversation = this.session.messages.some(
         (m) => m.images && m.images.length > 0,
       );
@@ -335,8 +419,6 @@ export class AivoAgent {
             messages: this.session.messages,
             tools: toolset.specs,
             reasoningEffort: this.config.reasoningEffort,
-            // Only send maxTokens on Anthropic messages wire (where it is required, capped at 16384);
-            // omit on chat/responses wires so upstreams stream immediately without huge reserve delays!
             maxTokens:
               this.config.wire === "messages"
                 ? Math.min(16384, modelInfo?.maxOutputTokens ?? 8192)
@@ -345,6 +427,7 @@ export class AivoAgent {
             fetchFn: this.fetchFn,
             onReasoningDelta: this.callbacks.onReasoningDelta,
             onTextDelta: this.callbacks.onTextDelta,
+            onToolCallProgress: this.callbacks.onToolCallProgress,
           });
           break;
         } catch (err) {
@@ -394,6 +477,33 @@ export class AivoAgent {
       });
 
       if (stepRes.toolCalls.length === 0) {
+        // Automated Review & Fix Gate when files were modified in this turn
+        const touched = this.checkpoints.listModifiedFiles();
+        if (touched.length > 0 && !reviewFixPassDone && !this.readOnlyOnly) {
+          reviewFixPassDone = true;
+          const verification = verifyWorkspaceArtifacts(this.config.cwd, touched);
+          if (!verification.clean) {
+            this.callbacks.onNotice?.(
+              `Automated Review & Fix Gate detected ${verification.findings.length} issue(s) — running fix pass...`,
+            );
+            this.session.messages.push({
+              role: "user",
+              content: [
+                "[Automated Review & Fix Gate]",
+                "The following issues were found in your modified files. Fix them now before completing:",
+                ...verification.findings.map((f) => `- ${f}`),
+              ].join("\n"),
+            });
+            continue;
+          }
+        }
+
+        // Mark all todos completed when turn finishes cleanly
+        if (this.todos.length > 0) {
+          for (const t of this.todos) t.status = "completed";
+          this.callbacks.onTodoUpdate?.(this.todos);
+        }
+
         finalText = stepRes.text;
         this.sessionStore.saveSession(this.session);
         break;
@@ -422,6 +532,9 @@ export class AivoAgent {
             this.callbacks.onToolCall?.(tc.name, tc.arguments);
             const execRes = await toolset.execute(tc.name, tc.arguments);
             if (execRes.durationMs === undefined) execRes.durationMs = Date.now() - t0;
+            if (autoAdvanceTodos(this.todos, tc.name, tc.arguments)) {
+              this.callbacks.onTodoUpdate?.(this.todos);
+            }
             this.callbacks.onToolResult?.(tc.name, execRes.output, execRes.isError, execRes, tc.arguments);
             return { tc, execRes };
           }),
@@ -444,6 +557,9 @@ export class AivoAgent {
           this.callbacks.onToolCall?.(tc.name, tc.arguments);
           const execRes = await toolset.execute(tc.name, tc.arguments);
           if (execRes.durationMs === undefined) execRes.durationMs = Date.now() - t0;
+          if (autoAdvanceTodos(this.todos, tc.name, tc.arguments) || tc.name === "todo_write") {
+            this.callbacks.onTodoUpdate?.(this.todos);
+          }
           this.callbacks.onToolResult?.(tc.name, execRes.output, execRes.isError, execRes, tc.arguments);
           this.session.messages.push({
             role: "tool",
@@ -466,6 +582,44 @@ export class AivoAgent {
         });
       }
 
+      this.sessionStore.saveSession(this.session);
+    }
+
+    // OpenCode V2 rule: if `maxSteps` was reached while the last message was a tool result,
+    // remove tools and request a final text summary so the agent NEVER stops silently!
+    const lastMsg = this.session.messages[this.session.messages.length - 1];
+    if (!finalText && lastMsg && lastMsg.role === "tool") {
+      this.pruneOldImagePayloads();
+      const summaryTurn = await streamTurn({
+        baseUrl: this.config.baseUrl,
+        apiKey: this.config.apiKey,
+        sessionId: this.session.id,
+        wire: this.config.wire,
+        model: this.config.model,
+        systemPrompt,
+        messages: [
+          ...this.session.messages,
+          {
+            role: "user",
+            content:
+              "Maximum tool steps reached. Summarize everything you built, verified, and how the user can run or open it.",
+          },
+        ],
+        tools: [],
+        reasoningEffort: "off",
+        signal,
+        fetchFn: this.fetchFn,
+        onTextDelta: this.callbacks.onTextDelta,
+      });
+      finalText = summaryTurn.text;
+      this.session.messages.push({
+        role: "assistant",
+        content: finalText,
+      });
+      if (this.todos.length > 0) {
+        for (const t of this.todos) t.status = "completed";
+        this.callbacks.onTodoUpdate?.(this.todos);
+      }
       this.sessionStore.saveSession(this.session);
     }
 

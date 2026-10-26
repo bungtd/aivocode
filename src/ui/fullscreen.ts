@@ -76,6 +76,9 @@ export async function startFullScreenTui(
   let streamingAssistantBuffer = "";
   let streamingReasoningLineIdx: number | null = null;
   let streamingReasoningBuffer = "";
+  let streamingToolProgressLineIdx: number | null = null;
+  let lastProgressRenderAt = 0;
+  let pendingStrategyResolve: ((choice: "subagent-driven" | "native") => void) | null = null;
 
   const computeState = (): FullScreenTuiState => {
     const sysPrompt = buildSystemPrompt(agent.config.cwd, agent.config.mode);
@@ -210,8 +213,38 @@ export async function startFullScreenTui(
     onToolCall: (name: string, args: Record<string, unknown>) => {
       streamingAssistantLineIdx = null;
       streamingReasoningLineIdx = null;
+      streamingToolProgressLineIdx = null;
       busyBaseLabel = `Running ${name}`;
       void args;
+      render();
+    },
+    onToolCallProgress: (
+      target: string,
+      bytes: number,
+      lines: number,
+      preview: string,
+    ) => {
+      const kb = (bytes / 1024).toFixed(1);
+      busyBaseLabel = `Streaming ${target} · ${lines} lines (${kb} KB)`;
+      const now = Date.now();
+      if (now - lastProgressRenderAt < 80) return;
+      lastProgressRenderAt = now;
+
+      if (streamingReasoningLineIdx !== null) {
+        transcriptLines.push(`${c.slate("╰─ End Thinking ───")}`);
+        streamingReasoningLineIdx = null;
+      }
+      if (streamingToolProgressLineIdx === null) {
+        streamingToolProgressLineIdx = transcriptLines.length;
+        transcriptLines.push("");
+      }
+      const previewRow = `${c.cyan("◌")} ${c.bold(target)} ${c.emerald(`${lines} lines`)} ${c.slate(`(${kb} KB)`)} ${c.dim(preview.slice(-60))}`;
+      transcriptLines.splice(
+        streamingToolProgressLineIdx,
+        transcriptLines.length - streamingToolProgressLineIdx,
+        previewRow,
+      );
+      scrollOffset = 0;
       render();
     },
     onToolResult: (
@@ -221,6 +254,13 @@ export async function startFullScreenTui(
       details?: { durationMs?: number; summary?: string; diff?: { filePath: string; before: string; after: string } },
       args?: Record<string, unknown>,
     ) => {
+      if (streamingToolProgressLineIdx !== null) {
+        transcriptLines.splice(
+          streamingToolProgressLineIdx,
+          transcriptLines.length - streamingToolProgressLineIdx,
+        );
+        streamingToolProgressLineIdx = null;
+      }
       const card = renderToolCallCard({
         name,
         args: args ?? {},
@@ -244,10 +284,43 @@ export async function startFullScreenTui(
       scrollOffset = 0;
       render();
     },
+    onTodoUpdate: () => {
+      render();
+    },
     onNotice: (msg: string) => {
       notice = msg;
       transcriptLines.push(`  ${c.amber(`⚡ ${msg}`)}`);
       render();
+    },
+    chooseStrategy: async (decision: {
+      teamName: string;
+      recommendedMode: "subagent-driven" | "native";
+    }) => {
+      stopBusy();
+      modal = {
+        id: "strategy",
+        title: `Choose Execution Strategy — ${decision.teamName}`,
+        filter: "",
+        selectedIdx: decision.recommendedMode === "subagent-driven" ? 0 : 1,
+        items: [
+          {
+            value: "subagent-driven",
+            label: "Subagent-Driven Team Workflow",
+            badge: "[Recommended]",
+            detail: `Multi-stage specialist workflow (${decision.teamName}: Architect → Builder → QA)`,
+          },
+          {
+            value: "native",
+            label: "Native Direct Execution",
+            badge: "[Fast]",
+            detail: "Implement directly in this session + automated Review & Fix gate",
+          },
+        ],
+      };
+      render();
+      return new Promise<"subagent-driven" | "native">((resStrategy) => {
+        pendingStrategyResolve = resStrategy;
+      });
     },
     confirmAction: async (description: string) => {
       stopBusy();
@@ -547,6 +620,14 @@ export async function startFullScreenTui(
         : m.items;
 
       if (key?.name === "escape" || (key?.ctrl && key?.name === "c")) {
+        if (m.id === "strategy" && pendingStrategyResolve) {
+          const fn = pendingStrategyResolve;
+          pendingStrategyResolve = null;
+          modal = null;
+          render();
+          fn("native");
+          return;
+        }
         if (m.id === "confirm" && pendingConfirmResolve) {
           const fn = pendingConfirmResolve;
           pendingConfirmResolve = null;
@@ -582,6 +663,13 @@ export async function startFullScreenTui(
         const chosen = filtered[m.selectedIdx];
         const modalId = m.id;
         modal = null;
+        if (modalId === "strategy" && pendingStrategyResolve) {
+          const fn = pendingStrategyResolve;
+          pendingStrategyResolve = null;
+          render();
+          fn(chosen?.value === "subagent-driven" ? "subagent-driven" : "native");
+          return;
+        }
         if (modalId === "confirm" && pendingConfirmResolve) {
           const fn = pendingConfirmResolve;
           pendingConfirmResolve = null;
@@ -914,7 +1002,7 @@ export interface ModalOption {
 }
 
 export interface FullScreenModalState {
-  id?: "model" | "effort" | "mode" | "wire" | "team" | "command" | "sessions" | "confirm";
+  id?: "model" | "effort" | "mode" | "wire" | "team" | "command" | "sessions" | "confirm" | "strategy";
   title: string;
   filter: string;
   selectedIdx: number;

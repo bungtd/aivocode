@@ -44,6 +44,7 @@ export interface StreamTurnOptions {
   onTextDelta?: (delta: string) => void;
   onReasoningDelta?: (delta: string) => void;
   onToolCallStart?: (id: string, name: string) => void;
+  onToolCallProgress?: (name: string, bytes: number, lines: number, preview: string) => void;
 }
 
 export interface StreamTurnResult {
@@ -447,6 +448,16 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
               }
               if (typeof fn.arguments === "string" && fn.arguments) {
                 entry.args += fn.arguments;
+                if (opts.onToolCallProgress) {
+                  const lines = (entry.args.match(/\\n/g)?.length ?? 0) + 1;
+                  const pathMatch = entry.args.match(/"path"\s*:\s*"([^"]+)"/);
+                  const target = pathMatch?.[1] ? `${entry.name}(${pathMatch[1]})` : entry.name;
+                  const tail = entry.args
+                    .slice(-180)
+                    .replace(/\\n/g, " ↵ ")
+                    .replace(/\\"/g, '"');
+                  opts.onToolCallProgress(target, entry.args.length, lines, tail);
+                }
               }
             }
           }
@@ -538,7 +549,19 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
           opts.onTextDelta?.(delta.text);
         } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
           const entry = blockTools.get(idx);
-          if (entry) entry.args += delta.partial_json;
+          if (entry) {
+            entry.args += delta.partial_json;
+            if (opts.onToolCallProgress) {
+              const lines = (entry.args.match(/\\n/g)?.length ?? 0) + 1;
+              const pathMatch = entry.args.match(/"path"\s*:\s*"([^"]+)"/);
+              const target = pathMatch?.[1] ? `${entry.name}(${pathMatch[1]})` : entry.name;
+              const tail = entry.args
+                .slice(-180)
+                .replace(/\\n/g, " ↵ ")
+                .replace(/\\"/g, '"');
+              opts.onToolCallProgress(target, entry.args.length, lines, tail);
+            }
+          }
         }
       } else if (type === "message_delta") {
         const u =

@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { exec } from "node:child_process";
+import { exec, spawn } from "node:child_process";
 import type { PermissionMode } from "../config.js";
 import type { ToolSpec } from "../protocol.js";
 import type { CheckpointManager } from "../checkpoint.js";
@@ -382,13 +382,15 @@ export function createToolset(opts: ToolsetOptions) {
       },
       {
         name: "run_shell",
-        description: "Execute a shell command in the workspace and return stdout/stderr.",
+        description:
+          "Execute a shell command in the workspace and return stdout/stderr. Set background=true for dev servers or long-running processes.",
         parameters: {
           type: "object",
           properties: {
             command: { type: "string", description: "Shell command to run" },
             workdir: { type: "string", description: "Working directory (optional)" },
             timeoutMs: { type: "number", description: "Timeout in milliseconds (default: 60000)" },
+            background: { type: "boolean", description: "Run in background and return immediately (for servers)" },
           },
           required: ["command"],
         },
@@ -412,7 +414,7 @@ export function createToolset(opts: ToolsetOptions) {
       {
         name: "computer_use",
         description:
-          "Interact with the desktop environment: capture screenshots (attached to Vision), list windows, open URLs, move/click mouse, or type keys.",
+          "Interact with the desktop environment: 'serve_preview' (starts local HTTP server for workspace, opens browser & captures full-DPI screenshot), 'screenshot', 'window_list', 'open_url', 'mouse_move', 'mouse_click', 'keyboard_type', or 'key_press'.",
         parameters: {
           type: "object",
           properties: {
@@ -420,6 +422,7 @@ export function createToolset(opts: ToolsetOptions) {
               type: "string",
               enum: [
                 "screenshot",
+                "serve_preview",
                 "window_list",
                 "open_url",
                 "mouse_move",
@@ -567,12 +570,24 @@ export function createToolset(opts: ToolsetOptions) {
 
         case "write_file": {
           const startedAt = Date.now();
-          const rawPath = String(args.path ?? "");
+          const rawPath = typeof args.path === "string" ? args.path.trim() : "";
+          if (!rawPath) {
+            return {
+              isError: true,
+              output: "write_file error: 'path' parameter is required (must be a non-empty file path).",
+            };
+          }
           const content = String(args.content ?? "");
           const guard = await checkMutationAllowed(`write_file(${rawPath})`);
           if (guard) return guard;
 
           const absPath = resolveWorkspacePath(opts.cwd, rawPath);
+          if (existsSync(absPath) && statSync(absPath).isDirectory()) {
+            return {
+              isError: true,
+              output: `write_file error: '${rawPath}' is a directory, not a file.`,
+            };
+          }
           const before = existsSync(absPath) ? readFileSync(absPath, "utf8") : "";
           opts.checkpoints.snapshotBeforeWrite(absPath);
           mkdirSync(dirname(absPath), { recursive: true });
@@ -588,7 +603,13 @@ export function createToolset(opts: ToolsetOptions) {
 
         case "edit_file": {
           const startedAt = Date.now();
-          const rawPath = String(args.path ?? "");
+          const rawPath = typeof args.path === "string" ? args.path.trim() : "";
+          if (!rawPath) {
+            return {
+              isError: true,
+              output: "edit_file error: 'path' parameter is required (e.g. path: 'src/index.ts').",
+            };
+          }
           const rawOld = String(args.oldString ?? "");
           const rawNew = String(args.newString ?? "");
           const replaceAll = args.replaceAll === true;
@@ -599,6 +620,12 @@ export function createToolset(opts: ToolsetOptions) {
           const absPath = resolveWorkspacePath(opts.cwd, rawPath);
           if (!existsSync(absPath)) {
             return { isError: true, output: `File not found: ${rawPath}` };
+          }
+          if (statSync(absPath).isDirectory()) {
+            return {
+              isError: true,
+              output: `edit_file error: '${rawPath}' is a directory, not a file. Specify a file path.`,
+            };
           }
 
           const original = readFileSync(absPath, "utf8");
@@ -613,6 +640,27 @@ export function createToolset(opts: ToolsetOptions) {
             if (strippedOld !== targetOld && normOriginal.includes(strippedOld)) {
               targetOld = strippedOld;
               targetNew = stripLineNumberPrefixes(targetNew);
+            }
+          }
+
+          // Fallback: trimmed line-by-line match if indentation/trailing spaces differed slightly
+          if (!normOriginal.includes(targetOld)) {
+            const origLines = normOriginal.split("\n");
+            const oldLines = targetOld.split("\n");
+            if (oldLines.length > 0 && oldLines.length <= origLines.length) {
+              for (let start = 0; start <= origLines.length - oldLines.length; start++) {
+                let allMatch = true;
+                for (let k = 0; k < oldLines.length; k++) {
+                  if (origLines[start + k]!.trim() !== oldLines[k]!.trim()) {
+                    allMatch = false;
+                    break;
+                  }
+                }
+                if (allMatch) {
+                  targetOld = origLines.slice(start, start + oldLines.length).join("\n");
+                  break;
+                }
+              }
             }
           }
 
@@ -843,7 +891,7 @@ export function createToolset(opts: ToolsetOptions) {
 
         case "run_shell": {
           const startedAt = Date.now();
-          const command = String(args.command ?? "").trim();
+          let command = String(args.command ?? "").trim();
           if (!command) return { isError: true, output: "Empty command" };
 
           for (const bad of DANGEROUS_SHELL_PATTERNS) {
@@ -858,9 +906,38 @@ export function createToolset(opts: ToolsetOptions) {
           const guard = await checkMutationAllowed(`run_shell: ${command}`);
           if (guard) return guard;
 
+          // Translate cmd.exe / POSIX directory listing idioms on Windows PowerShell
+          // (fixes `dir /a` -> `Cannot find path 'C:\a'` in PowerShell)
+          if (process.platform === "win32") {
+            if (/^dir\s+\/[a-z0-9]/i.test(command)) {
+              command = `cmd.exe /c "${command.replace(/"/g, '\\"')}"`;
+            } else if (/^ls\s+-[a-z]*a[a-z]*(\s+.*)?$/i.test(command)) {
+              const tail = command.replace(/^ls\s+-[a-z]+\s*/i, "").trim();
+              command = tail ? `Get-ChildItem -Force ${tail}` : "Get-ChildItem -Force";
+            }
+          }
+
           const workdir = args.workdir
             ? resolveWorkspacePath(opts.cwd, String(args.workdir))
             : opts.cwd;
+
+          if (args.background === true) {
+            const shellBin = process.platform === "win32" ? "powershell.exe" : "/bin/sh";
+            const shellArgs =
+              process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-c", command];
+            const child = spawn(shellBin, shellArgs, {
+              cwd: workdir,
+              detached: true,
+              stdio: "ignore",
+            });
+            child.unref();
+            return {
+              output: `Started background command (PID: ${child.pid ?? "detached"}): ${command}`,
+              summary: `background PID ${child.pid ?? "ok"}`,
+              durationMs: Date.now() - startedAt,
+            };
+          }
+
           const timeoutMs =
             typeof args.timeoutMs === "number" && args.timeoutMs > 0
               ? Math.min(args.timeoutMs, 300_000)
@@ -1047,25 +1124,31 @@ export function createToolset(opts: ToolsetOptions) {
         }
 
         case "computer_use": {
+          const startedAt = Date.now();
           const action = String(args.action ?? "window_list") as ComputerUseAction;
-          if (action !== "window_list" && action !== "screenshot") {
+          if (action !== "window_list" && action !== "screenshot" && action !== "serve_preview") {
             const guard = await checkMutationAllowed(`computer_use(${action})`);
             if (guard) return guard;
           }
-          const res = await executeComputerUse({
-            action,
-            x: typeof args.x === "number" ? args.x : undefined,
-            y: typeof args.y === "number" ? args.y : undefined,
-            button:
-              args.button === "right" || args.button === "double" ? args.button : "left",
-            text: typeof args.text === "string" ? args.text : undefined,
-            key: typeof args.key === "string" ? args.key : undefined,
-            url: typeof args.url === "string" ? args.url : undefined,
-          });
+          const res = await executeComputerUse(
+            {
+              action,
+              cwd: opts.cwd,
+              x: typeof args.x === "number" ? args.x : undefined,
+              y: typeof args.y === "number" ? args.y : undefined,
+              button:
+                args.button === "right" || args.button === "double" ? args.button : "left",
+              text: typeof args.text === "string" ? args.text : undefined,
+              key: typeof args.key === "string" ? args.key : undefined,
+              url: typeof args.url === "string" ? args.url : undefined,
+            },
+            { cwd: opts.cwd },
+          );
           return {
             output: res.output,
             isError: res.isError,
             summary: action,
+            durationMs: Date.now() - startedAt,
             imageAttachment: res.screenshotAttachment,
           };
         }
