@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { wrapTranscriptLines } from "../src/ui/fullscreen.js";
+import { wrapTranscriptLines, renderFullScreenViewport, extractLastCodeBlock } from "../src/ui/fullscreen.js";
+import { renderTerminalMarkdown } from "../src/ui/markdown.js";
 import { c, stripAnsi } from "../src/ui/theme.js";
 import { CheckpointManager } from "../src/checkpoint.js";
 import { createToolset } from "../src/tools/index.js";
@@ -312,5 +313,66 @@ describe("Deep Review Round 1 Fixes", () => {
     });
 
     expect(progressCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("6. renders full-width clean-copyable transcript, code blocks, and input line with zero sidebar │ or border │ pollution", () => {
+    const md = renderTerminalMarkdown("Here is code:\n```ts\nconst x = 1;\nconsole.log(x);\n```");
+    const plainMd = stripAnsi(md);
+    // Code lines inside fenced block must NOT have │ prefix so mouse copy-paste is valid code
+    for (const line of plainMd.split("\n")) {
+      if (line.includes("const x = 1;") || line.includes("console.log(x);")) {
+        expect(line.trimStart().startsWith("│")).toBe(false);
+      }
+    }
+
+    expect(extractLastCodeBlock("Text\n```js\nalert(1);\n```\nDone")).toBe("alert(1);");
+
+    const viewport = stripAnsi(
+      renderFullScreenViewport({
+        cols: 100,
+        rows: 20,
+        showSidebar: false,
+        version: "1.2.0",
+        cwd: "C:/Dev/Projects/app",
+        gitBranch: "main",
+        gatewayUrl: "https://api.aivokey.dev",
+        model: "deepseek-v4.1-flash",
+        fastModel: "deepseek-v4.1-flash",
+        wire: "chat",
+        effort: "off",
+        mode: "auto",
+        sessionId: "ses_copy_clean",
+        usedContextTokens: 500,
+        maxContextTokens: 1_000_000,
+        cacheHitPct: 90,
+        sessionCostMicro: 1000n,
+        balanceMicro: 5_000_000n,
+        keyStatus: null,
+        todos: [],
+        modifiedFiles: [],
+        transcriptLines: ["◆ deepseek-v4.1-flash", "  Halo, ini jawaban bersih untuk dicopy."],
+        scrollOffset: 0,
+        busyLabel: null,
+        buffer: "ketikan input saya",
+        cursorPos: 18,
+        suggestions: { kind: "none", query: "", items: [] },
+        selectedSuggestionIdx: 0,
+        modal: null,
+        notice: null,
+      }),
+    );
+
+    const vLines = viewport.split("\n");
+    const answerLine = vLines.find((l) => l.includes("Halo, ini jawaban bersih untuk dicopy."))!;
+    expect(answerLine).toBeDefined();
+    // Must not contain any sidebar │ separator or trailing 50-space padding
+    expect(answerLine).not.toContain("│");
+    expect(answerLine.endsWith("   ")).toBe(false);
+
+    const inputLine = vLines.find((l) => l.includes("ketikan input saya"))!;
+    expect(inputLine).toBeDefined();
+    // Input line must not have │ box walls around it
+    expect(inputLine).not.toContain("│");
+    expect(inputLine.endsWith("   ")).toBe(false);
   });
 });

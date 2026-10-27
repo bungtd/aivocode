@@ -44,41 +44,41 @@ export function renderUnifiedDiff(
   const ctxEnd = Math.min(newLines.length - 1, newSuffix + contextLines);
 
   const out: string[] = [
-    `${c.slate("  ╭─")} ${c.bold(filePath)} ${c.emerald(`+${addedCount}`)} ${c.rose(`-${removedCount}`)} ${c.slate("─".repeat(Math.max(4, 48 - filePath.length)))}`,
+    `${c.slate("  ──")} ${c.bold(filePath)} ${c.emerald(`+${addedCount}`)} ${c.rose(`-${removedCount}`)} ${c.slate("─".repeat(Math.max(4, 48 - filePath.length)))}`,
   ];
 
   // Context before
   for (let i = ctxStart; i < prefix; i++) {
     const ln = String(i + 1).padStart(4, " ");
-    out.push(`${c.slate(`  │ ${ln}`)}   ${c.dim(oldLines[i] ?? "")}`);
+    out.push(`${c.slate(`    ${ln}`)}   ${c.dim(oldLines[i] ?? "")}`);
   }
 
   // Removed lines (cap at 30 lines for readability)
   const maxShow = 30;
   for (let i = 0; i < Math.min(removedSlice.length, maxShow); i++) {
     const ln = String(prefix + i + 1).padStart(4, " ");
-    out.push(`${c.slate("  │")} ${c.diffDelLine(`${ln} - ${removedSlice[i] ?? ""}`)}`);
+    out.push(`    ${c.diffDelLine(`${ln} - ${removedSlice[i] ?? ""}`)}`);
   }
   if (removedSlice.length > maxShow) {
-    out.push(`${c.slate("  │")} ${c.dim(`     ... (${removedSlice.length - maxShow} more removed lines)`)}`);
+    out.push(`    ${c.dim(`     ... (${removedSlice.length - maxShow} more removed lines)`)}`);
   }
 
   // Added lines (cap at 30 lines for readability)
   for (let i = 0; i < Math.min(addedSlice.length, maxShow); i++) {
     const ln = String(prefix + i + 1).padStart(4, " ");
-    out.push(`${c.slate("  │")} ${c.diffAddLine(`${ln} + ${addedSlice[i] ?? ""}`)}`);
+    out.push(`    ${c.diffAddLine(`${ln} + ${addedSlice[i] ?? ""}`)}`);
   }
   if (addedSlice.length > maxShow) {
-    out.push(`${c.slate("  │")} ${c.dim(`     ... (${addedSlice.length - maxShow} more added lines)`)}`);
+    out.push(`    ${c.dim(`     ... (${addedSlice.length - maxShow} more added lines)`)}`);
   }
 
   // Context after
   for (let i = newSuffix + 1; i <= ctxEnd; i++) {
     const ln = String(i + 1).padStart(4, " ");
-    out.push(`${c.slate(`  │ ${ln}`)}   ${c.dim(newLines[i] ?? "")}`);
+    out.push(`${c.slate(`    ${ln}`)}   ${c.dim(newLines[i] ?? "")}`);
   }
 
-  out.push(`${c.slate("  ╰" + "─".repeat(62))}`);
+  out.push(`${c.slate("  " + "─".repeat(64))}`);
   return out.join("\n");
 }
 
@@ -113,17 +113,17 @@ export function renderTerminalMarkdown(markdown: string): string {
       if (!inCodeBlock) {
         inCodeBlock = true;
         codeLang = fenceMatch[1] || "code";
-        out.push(`${c.slate("  ╭─")} ${c.amber(codeLang)} ${c.slate("─".repeat(Math.max(4, 52 - codeLang.length)))}`);
+        out.push(`${c.slate("  ──")} ${c.amber(codeLang)} ${c.slate("─".repeat(Math.max(4, 52 - codeLang.length)))}`);
       } else {
         inCodeBlock = false;
         codeLang = "";
-        out.push(`${c.slate("  ╰" + "─".repeat(58))}`);
+        out.push(`${c.slate("  " + "─".repeat(60))}`);
       }
       continue;
     }
 
     if (inCodeBlock) {
-      out.push(`${c.slate("  │")} ${highlightCodeLine(rawLine)}`);
+      out.push(`    ${highlightCodeLine(rawLine)}`);
       continue;
     }
 
@@ -143,7 +143,7 @@ export function renderTerminalMarkdown(markdown: string): string {
   }
 
   if (inCodeBlock) {
-    out.push(`${c.slate("  ╰" + "─".repeat(58))}`);
+    out.push(`${c.slate("  " + "─".repeat(60))}`);
   }
 
   return out.join("\n");

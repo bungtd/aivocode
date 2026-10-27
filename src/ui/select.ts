@@ -20,6 +20,7 @@ export const SLASH_COMMANDS: Array<{ cmd: string; description: string }> = [
   { cmd: "/memory", description: "View or search self-learning persistent memories" },
   { cmd: "/audit", description: "Run Anti-AI-Slop code quality audit on modified files" },
   { cmd: "/screenshot", description: "Capture desktop screenshot and attach to Vision" },
+  { cmd: "/copy", description: "Copy last assistant response (or '/copy code' for last code block) to clipboard (Ctrl+Y)" },
   { cmd: "/status", description: "Live AivoKey balance, faucet tokens, plan quota & cache stats" },
   { cmd: "/compact", description: "Compress conversation history to free context window" },
   { cmd: "/undo", description: "Revert file edits from the last turn via checkpoints" },

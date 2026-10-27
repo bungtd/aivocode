@@ -51,12 +51,13 @@ export async function startFullScreenTui(
   let keyStatus = initialKeyStatus;
   let workspaceFiles = walkWorkspaceFiles(agent.config.cwd);
   let gitBranch = getGitBranchLabel(agent.config.cwd);
-  let showSidebar = true;
+  // Default showSidebar to false so mouse selection copies pure transcript text without right-column pollution (Ctrl+B toggles drawer)
+  let showSidebar = false;
 
   const transcriptLines: string[] = [
     `${c.cyan("◆")} ${c.bold("Welcome to AivoCode Full-Screen Studio")} ${c.slate("(Native AivoKey Harness)")}`,
-    `  ${c.slate("• Type")} ${c.cyan("/")} ${c.slate("for commands,")} ${c.cyan("@")} ${c.slate("to attach files,")} ${c.cyan("!cmd")} ${c.slate("for shell.")}`,
-    `  ${c.slate("• Hotkeys:")} ${c.amber("Shift+Tab")} Mode · ${c.amber("Ctrl+K")} Model Picker · ${c.amber("Ctrl+E")} Effort · ${c.amber("Ctrl+B")} Toggle Sidebar · ${c.amber("PgUp/PgDn")} Scroll`,
+    `  ${c.slate("• Type")} ${c.cyan("/")} ${c.slate("for commands,")} ${c.cyan("@")} ${c.slate("to attach files,")} ${c.cyan("!cmd")} ${c.slate("for shell,")} ${c.cyan("/copy")} ${c.slate("or")} ${c.amber("Ctrl+Y")} ${c.slate("to copy response.")}`,
+    `  ${c.slate("• Hotkeys:")} ${c.amber("Shift+Tab")} Mode · ${c.amber("Ctrl+K")} Model · ${c.amber("Ctrl+G")} Subagents · ${c.amber("Ctrl+O")} Config · ${c.amber("Ctrl+B")} Sidebar Drawer`,
     "",
   ];
 
@@ -182,7 +183,7 @@ export async function startFullScreenTui(
     onReasoningDelta: (delta: string) => {
       busyBaseLabel = `Thinking with ${agent.config.model}`;
       if (streamingReasoningLineIdx === null) {
-        transcriptLines.push(`${c.slate(`╭─ ◆ Thinking (${agent.config.reasoningEffort}) ───`)}`);
+        transcriptLines.push(`${c.slate(`  ── ◆ Thinking (${agent.config.reasoningEffort}) ──────────────────────`)}`);
         streamingReasoningLineIdx = transcriptLines.length;
         streamingReasoningBuffer = "";
         transcriptLines.push("");
@@ -191,7 +192,7 @@ export async function startFullScreenTui(
       const previewLines = streamingReasoningBuffer
         .split(/\r?\n/)
         .slice(-6)
-        .map((l) => `${c.slate("│")} ${c.dim(l)}`);
+        .map((l) => `    ${c.dim(l)}`);
       transcriptLines.splice(
         streamingReasoningLineIdx,
         transcriptLines.length - streamingReasoningLineIdx,
@@ -202,7 +203,7 @@ export async function startFullScreenTui(
     onTextDelta: (delta: string) => {
       busyBaseLabel = `Streaming from ${agent.config.model}`;
       if (streamingReasoningLineIdx !== null) {
-        transcriptLines.push(`${c.slate("╰─ End Thinking ───")}`);
+        transcriptLines.push(`${c.slate("  ── End Thinking ─────────────────────────────")}`);
         streamingReasoningLineIdx = null;
       }
       if (streamingAssistantLineIdx === null) {
@@ -1355,7 +1356,24 @@ export async function startFullScreenTui(
     // Ctrl+B -> Toggle Right Sidebar
     if (key?.ctrl && key.name === "b") {
       showSidebar = !showSidebar;
-      notice = showSidebar ? "Sidebar shown" : "Sidebar hidden";
+      notice = showSidebar ? "Sidebar drawer shown (Ctrl+B to hide for clean copy)" : "Sidebar drawer hidden (clean full-width copy)";
+      render();
+      return;
+    }
+
+    // Ctrl+Y -> Copy last assistant response to clipboard
+    if (key?.ctrl && key.name === "y") {
+      const lastAssistant = [...agent.session.messages]
+        .reverse()
+        .find((m) => m.role === "assistant" && m.content.trim().length > 0);
+      if (lastAssistant) {
+        const ok = copyTextToSystemClipboard(lastAssistant.content);
+        notice = ok
+          ? `Copied last response (${lastAssistant.content.length} chars) to clipboard!`
+          : "Failed to access system clipboard";
+      } else {
+        notice = "No assistant response to copy yet";
+      }
       render();
       return;
     }
@@ -1663,6 +1681,56 @@ export interface FullScreenTuiState {
 }
 
 /**
+ * Truncates an ANSI-styled line if it exceeds `width` visible columns, without padding trailing spaces.
+ */
+export function truncateLineToWidth(line: string, width: number): string {
+  if (width <= 0) return "";
+  const vis = visibleLength(line);
+  if (vis <= width) return line;
+  return fitLineToWidth(line, width).trimEnd();
+}
+
+/**
+ * Extracts the last fenced code block (` ```...``` `) from a markdown response,
+ * or returns the full text if no code block is present.
+ */
+export function extractLastCodeBlock(markdown: string): string {
+  const regex = /```(?:\w*)\r?\n([\s\S]*?)```/g;
+  let lastMatch: string | null = null;
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(markdown)) !== null) {
+    if (m[1]) lastMatch = m[1].trim();
+  }
+  return lastMatch ?? markdown.trim();
+}
+
+/**
+ * Copies text directly to the OS clipboard (`Set-Clipboard` on Windows, `pbcopy` on macOS, `xclip` on Linux).
+ */
+export function copyTextToSystemClipboard(text: string): boolean {
+  try {
+    if (process.platform === "win32") {
+      execSync("powershell.exe -NoProfile -Command \"$input | Set-Clipboard\"", {
+        input: text,
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      return true;
+    }
+    if (process.platform === "darwin") {
+      execSync("pbcopy", { input: text, stdio: ["pipe", "ignore", "ignore"] });
+      return true;
+    }
+    execSync("xclip -selection clipboard || xsel --clipboard --input", {
+      input: text,
+      stdio: ["pipe", "ignore", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Truncate or pad an ANSI-styled line to an exact visible column width.
  */
 export function fitLineToWidth(line: string, width: number): string {
@@ -1918,15 +1986,19 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
 
   const leftRows: string[] = [];
   for (const line of visibleSlice) {
-    leftRows.push(fitLineToWidth(` ${line}`, mainWidth));
+    leftRows.push(
+      hasSidebar ? fitLineToWidth(` ${line}`, mainWidth) : truncateLineToWidth(` ${line}`, mainWidth),
+    );
   }
   while (leftRows.length < availTranscriptRows) {
-    leftRows.push(" ".repeat(mainWidth));
+    leftRows.push(hasSidebar ? " ".repeat(mainWidth) : "");
   }
 
   if (state.busyLabel) {
     const busyLine = ` ${c.cyan("⠋")} ${c.amber(state.busyLabel)}`;
-    leftRows.push(fitLineToWidth(busyLine, mainWidth));
+    leftRows.push(
+      hasSidebar ? fitLineToWidth(busyLine, mainWidth) : truncateLineToWidth(busyLine, mainWidth),
+    );
   }
 
   // Overlay floating `/` or `@` suggestion dropdown at the bottom of `leftRows` if active
@@ -1962,12 +2034,12 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
 
   const bodyLines: string[] = [];
   for (let r = 0; r < bodyHeight; r++) {
-    const leftCell = leftRows[r] ?? " ".repeat(mainWidth);
     if (hasSidebar) {
+      const leftCell = leftRows[r] ?? " ".repeat(mainWidth);
       const rightCell = rightRows[r] ?? " ".repeat(sidebarWidth - 2);
       bodyLines.push(`${leftCell}${c.slate("│")} ${fitLineToWidth(rightCell, sidebarWidth - 1)}`);
     } else {
-      bodyLines.push(leftCell);
+      bodyLines.push(leftRows[r] ?? "");
     }
   }
 
@@ -2027,7 +2099,7 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
     }
   }
 
-  // ── 3. Bottom Docked Composer Box (3 rows) + Bottom Hotkey/Status Ribbon (1 row) ──
+  // ── 3. Bottom Docked Composer (Borderless left/right so mouse selection copies pure input text!) ──
   const borderColor =
     state.mode === "plan" ? c.violet : state.mode === "safe" ? c.amber : c.cyan;
   const modeLabel =
@@ -2040,10 +2112,10 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
   const scrollTag =
     clampedScroll > 0 ? ` · ↑ Scrolled +${clampedScroll} lines (PgDn/End)` : "";
   const noticeTag = state.notice ? ` · ⚡ ${state.notice}` : "";
-  const compHeader = `─ ◆ ${modeLabel}${scrollTag}${noticeTag} `;
-  const compTopDash = Math.max(2, cols - 2 - compHeader.length);
-  const compTop = fitLineToWidth(
-    borderColor(`╭${compHeader}${"─".repeat(compTopDash)}╮`),
+  const compHeader = `── ◆ ${modeLabel}${scrollTag}${noticeTag} `;
+  const compTopDash = Math.max(2, cols - compHeader.length);
+  const compTop = truncateLineToWidth(
+    borderColor(`${compHeader}${"─".repeat(compTopDash)}`),
     cols,
   );
 
@@ -2070,11 +2142,12 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
     inputContent = `${glyph}${c.white(clipped)}`;
   }
 
-  const compMid = `${borderColor("│")} ${fitLineToWidth(inputContent, innerCompW)} ${borderColor("│")}`;
-  const compBot = borderColor(`╰${"─".repeat(Math.max(2, cols - 2))}╯`);
+  // No left/right │ walls and no trailing spaces so selecting input text copies cleanly!
+  const compMid = ` ${truncateLineToWidth(inputContent, innerCompW)}`;
+  const compBot = borderColor("─".repeat(Math.max(2, cols)));
 
-  const footerBar = fitLineToWidth(
-    ` ${c.bold("Shift+Tab:")} Mode ${c.slate("│")} ${c.bold("Ctrl+K:")} Model ${c.slate("│")} ${c.bold("Ctrl+G:")} Subagents ${c.slate("│")} ${c.bold("Ctrl+O:")} Config ${c.slate("│")} ${c.bold("Ctrl+A:")} Team(${c.amber(state.team ?? "fullstack")}) ${c.slate("│")} ${c.bold("Ctrl+P:")} Palette ${c.slate("│")} ${c.bold("/:")} Cmds`,
+  const footerBar = truncateLineToWidth(
+    ` ${c.bold("Shift+Tab:")} Mode ${c.slate("│")} ${c.bold("Ctrl+K:")} Model ${c.slate("│")} ${c.bold("Ctrl+G:")} Subagents ${c.slate("│")} ${c.bold("Ctrl+O:")} Config ${c.slate("│")} ${c.bold("Ctrl+Y:")} Copy ${c.slate("│")} ${c.bold("Ctrl+B:")} Sidebar ${c.slate("│")} ${c.bold("/:")} Cmds`,
     cols,
   );
 

@@ -389,9 +389,9 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
         ? "SAFE · CONFIRM EDITS"
         : "AUTO · BUILD AGENT";
 
-  const topTitle = `─ ◆ ${modeTitle} `;
-  const topDashCount = Math.max(2, width - 2 - topTitle.length);
-  const topBorder = borderColor(`╭${topTitle}${"─".repeat(topDashCount)}╮`);
+  const topTitle = `── ◆ ${modeTitle} `;
+  const topDashCount = Math.max(2, width - topTitle.length);
+  const topBorder = borderColor(`${topTitle}${"─".repeat(topDashCount)}`);
 
   const glyph =
     opts.mode === "plan"
@@ -403,7 +403,7 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
   let inputDisplay: string;
   if (!opts.buffer) {
     const placeholder = "Ask anything, @file to attach, / for commands, !cmd for shell…";
-    inputDisplay = `${glyph}${c. white("▏")}${c.dim(placeholder)}`;
+    inputDisplay = `${glyph}${c.white("▏")}${c.dim(placeholder)}`;
   } else {
     const beforeCursor = opts.buffer.slice(0, opts.cursorPos);
     const afterCursor = opts.buffer.slice(opts.cursorPos);
@@ -414,12 +414,13 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
     inputDisplay = `${glyph}${c.white(clipped)}`;
   }
 
-  const middleRow = `${borderColor("│")} ${padEndVisible(inputDisplay, inner)} ${borderColor("│")}`;
+  // Borderless left/right so mouse selection copies pure input text without │ borders!
+  const middleRow = ` ${inputDisplay}`;
 
   const footerHint =
-    " Shift+Tab: Mode · Ctrl+K: Models · Ctrl+E: Effort · Ctrl+W: Wire · /: Cmds ";
-  const bottomDashCount = Math.max(1, width - 2 - footerHint.length);
-  const bottomBorder = borderColor(`╰${footerHint}${"─".repeat(bottomDashCount)}╯`);
+    "── Shift+Tab: Mode · Ctrl+K: Models · Ctrl+E: Effort · Ctrl+W: Wire · /: Cmds ";
+  const bottomDashCount = Math.max(1, width - footerHint.length);
+  const bottomBorder = borderColor(`${footerHint}${"─".repeat(bottomDashCount)}`);
 
   const lines: string[] = [statusBar, topBorder, middleRow, bottomBorder];
 

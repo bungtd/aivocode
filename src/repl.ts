@@ -1084,6 +1084,26 @@ export async function handleSlashCommand(
       };
     }
 
+    case "/copy": {
+      const { copyTextToSystemClipboard, extractLastCodeBlock } = await import("./ui/fullscreen.js");
+      const lastAssistant = [...agent.session.messages]
+        .reverse()
+        .find((m) => m.role === "assistant" && m.content.trim().length > 0);
+      if (!lastAssistant) {
+        return { output: c.slate("No assistant response to copy yet.") };
+      }
+      const targetText =
+        arg.toLowerCase() === "code"
+          ? extractLastCodeBlock(lastAssistant.content)
+          : lastAssistant.content;
+      const ok = copyTextToSystemClipboard(targetText);
+      return {
+        output: ok
+          ? `${c.emerald("✓")} Copied ${arg.toLowerCase() === "code" ? "last code block" : "last response"} (${targetText.length} chars) to system clipboard!`
+          : c.rose("Failed to access system clipboard."),
+      };
+    }
+
     case "/exit":
     case "/quit":
       return { output: c.slate("Session saved. Goodbye!"), shouldExit: true };
