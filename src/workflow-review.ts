@@ -202,3 +202,128 @@ export function verifyWorkspaceArtifacts(
     findings,
   };
 }
+
+export interface ParsedReviewerVerdict {
+  passed: boolean;
+  issues: string[];
+  rawText: string;
+}
+
+/**
+ * Parses the structured output of a dedicated Read-Only Reviewer pass:
+ * - `VERDICT: PASS` -> `{ passed: true, issues: [] }`
+ * - `VERDICT: NEEDS_FIX` followed by numbered/bulleted findings -> `{ passed: false, issues: [...] }`
+ */
+export function parseReviewerVerdict(rawText: string): ParsedReviewerVerdict {
+  const text = rawText.trim();
+  const hasNeedsFix = /VERDICT:\s*NEEDS_FIX/i.test(text);
+  const hasPass = /VERDICT:\s*PASS/i.test(text) && !hasNeedsFix;
+
+  if (hasPass) {
+    return { passed: true, issues: [], rawText: text };
+  }
+
+  const lines = text.split(/\r?\n/);
+  const issues: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^(?:\d+\.|[-*•])\s+(.+)$/.test(trimmed)) {
+      issues.push(trimmed.replace(/^(?:\d+\.|[-*•])\s+/, ""));
+    }
+  }
+
+  if (!hasNeedsFix && issues.length === 0) {
+    return { passed: true, issues: [], rawText: text };
+  }
+
+  if (hasNeedsFix && issues.length === 0) {
+    issues.push(text.replace(/VERDICT:\s*NEEDS_FIX/i, "").trim() || "Reviewer requested fixes");
+  }
+
+  return {
+    passed: false,
+    issues,
+    rawText: text,
+  };
+}
+
+export interface IterativeReviewFixOptions {
+  cwd: string;
+  modifiedFiles: string[];
+  maxRounds?: number;
+  onEvent?: (message: string) => void;
+  runReviewerAgent: (round: number, staticFindings: string[]) => Promise<string>;
+  runFixerAgent: (round: number, issuesToFix: string[]) => Promise<string>;
+}
+
+export interface IterativeReviewFixResult {
+  passed: boolean;
+  roundsRun: number;
+  remainingIssues: string[];
+}
+
+/**
+ * Separated Iterative Review -> Fix -> Re-Review -> Re-Fix Loop:
+ * 1. Runs a dedicated Read-Only Review pass (static artifact audit + Reviewer agent).
+ * 2. If issues are found, runs a separate Read-Write Fixer pass.
+ * 3. Re-runs the Read-Only Review pass from scratch to verify the fixes and check for regressions.
+ * 4. Repeats until VERDICT: PASS (0 issues) or maxRounds is reached.
+ */
+export async function runIterativeReviewFixLoop(
+  opts: IterativeReviewFixOptions,
+): Promise<IterativeReviewFixResult> {
+  const maxRounds = Math.max(1, opts.maxRounds ?? 3);
+  let remainingIssues: string[] = [];
+
+  for (let round = 1; round <= maxRounds; round++) {
+    opts.onEvent?.(`Review Round ${round}/${maxRounds}: Auditing modified files (read-only)...`);
+    const staticCheck = verifyWorkspaceArtifacts(opts.cwd, opts.modifiedFiles);
+    const reviewerOutput = await opts.runReviewerAgent(round, staticCheck.findings);
+    const verdict = parseReviewerVerdict(reviewerOutput);
+
+    const combinedIssues = [
+      ...staticCheck.findings,
+      ...verdict.issues.filter((i) => !staticCheck.findings.includes(i)),
+    ];
+
+    if (staticCheck.clean && verdict.passed && combinedIssues.length === 0) {
+      opts.onEvent?.(`Review Round ${round} PASSED (0 issues found).`);
+      return {
+        passed: true,
+        roundsRun: round,
+        remainingIssues: [],
+      };
+    }
+
+    remainingIssues = combinedIssues;
+    opts.onEvent?.(
+      `Review Round ${round} found ${remainingIssues.length} issue(s) — starting Fix Round ${round}...`,
+    );
+
+    await opts.runFixerAgent(round, remainingIssues);
+  }
+
+  // Final verification check after last fix round
+  const finalStatic = verifyWorkspaceArtifacts(opts.cwd, opts.modifiedFiles);
+  if (finalStatic.clean) {
+    const finalReview = await opts.runReviewerAgent(maxRounds + 1, []);
+    const finalVerdict = parseReviewerVerdict(finalReview);
+    if (finalVerdict.passed) {
+      opts.onEvent?.(`Final Re-Review PASSED (0 issues remaining).`);
+      return {
+        passed: true,
+        roundsRun: maxRounds,
+        remainingIssues: [],
+      };
+    }
+    remainingIssues = finalVerdict.issues;
+  } else {
+    remainingIssues = finalStatic.findings;
+  }
+
+  return {
+    passed: remainingIssues.length === 0,
+    roundsRun: maxRounds,
+    remainingIssues,
+  };
+}

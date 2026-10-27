@@ -13,7 +13,9 @@ import {
 import type { TodoItem } from "../tools/index.js";
 import { walkWorkspaceFiles } from "../tools/index.js";
 import { buildSystemPrompt, estimateConversationTokens } from "../context.js";
-import type { AivoAgent } from "../agent.js";
+import type { AivoAgent, SubagentRunRecord } from "../agent.js";
+import type { BackgroundJob } from "../background-jobs.js";
+import { filterEligibleModelsForAccount } from "../aivokey-client.js";
 import {
   c,
   formatCompactTokens,
@@ -122,6 +124,8 @@ export async function startFullScreenTui(
       keyStatus,
       todos: agent.todos,
       modifiedFiles: agent.checkpoints.listModifiedFiles(),
+      subagentRuns: agent.subagentRuns,
+      backgroundJobs: agent.backgroundJobs.listJobs(),
       transcriptLines,
       scrollOffset,
       busyLabel: formattedBusy,
@@ -140,10 +144,10 @@ export async function startFullScreenTui(
     };
   };
 
-  const render = () => {
-    const frame = renderFullScreenViewport(computeState());
-    // Move cursor to top-left (1,1) and paint full screen without flicker
-    stdout.write(`\x1b[H${frame}`);
+  let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  const render = (clearScreen: boolean = false) => {
+    const ansiBuf = renderFullScreenAnsiBuffer(computeState(), clearScreen);
+    stdout.write(ansiBuf);
   };
 
   const startBusy = (label: string) => {
@@ -173,7 +177,7 @@ export async function startFullScreenTui(
     onReasoningDelta: (delta: string) => {
       busyBaseLabel = `Thinking with ${agent.config.model}`;
       if (streamingReasoningLineIdx === null) {
-        transcriptLines.push(`${c.slate(`╭─ 💭 Thinking (${agent.config.reasoningEffort}) ───`)}`);
+        transcriptLines.push(`${c.slate(`╭─ ◆ Thinking (${agent.config.reasoningEffort}) ───`)}`);
         streamingReasoningLineIdx = transcriptLines.length;
         streamingReasoningBuffer = "";
         transcriptLines.push("");
@@ -188,7 +192,6 @@ export async function startFullScreenTui(
         transcriptLines.length - streamingReasoningLineIdx,
         ...previewLines,
       );
-      scrollOffset = 0;
       render();
     },
     onTextDelta: (delta: string) => {
@@ -212,7 +215,6 @@ export async function startFullScreenTui(
         transcriptLines.length - streamingAssistantLineIdx,
         ...formatted,
       );
-      scrollOffset = 0;
       render();
     },
     onToolCall: (name: string, args: Record<string, unknown>) => {
@@ -249,7 +251,6 @@ export async function startFullScreenTui(
         transcriptLines.length - streamingToolProgressLineIdx,
         previewRow,
       );
-      scrollOffset = 0;
       render();
     },
     onToolResult: (
@@ -286,7 +287,6 @@ export async function startFullScreenTui(
       if (!isError && name === "todo_write") {
         transcriptLines.push(...renderTodoBoard(agent.todos).split("\n"));
       }
-      scrollOffset = 0;
       render();
     },
     onTodoUpdate: () => {
@@ -349,8 +349,10 @@ export async function startFullScreenTui(
 
   let activeSubagentRoleTarget: "explore" | "architect" | "builder" | "reviewer" | "all" = "explore";
 
-  const getAvailableCatalog = () =>
-    agent.catalog.length > 0 ? agent.catalog : DEFAULT_AIVOKEY_CATALOG;
+  const getAvailableCatalog = () => {
+    const base = agent.catalog.length > 0 ? agent.catalog : DEFAULT_AIVOKEY_CATALOG;
+    return filterEligibleModelsForAccount(base, keyStatus);
+  };
 
   const buildModelModalItems = (): ModalOption[] =>
     getAvailableCatalog().map((m) => {
@@ -672,6 +674,97 @@ export async function startFullScreenTui(
     render();
   };
 
+  const openSubagentInspectorListModal = () => {
+    const runs = agent.subagentRuns;
+    if (runs.length === 0) {
+      notice = "No subagents have run in this session yet.";
+      render();
+      return;
+    }
+    modal = {
+      id: "subagent_inspect_list",
+      title: `Inspect Subagent Work (${runs.length} subagents · Enter to view logs)`,
+      filter: "",
+      selectedIdx: runs.length - 1,
+      items: runs.map((r) => ({
+        value: r.id,
+        label: `${r.id} · ${r.name}`,
+        badge: `[${r.status.toUpperCase()} · ${r.model}]`,
+        detail: r.description,
+      })),
+    };
+    render();
+  };
+
+  const openSubagentDetailModal = (subId: string) => {
+    const run = agent.subagentRuns.find((r) => r.id === subId);
+    if (!run) {
+      notice = `Subagent '${subId}' not found.`;
+      render();
+      return;
+    }
+    const logLines = run.logs.flatMap((l) => l.split(/\r?\n/));
+    modal = {
+      id: "subagent_inspect_detail",
+      title: `Subagent ${run.id}: ${run.name} (${run.model} · ${run.status}) — Esc to close`,
+      filter: "",
+      selectedIdx: 0,
+      items: (logLines.length > 0 ? logLines : ["(no logs yet)"]).map((line, idx) => ({
+        value: String(idx),
+        label: line.slice(0, 70),
+      })),
+    };
+    render();
+  };
+
+  const openJobsListModal = () => {
+    const jobs = agent.backgroundJobs.listJobs();
+    if (jobs.length === 0) {
+      notice = "No background terminal jobs running. Use /bg <cmd> or run_shell(background:true).";
+      render();
+      return;
+    }
+    modal = {
+      id: "jobs_list",
+      title: `Background Terminal Jobs (${jobs.length}) — Enter to view logs / kill`,
+      filter: "",
+      selectedIdx: jobs.length - 1,
+      items: jobs.map((j) => ({
+        value: j.id,
+        label: `${j.id} (PID ${j.pid ?? "-"})`,
+        badge: `[${j.status.toUpperCase()}${j.detectedUrl ? ` · ${j.detectedUrl}` : ""}]`,
+        detail: j.command.slice(0, 48),
+      })),
+    };
+    render();
+  };
+
+  const openJobDetailModal = (jobId: string) => {
+    const job = agent.backgroundJobs.getJob(jobId);
+    if (!job) {
+      notice = `Background job '${jobId}' not found.`;
+      render();
+      return;
+    }
+    const items: ModalOption[] = [
+      ...(job.status === "running"
+        ? [{ value: `kill:${job.id}`, label: "✗ Kill / Stop This Process", badge: `[PID ${job.pid ?? "-"}]`, detail: job.command }]
+        : []),
+      ...job.logs.slice(-40).map((l, idx) => ({
+        value: `log:${idx}`,
+        label: l.slice(0, 68),
+      })),
+    ];
+    modal = {
+      id: "job_detail",
+      title: `Terminal ${job.id} (${job.status}${job.detectedUrl ? ` · ${job.detectedUrl}` : ""})`,
+      filter: "",
+      selectedIdx: 0,
+      items: items.length > 0 ? items : [{ value: "noop", label: "(no output yet)" }],
+    };
+    render();
+  };
+
   const openCommandPaletteModal = () => {
     modal = {
       id: "command",
@@ -752,6 +845,39 @@ export async function startFullScreenTui(
       }
       if (cmdOnly === "/team" || cmdOnly === "/agents") {
         openTeamModal();
+        return;
+      }
+      if (cmdOnly === "/subagents" || cmdOnly === "/inspect") {
+        openSubagentInspectorListModal();
+        return;
+      }
+      if (cmdOnly.startsWith("/inspect ")) {
+        openSubagentDetailModal(line.slice("/inspect ".length).trim());
+        return;
+      }
+      if (cmdOnly === "/jobs" || cmdOnly === "/ps") {
+        openJobsListModal();
+        return;
+      }
+      if (cmdOnly.startsWith("/logs ")) {
+        openJobDetailModal(line.slice("/logs ".length).trim());
+        return;
+      }
+      if (cmdOnly.startsWith("/kill ")) {
+        const jid = line.slice("/kill ".length).trim();
+        const ok = agent.backgroundJobs.killJob(jid);
+        notice = ok ? `Killed background job ${jid}` : `Job ${jid} not found`;
+        render();
+        return;
+      }
+      if (cmdOnly.startsWith("/bg ")) {
+        const bgCmd = line.slice("/bg ".length).trim();
+        if (bgCmd) {
+          const job = agent.backgroundJobs.startJob({ command: bgCmd, cwd: agent.config.cwd });
+          notice = `Started background job ${job.id} (PID ${job.pid ?? "-"})`;
+          transcriptLines.push(`${c.emerald("●")} Started background terminal ${c.bold(job.id)}: ${bgCmd}`);
+          render();
+        }
         return;
       }
       const res = await handleSlashCommand(line, agent, keyStatus, fetchFn, false);
@@ -835,16 +961,71 @@ export async function startFullScreenTui(
     if (cleanedUp) return;
     cleanedUp = true;
     if (spinnerTimer) clearInterval(spinnerTimer);
+    if (resizeTimer) clearTimeout(resizeTimer);
+    agent.backgroundJobs.stopAll();
     stdout.off("resize", onResize);
     stdin.off("keypress", onKeypress);
+    stdin.off("data", onRawMouseData);
     if (stdin.isTTY) stdin.setRawMode(false);
-    // Restore normal screen buffer and cursor
-    stdout.write("\x1b[?25h\x1b[?1049l");
+    // Disable SGR mouse mode, restore auto-wrap, cursor, and normal screen buffer
+    stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?7h\x1b[?25h\x1b[?1049l");
+    // Print the session summary card on the normal terminal screen!
+    stdout.write(
+      "\n" +
+        formatSessionExitBanner({
+          sessionId: agent.session.id,
+          cwd: agent.config.cwd,
+          model: agent.config.model,
+          fastModel: agent.config.fastModel,
+          messageCount: agent.session.messages.length,
+          modifiedFilesCount: agent.checkpoints.listModifiedFiles().length,
+          inputTokens: agent.session.totalInputTokens,
+          cacheReadTokens: agent.session.totalCacheReadTokens,
+          outputTokens: agent.session.totalOutputTokens,
+          costMicro: BigInt(agent.session.totalCostMicro || "0"),
+        }) +
+        "\n\n",
+    );
     exitResolve?.();
   };
 
   const onResize = () => {
-    render();
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      render(true);
+    }, 30);
+  };
+
+  const onRawMouseData = (chunk: Buffer) => {
+    const raw = chunk.toString("utf8");
+    const mouse = parseSgrMouseEvent(raw);
+    if (!mouse) return;
+    if (mouse.type === "wheel_up") {
+      scrollOffset += 4;
+      render();
+      return;
+    }
+    if (mouse.type === "wheel_down") {
+      scrollOffset = Math.max(0, scrollOffset - 4);
+      render();
+      return;
+    }
+    if (mouse.type === "click") {
+      const cols = stdout.columns || 110;
+      const sidebarWidth = showSidebar && cols >= 95 ? Math.min(36, Math.max(28, Math.floor(cols * 0.28))) : 0;
+      const mainWidth = sidebarWidth > 0 ? cols - sidebarWidth - 1 : cols;
+      // Clicking in the right sidebar area opens Subagent Inspector or Jobs Inspector
+      if (sidebarWidth > 0 && mouse.x > mainWidth) {
+        if (agent.subagentRuns.length > 0) {
+          openSubagentInspectorListModal();
+          return;
+        }
+        if (agent.backgroundJobs.listJobs().length > 0) {
+          openJobsListModal();
+          return;
+        }
+      }
+    }
   };
 
   const onKeypress = (
@@ -1055,6 +1236,18 @@ export async function startFullScreenTui(
             saveUserConfig({ team: chosen.value as TeamId }, agent.config.globalConfigPath);
             const t = getAgentTeam(chosen.value);
             notice = `Specialist Team: ${t?.name ?? chosen.value}`;
+          } else if (modalId === "subagent_inspect_list") {
+            openSubagentDetailModal(chosen.value);
+            return;
+          } else if (modalId === "jobs_list") {
+            openJobDetailModal(chosen.value);
+            return;
+          } else if (modalId === "job_detail") {
+            if (chosen.value.startsWith("kill:")) {
+              const jid = chosen.value.slice(5);
+              agent.backgroundJobs.killJob(jid);
+              notice = `Stopped background job ${jid}`;
+            }
           } else if (modalId === "command") {
             render();
             void executePromptOrCommand(chosen.value);
@@ -1072,10 +1265,26 @@ export async function startFullScreenTui(
       return;
     }
 
-    // 2. If agent is busy streaming, Esc or Ctrl+C interrupts the stream
+    // Allow scrolling at ALL times (even while the agent is busy working!)
+    if (key?.name === "pageup" || (key?.shift && key.name === "up") || (key?.meta && key.name === "up")) {
+      scrollOffset += 8;
+      render();
+      return;
+    }
+    if (key?.name === "pagedown" || (key?.shift && key.name === "down") || (key?.meta && key.name === "down")) {
+      scrollOffset = Math.max(0, scrollOffset - 8);
+      render();
+      return;
+    }
+
+    // 2. If agent is busy streaming, Esc or Ctrl+C interrupts the stream, and Ctrl+U/Ctrl+J inspect subagents/jobs
     if (activeAbort) {
       if (key?.name === "escape" || (key?.ctrl && key?.name === "c")) {
         activeAbort.abort();
+      } else if (key?.ctrl && key?.name === "u") {
+        openSubagentInspectorListModal();
+      } else if (key?.ctrl && key?.name === "j") {
+        openJobsListModal();
       }
       return;
     }
@@ -1134,6 +1343,18 @@ export async function startFullScreenTui(
     // Ctrl+P -> Open Command Palette Modal
     if (key?.ctrl && key.name === "p") {
       openCommandPaletteModal();
+      return;
+    }
+
+    // Ctrl+U -> Open Subagent Work Inspector Modal
+    if (key?.ctrl && key.name === "u") {
+      openSubagentInspectorListModal();
+      return;
+    }
+
+    // Ctrl+J -> Open Background Terminal Jobs Modal
+    if (key?.ctrl && key.name === "j") {
+      openJobsListModal();
       return;
     }
 
@@ -1348,15 +1569,20 @@ export async function startFullScreenTui(
     }
   };
 
-  // Enter Alternate Screen Buffer + Hide hardware cursor (we draw our own `▏` cursor inside the composer!)
+  agent.backgroundJobs.setOnUpdate(() => {
+    render();
+  });
+
+  // Enter Alternate Screen Buffer + Enable SGR Mouse Wheel/Click + Disable Auto-Wrap + Hide hardware cursor
   emitKeypressEvents(stdin);
   if (stdin.isTTY) stdin.setRawMode(true);
   stdin.resume();
-  stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+  stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?7l\x1b[?25l\x1b[2J\x1b[H");
 
   stdout.on("resize", onResize);
   stdin.on("keypress", onKeypress);
-  render();
+  stdin.on("data", onRawMouseData);
+  render(true);
 
   return new Promise<void>((resPromise) => {
     exitResolve = resPromise;
@@ -1376,6 +1602,10 @@ export interface FullScreenModalState {
     | "subagent_role"
     | "subagent_model"
     | "subagent_effort"
+    | "subagent_inspect_list"
+    | "subagent_inspect_detail"
+    | "jobs_list"
+    | "job_detail"
     | "strategy_config"
     | "config"
     | "effort"
@@ -1415,6 +1645,8 @@ export interface FullScreenTuiState {
   keyStatus: KeyInspectStatus | null;
   todos: TodoItem[];
   modifiedFiles: string[];
+  subagentRuns?: SubagentRunRecord[];
+  backgroundJobs?: BackgroundJob[];
   transcriptLines: string[];
   scrollOffset: number;
   busyLabel: string | null;
@@ -1565,9 +1797,32 @@ function buildSidebarLines(state: FullScreenTuiState, width: number, height: num
   if (state.modifiedFiles.length === 0) {
     addRow(c.dim("No edits in session"));
   } else {
-    for (const f of state.modifiedFiles.slice(-5)) {
+    for (const f of state.modifiedFiles.slice(-4)) {
       const shortF = f.replace(/\\/g, "/").split("/").slice(-3).join("/");
       addRow(`${c.emerald("•")} ${c.white(shortF)}`);
+    }
+  }
+
+  if (state.subagentRuns && state.subagentRuns.length > 0) {
+    addDivider();
+    addSection(`Subagents (${state.subagentRuns.length}) [Ctrl+U]`);
+    for (const sub of state.subagentRuns.slice(-3)) {
+      const stIcon =
+        sub.status === "completed"
+          ? c.emerald("✓")
+          : sub.status === "running"
+            ? c.amber("▸")
+            : c.rose("✗");
+      addRow(`${stIcon} ${c.cyan(sub.id)} ${sub.name} (${sub.model})`);
+    }
+  }
+
+  if (state.backgroundJobs && state.backgroundJobs.length > 0) {
+    addDivider();
+    addSection(`Terminals (${state.backgroundJobs.length}) [Ctrl+J]`);
+    for (const j of state.backgroundJobs.slice(-2)) {
+      const stIcon = j.status === "running" ? c.emerald("●") : c.slate("○");
+      addRow(`${stIcon} ${c.cyan(j.id)} ${j.detectedUrl ?? j.command.slice(0, 18)}`);
     }
   }
 
@@ -1786,4 +2041,79 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
 
   const allRows = [row0, row1, ...bodyLines, compTop, compMid, compBot, footerBar];
   return allRows.slice(0, rows).join("\n");
+}
+
+/**
+ * Renders the full-screen viewport using DEC Synchronized Output (`\x1b[?2026h`..`\x1b[?2026l`),
+ * Auto-Wrap Disable (`\x1b[?7l`), and explicit per-row cursor positioning (`\x1b[R;1H\x1b[2K`).
+ * This guarantees ZERO terminal line-scroll and ZERO duplicate input boxes on resize/maximize!
+ */
+export function renderFullScreenAnsiBuffer(
+  state: FullScreenTuiState,
+  clearFirst: boolean = false,
+): string {
+  const rawLines = renderFullScreenViewport(state).split("\n");
+  const positioned = rawLines
+    .map((line, idx) => `\x1b[${idx + 1};1H\x1b[2K${line}`)
+    .join("");
+  const clearSeq = clearFirst ? "\x1b[2J" : "";
+  return `\x1b[?2026h\x1b[?7l${clearSeq}${positioned}\x1b[?2026l`;
+}
+
+export interface SgrMouseEvent {
+  type: "wheel_up" | "wheel_down" | "click";
+  x: number;
+  y: number;
+}
+
+/**
+ * Parses SGR mouse escape sequences (`\x1b[<btn;x;yM`).
+ */
+export function parseSgrMouseEvent(raw: string): SgrMouseEvent | null {
+  const m = raw.match(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
+  if (!m) return null;
+  const btn = Number(m[1]);
+  const x = Number(m[2]);
+  const y = Number(m[3]);
+  const release = m[4] === "m";
+  if (btn === 64) return { type: "wheel_up", x, y };
+  if (btn === 65) return { type: "wheel_down", x, y };
+  if (btn === 0 && !release) return { type: "click", x, y };
+  return null;
+}
+
+export interface SessionExitBannerOptions {
+  sessionId: string;
+  cwd: string;
+  model: string;
+  fastModel?: string | null;
+  messageCount: number;
+  modifiedFilesCount: number;
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  costMicro: bigint;
+}
+
+/**
+ * Formats the session summary card shown on the main terminal after exiting AivoCode.
+ */
+export function formatSessionExitBanner(opts: SessionExitBannerOptions): string {
+  const totalIn = opts.inputTokens + opts.cacheReadTokens;
+  const cachePct =
+    totalIn > 0 ? Math.round((opts.cacheReadTokens / totalIn) * 100) : 0;
+
+  return [
+    `${c.cyan("╭─")} ${c.bold("AivoCode Session Summary")} ${c.cyan("─".repeat(48))}`,
+    `${c.cyan("│")} ${c.slate("Session ID     :")} ${c.bold(c.emerald(opts.sessionId))}`,
+    `${c.cyan("│")} ${c.slate("Workspace      :")} ${c.white(opts.cwd)}`,
+    `${c.cyan("│")} ${c.slate("Models Used    :")} Primary ${c.emerald(opts.model)} · Subagent ${c.teal(opts.fastModel ?? opts.model)}`,
+    `${c.cyan("│")} ${c.slate("Activity       :")} ${opts.messageCount} messages · ${opts.modifiedFilesCount} file(s) modified`,
+    `${c.cyan("│")} ${c.slate("Tokens & Cost  :")} in=${opts.inputTokens.toLocaleString("en-US")} · cache=${opts.cacheReadTokens.toLocaleString("en-US")} (${cachePct}% hit) · out=${opts.outputTokens.toLocaleString("en-US")} · total=${c.emerald(formatMicroUsd(opts.costMicro))}`,
+    `${c.cyan("├" + "─".repeat(75))}`,
+    `${c.cyan("│")} ${c.bold("Resume this session anytime:")}`,
+    `${c.cyan("│")}   ${c.amber("aivo -c")}                      ${c.slate("# Resume latest session")}`,
+    `${c.cyan("│")}   ${c.amber(`aivo -s ${opts.sessionId}`)}  ${c.slate("# Resume this specific session")}`,
+    `${c.cyan("╰" + "─".repeat(75))}`,
+  ].join("\n");
 }

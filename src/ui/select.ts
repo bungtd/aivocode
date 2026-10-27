@@ -5,6 +5,8 @@ import { c } from "./theme.js";
 export const SLASH_COMMANDS: Array<{ cmd: string; description: string }> = [
   { cmd: "/model", description: "Interactive Primary Model Picker or switch model (/model <id>)" },
   { cmd: "/subagent", description: "Select model for Subagents & Specialist Roles (/subagent [explore|architect|builder|reviewer] <id>)" },
+  { cmd: "/subagents", description: "Inspect subagent runs, logs & outputs (or press Ctrl+U / click sidebar)" },
+  { cmd: "/jobs", description: "View & manage background terminal jobs (or press Ctrl+J / /bg <cmd> / /kill <id>)" },
   { cmd: "/config", description: "Open Interactive Settings & Configuration Center (/config [key] [value])" },
   { cmd: "/strategy", description: "Choose execution strategy (auto · subagent-driven · native · ask)" },
   { cmd: "/team", description: "Switch specialist Agent Team (fullstack · backend · frontend · android · blender3d · gamedev · autopilot)" },

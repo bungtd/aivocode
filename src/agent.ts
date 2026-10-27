@@ -29,8 +29,19 @@ import {
 import {
   autoAdvanceTodos,
   classifyTaskStrategy,
+  runIterativeReviewFixLoop,
   verifyWorkspaceArtifacts,
 } from "./workflow-review.js";
+import { BackgroundJobManager } from "./background-jobs.js";
+
+export interface SubagentRunRecord {
+  id: string;
+  name: string;
+  description: string;
+  model: string;
+  status: "running" | "completed" | "error";
+  logs: string[];
+}
 
 export interface AgentCallbacks {
   onReasoningDelta?: (delta: string) => void;
@@ -89,6 +100,8 @@ export class AivoAgent {
   readonly sessionStore: SessionStore;
   readonly memory: SelfLearningMemory;
   readonly skills: SkillRegistry;
+  readonly backgroundJobs: BackgroundJobManager;
+  readonly subagentRuns: SubagentRunRecord[];
   session: AivoSession;
   callbacks: AgentCallbacks;
   private fetchFn: typeof fetch;
@@ -105,6 +118,8 @@ export class AivoAgent {
     this.sessionStore = opts.sessionStore ?? new SessionStore();
     this.memory = opts.memory ?? new SelfLearningMemory();
     this.skills = opts.skills ?? new SkillRegistry({ cwd: this.config.cwd });
+    this.backgroundJobs = new BackgroundJobManager();
+    this.subagentRuns = [];
     this.session =
       opts.session ??
       this.sessionStore.createSession({
@@ -241,6 +256,16 @@ export class AivoAgent {
           this.config.subagentEffort ??
           (this.config.reasoningEffort === "off" ? "off" : role.preferredEffort);
 
+        const subRecord: SubagentRunRecord = {
+          id: `sub_${this.subagentRuns.length + 1}`,
+          name: role.name,
+          description: _stage.title,
+          model: stageModel,
+          status: "running",
+          logs: [`Stage: ${_stage.title}`, `Objective: ${_stage.objective}`],
+        };
+        this.subagentRuns.push(subRecord);
+
         const stageAgent = new AivoAgent({
           config: {
             ...this.config,
@@ -257,11 +282,28 @@ export class AivoAgent {
           maxSteps: 12,
           readOnlyOnly: role.readOnly || this.config.mode === "plan",
           allowSubagents: false,
-          callbacks: this.callbacks,
+          callbacks: {
+            ...this.callbacks,
+            onToolCall: (name, args) => {
+              subRecord.logs.push(`▸ ${name}(${JSON.stringify(args).slice(0, 80)})`);
+              this.callbacks.onToolCall?.(name, args);
+            },
+            onTextDelta: (d) => {
+              this.callbacks.onTextDelta?.(d);
+            },
+          },
         });
 
-        const res = await stageAgent.runUserPrompt(stagePrompt, signal);
-        return res.finalText || "(stage finished)";
+        try {
+          const res = await stageAgent.runUserPrompt(stagePrompt, signal);
+          subRecord.status = "completed";
+          subRecord.logs.push("", "--- Final Stage Output ---", res.finalText);
+          return res.finalText || "(stage finished)";
+        } catch (err) {
+          subRecord.status = "error";
+          subRecord.logs.push(`Error: ${err instanceof Error ? err.message : String(err)}`);
+          throw err;
+        }
       },
     });
 
@@ -350,12 +392,12 @@ export class AivoAgent {
       todos: this.todos,
       memory: this.memory,
       skills: this.skills,
+      backgroundJobs: this.backgroundJobs,
       readOnlyOnly: this.readOnlyOnly,
       confirmAction: this.callbacks.confirmAction,
       fetchFn: this.fetchFn,
       onSubagent: this.allowSubagents
         ? async ({ agent, description, prompt }) => {
-            this.callbacks.onNotice?.(`Spawning ${agent} subagent: ${description}`);
             const subModel =
               agent === "explore"
                 ? (this.config.fastModel || this.config.model)
@@ -367,6 +409,19 @@ export class AivoAgent {
                   ? "off"
                   : "low"
                 : this.config.reasoningEffort);
+
+            const subRecord: SubagentRunRecord = {
+              id: `sub_${this.subagentRuns.length + 1}`,
+              name: agent,
+              description,
+              model: subModel,
+              status: "running",
+              logs: [`Task: ${description}`, `Model: ${subModel} (effort: ${subEffort})`, ""],
+            };
+            this.subagentRuns.push(subRecord);
+            this.callbacks.onNotice?.(
+              `Spawning ${agent} subagent [${subRecord.id} · ${subModel}]: ${description}`,
+            );
 
             const subAgent = new AivoAgent({
               config: {
@@ -383,9 +438,27 @@ export class AivoAgent {
               maxSteps: 10,
               readOnlyOnly: agent === "explore" || this.config.mode === "plan",
               allowSubagents: false,
+              callbacks: {
+                onToolCall: (tName, tArgs) => {
+                  subRecord.logs.push(`▸ ${tName}(${JSON.stringify(tArgs).slice(0, 80)})`);
+                },
+                onToolResult: (tName, tOut, isErr) => {
+                  subRecord.logs.push(
+                    `  ${isErr ? "✗" : "✓"} ${tName}: ${tOut.split(/\r?\n/)[0]?.slice(0, 100) ?? ""}`,
+                  );
+                },
+              },
             });
-            const subRes = await subAgent.runUserPrompt(prompt, signal);
-            return subRes.finalText || "(subagent completed with no output)";
+            try {
+              const subRes = await subAgent.runUserPrompt(prompt, signal);
+              subRecord.status = "completed";
+              subRecord.logs.push("", "--- Subagent Report ---", subRes.finalText);
+              return subRes.finalText || "(subagent completed with no output)";
+            } catch (err) {
+              subRecord.status = "error";
+              subRecord.logs.push(`Error: ${err instanceof Error ? err.message : String(err)}`);
+              throw err;
+            }
           }
         : undefined,
       onTeamWorkflow: this.allowSubagents
@@ -495,7 +568,7 @@ export class AivoAgent {
       });
 
       if (stepRes.toolCalls.length === 0) {
-        // Automated Review & Fix Gate when files were modified in this turn
+        // Separated Iterative Review -> Fix -> Re-Review -> Re-Fix Loop when files were modified
         const touched = this.checkpoints.listModifiedFiles();
         if (
           touched.length > 0 &&
@@ -503,22 +576,49 @@ export class AivoAgent {
           !this.readOnlyOnly &&
           this.config.autoReviewFix !== false
         ) {
-          reviewFixPassDone = true;
-          const verification = verifyWorkspaceArtifacts(this.config.cwd, touched);
-          if (!verification.clean) {
-            this.callbacks.onNotice?.(
-              `Automated Review & Fix Gate detected ${verification.findings.length} issue(s) — running fix pass...`,
-            );
-            this.session.messages.push({
-              role: "user",
-              content: [
-                "[Automated Review & Fix Gate]",
-                "The following issues were found in your modified files. Fix them now before completing:",
-                ...verification.findings.map((f) => `- ${f}`),
-              ].join("\n"),
+          const staticCheck = verifyWorkspaceArtifacts(this.config.cwd, touched);
+          if (!staticCheck.clean) {
+            await runIterativeReviewFixLoop({
+              cwd: this.config.cwd,
+              modifiedFiles: touched,
+              maxRounds: 3,
+              onEvent: (msg) => this.callbacks.onNotice?.(msg),
+              runReviewerAgent: async (_round, staticFindings) => {
+                if (staticFindings.length > 0) {
+                  return `VERDICT: NEEDS_FIX\n${staticFindings.map((f, idx) => `${idx + 1}. ${f}`).join("\n")}`;
+                }
+                return "VERDICT: PASS";
+              },
+              runFixerAgent: async (round, issuesToFix) => {
+                const fixerAgent = new AivoAgent({
+                  config: {
+                    ...this.config,
+                    model: this.config.builderModel || this.config.model,
+                  },
+                  catalog: this.catalog,
+                  sessionStore: this.sessionStore,
+                  memory: this.memory,
+                  skills: this.skills,
+                  fetchFn: this.fetchFn,
+                  sleepFn: this.sleepFn,
+                  maxSteps: 8,
+                  readOnlyOnly: false,
+                  allowSubagents: false,
+                  callbacks: this.callbacks,
+                });
+                const fixRes = await fixerAgent.runUserPrompt(
+                  [
+                    `[Dedicated Fix Round ${round}]`,
+                    "Fix ONLY the following verified review issues in the workspace files:",
+                    ...issuesToFix.map((iss, idx) => `${idx + 1}. ${iss}`),
+                  ].join("\n"),
+                  signal,
+                );
+                return fixRes.finalText;
+              },
             });
-            continue;
           }
+          reviewFixPassDone = true;
         }
 
         // Mark all todos completed when turn finishes cleanly
@@ -570,7 +670,9 @@ export class AivoAgent {
             content: execRes.output,
             isError: execRes.isError,
           });
-          if (execRes.imageAttachment) {
+          if (execRes.imageAttachments && execRes.imageAttachments.length > 0) {
+            pendingImages.push(...execRes.imageAttachments);
+          } else if (execRes.imageAttachment) {
             pendingImages.push(execRes.imageAttachment);
           }
         }
@@ -591,7 +693,9 @@ export class AivoAgent {
             content: execRes.output,
             isError: execRes.isError,
           });
-          if (execRes.imageAttachment) {
+          if (execRes.imageAttachments && execRes.imageAttachments.length > 0) {
+            pendingImages.push(...execRes.imageAttachments);
+          } else if (execRes.imageAttachment) {
             pendingImages.push(execRes.imageAttachment);
           }
         }

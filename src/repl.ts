@@ -25,6 +25,7 @@ import { relative } from "node:path";
 import {
   DEFAULT_AIVOKEY_CATALOG,
   fetchModels,
+  filterEligibleModelsForAccount,
   formatKeyStatusSummary,
   formatMicroUsd,
   inspectKey,
@@ -704,23 +705,137 @@ export async function handleSlashCommand(
     case "/login": {
       if (!arg) {
         return {
-          output: `Usage: ${c.cyan("/login sk-aivo_YOUR_KEY")} — saves and verifies your AivoKey API key immediately.`,
+          output: `Usage: ${c.cyan("/login sk-aivo_YOUR_KEY")} — verifies your key, detects models available on your plan/account, and configures default models.`,
         };
       }
       const cleanKey = arg.trim();
       agent.config.apiKey = cleanKey;
-      saveUserConfig({ apiKey: cleanKey }, agent.config.globalConfigPath);
       try {
-        const verified = await inspectKey(agent.config.baseUrl, cleanKey, fetchFn);
+        const [models, verified] = await Promise.all([
+          fetchModels(agent.config.baseUrl, fetchFn).catch(() => agent.catalog),
+          inspectKey(agent.config.baseUrl, cleanKey, fetchFn),
+        ]);
+        if (models.length > 0) agent.catalog = models;
+        const eligible = filterEligibleModelsForAccount(
+          agent.catalog.length > 0 ? agent.catalog : DEFAULT_AIVOKEY_CATALOG,
+          verified,
+          { toolsOnly: true },
+        );
+        const defaultModelId = eligible.some((m) => m.id === "deepseek-v4.1-flash")
+          ? "deepseek-v4.1-flash"
+          : (eligible[0]?.id ?? "deepseek-v4.1-flash");
+
+        agent.config.model = defaultModelId;
+        agent.config.fastModel = defaultModelId;
+        saveUserConfig(
+          {
+            apiKey: cleanKey,
+            model: agent.config.model,
+            fastModel: agent.config.fastModel,
+            setupCompleted: true,
+          },
+          agent.config.globalConfigPath,
+        );
         return {
-          output: `${c.emerald("✓")} API key saved (${maskApiKey(cleanKey)}) & verified: ${formatKeyStatusSummary(verified)}`,
+          output: [
+            `${c.emerald("✓")} API key verified: ${formatKeyStatusSummary(verified)}`,
+            `${c.emerald("✓")} Eligible models for your account: ${c.bold(String(eligible.length))} models (${verified.mode === "plan" && !verified.fallbackEnabled ? "filtered to active plan & free tokens" : "all active catalog models"})`,
+            `${c.emerald("✓")} Primary & Subagent default model set to: ${c.bold(c.emerald(defaultModelId))} (use /model, /subagent, or Ctrl+O to customize)`,
+          ].join("\n"),
           updatedKeyStatus: verified,
         };
       } catch (err) {
+        saveUserConfig({ apiKey: cleanKey }, agent.config.globalConfigPath);
         return {
           output: `${c.amber("⚠")} Saved key (${maskApiKey(cleanKey)}), but verification failed: ${err instanceof Error ? err.message : String(err)}`,
         };
       }
+    }
+
+    case "/subagents":
+    case "/inspect": {
+      const runs = agent.subagentRuns;
+      if (runs.length === 0) {
+        return { output: c.slate("No subagent runs recorded in this session yet.") };
+      }
+      if (arg) {
+        const target = runs.find((r) => r.id === arg.trim());
+        if (!target) {
+          return { output: c.amber(`Subagent '${arg}' not found. Available: ${runs.map((r) => r.id).join(", ")}`) };
+        }
+        return {
+          output: [
+            `${c.cyan("╭─")} ${c.bold(`Subagent ${target.id}: ${target.name} (${target.model} · ${target.status})`)}`,
+            ...target.logs.map((l) => `${c.cyan("│")} ${l}`),
+            `${c.cyan("╰" + "─".repeat(72))}`,
+          ].join("\n"),
+        };
+      }
+      return {
+        output: [
+          `${c.cyan("◆")} ${c.bold(`Session Subagents (${runs.length}) — run '/inspect <id>' to view full work:`)}`,
+          ...runs.map(
+            (r) =>
+              `  • ${c.bold(c.cyan(r.id.padEnd(8)))} [${r.status}] ${c.white(r.name)} (${c.emerald(r.model)}) — ${c.slate(r.description)}`,
+          ),
+        ].join("\n"),
+      };
+    }
+
+    case "/jobs":
+    case "/ps": {
+      const jobs = agent.backgroundJobs.listJobs();
+      if (jobs.length === 0) {
+        return { output: c.slate("No background terminal jobs. Start one with '/bg <command>' or run_shell(background:true).") };
+      }
+      return {
+        output: [
+          `${c.cyan("◆")} ${c.bold(`Background Terminal Jobs (${jobs.length}):`)}`,
+          ...jobs.map(
+            (j) =>
+              `  • ${c.bold(c.cyan(j.id.padEnd(7)))} [PID ${j.pid ?? "-"} · ${j.status}] ${c.white(j.command)}${j.detectedUrl ? ` → ${c.emerald(j.detectedUrl)}` : ""}`,
+          ),
+        ].join("\n"),
+      };
+    }
+
+    case "/bg": {
+      if (!arg) {
+        return { output: `Usage: ${c.cyan("/bg <command>")} — starts a background terminal job.` };
+      }
+      const job = agent.backgroundJobs.startJob({ command: arg, cwd: agent.config.cwd });
+      return {
+        output: `${c.emerald("✓")} Started background terminal ${c.bold(c.cyan(job.id))} (PID ${job.pid ?? "-"}): ${arg}`,
+      };
+    }
+
+    case "/logs": {
+      if (!arg) {
+        return { output: `Usage: ${c.cyan("/logs <job_id>")} — displays captured stdout/stderr for a background job.` };
+      }
+      const job = agent.backgroundJobs.getJob(arg.trim());
+      if (!job) {
+        return { output: c.amber(`Background job '${arg}' not found.`) };
+      }
+      return {
+        output: [
+          `${c.cyan("╭─")} ${c.bold(`Logs for ${job.id} (${job.status}) — ${job.command}`)}`,
+          ...(job.logs.length > 0 ? job.logs.slice(-40).map((l) => `${c.cyan("│")} ${l}`) : [`${c.cyan("│")} (no output yet)`]),
+          `${c.cyan("╰" + "─".repeat(72))}`,
+        ].join("\n"),
+      };
+    }
+
+    case "/kill": {
+      if (!arg) {
+        return { output: `Usage: ${c.cyan("/kill <job_id>")} — terminates a background terminal job.` };
+      }
+      const ok = agent.backgroundJobs.killJob(arg.trim());
+      return {
+        output: ok
+          ? `${c.emerald("✓")} Stopped background job ${c.bold(arg.trim())}.`
+          : c.amber(`Background job '${arg}' not found.`),
+      };
     }
 
     case "/status":

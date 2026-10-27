@@ -153,6 +153,23 @@ export function parseModelRow(raw: Record<string, unknown>): AivoModelInfo {
 
 export const DEFAULT_AIVOKEY_CATALOG: AivoModelInfo[] = [
   {
+    id: "deepseek-v4.1-flash",
+    name: "DeepSeek V4.1 Flash",
+    contextWindow: 1_000_000,
+    maxOutputTokens: 65_536,
+    supportsTools: true,
+    supportsVision: true,
+    supportsReasoning: true,
+    supportsPromptCache: true,
+    supportsJsonMode: true,
+    supportedEfforts: ["minimal", "low", "medium", "high", "xhigh", "max"],
+    inputMicroPer1M: 300_000n,
+    outputMicroPer1M: 1_200_000n,
+    cacheReadMicroPer1M: 30_000n,
+    cacheWriteMicroPer1M: null,
+    category: "flagship",
+  },
+  {
     id: "deepseek-v4-flash",
     name: "DeepSeek V4 Flash",
     contextWindow: 1_000_000,
@@ -534,6 +551,27 @@ export interface RecommendedCodingModels {
   primaryModel: string;
   fastModel: string;
   eligibleModels: AivoModelInfo[];
+}
+
+/**
+ * Filters `/v1/models` to the models actually usable by the authenticated user's account:
+ * - For `payg` accounts (or `plan` accounts with `fallbackEnabled: true` and positive balance),
+ *   all active catalog models are available.
+ * - For `plan` accounts without balance fallback, ONLY models included in the user's plan
+ *   (or models where the user holds free faucet tokens / purchased token packs) are returned.
+ */
+export function filterEligibleModelsForAccount(
+  catalog: AivoModelInfo[],
+  keyStatus: KeyInspectStatus | null,
+  opts: { toolsOnly?: boolean } = {},
+): AivoModelInfo[] {
+  const base = opts.toolsOnly ? catalog.filter((m) => m.supportsTools) : catalog;
+  if (!keyStatus) return base;
+  if (keyStatus.mode === "payg") return base;
+  if (keyStatus.fallbackEnabled && keyStatus.balanceMicro > 0n) return base;
+
+  const eligible = base.filter((m) => isModelUsableByKey(m.id, keyStatus));
+  return eligible.length > 0 ? eligible : base;
 }
 
 /**

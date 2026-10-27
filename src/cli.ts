@@ -1,6 +1,8 @@
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import {
+  DEFAULT_FAST_MODEL,
+  DEFAULT_MODEL,
   maskApiKey,
   normalizeGatewayOrigin,
   normalizeModelId,
@@ -12,13 +14,17 @@ import {
   type UserConfigFile,
 } from "./config.js";
 import {
+  DEFAULT_AIVOKEY_CATALOG,
   fetchModels,
+  filterEligibleModelsForAccount,
+  formatKeyStatusSummary,
   formatMicroUsd,
   inspectKey,
   recommendCodingModels,
   type AivoModelInfo,
   type KeyInspectStatus,
 } from "./aivokey-client.js";
+import { interactiveSelect } from "./ui/select.js";
 import { AivoAgent } from "./agent.js";
 import { formatDetailedStatus, formatModelsTable, startInteractiveRepl } from "./repl.js";
 import { startFullScreenTui } from "./ui/fullscreen.js";
@@ -345,16 +351,117 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       writeOut("Usage: aivo login <sk-aivo_...> [--base-url https://api.aivokey.dev]");
       return 1;
     }
+
+    let loginCatalog: AivoModelInfo[] = DEFAULT_AIVOKEY_CATALOG;
+    let loginKeyStatus = null as KeyInspectStatus | null;
+    await Promise.all([
+      fetchModels(config.baseUrl, fetchFn)
+        .then((m) => {
+          if (m.length > 0) loginCatalog = m;
+        })
+        .catch(() => {}),
+      inspectKey(config.baseUrl, keyToSave, fetchFn)
+        .then((k) => {
+          loginKeyStatus = k;
+        })
+        .catch(() => {}),
+    ]);
+
+    const eligible = filterEligibleModelsForAccount(loginCatalog, loginKeyStatus, {
+      toolsOnly: true,
+    });
+    const fallbackDefault = eligible.some((m) => m.id === DEFAULT_MODEL)
+      ? DEFAULT_MODEL
+      : (eligible[0]?.id ?? DEFAULT_MODEL);
+
+    let chosenPrimary = parsed.cliConfig.model ?? fallbackDefault;
+    let chosenFast = parsed.cliConfig.fastModel ?? DEFAULT_FAST_MODEL;
+    if (!eligible.some((m) => m.id === chosenFast)) {
+      chosenFast = chosenPrimary;
+    }
+    let chosenEffort: ReasoningEffort = parsed.cliConfig.reasoningEffort ?? "off";
+    let chosenSubEffort: ReasoningEffort = "low";
+
+    if (stdin.isTTY && stdout.isTTY && !opts.writeOut) {
+      writeOut(
+        `\n${c.emerald("✓")} Verified AivoKey Account: ${loginKeyStatus ? formatKeyStatusSummary(loginKeyStatus) : "Connected"}`,
+      );
+      writeOut(
+        `  ${c.cyan("◆")} Detected ${c.bold(String(eligible.length))} eligible models for your account (${loginKeyStatus?.mode === "plan" && !loginKeyStatus.fallbackEnabled ? "Plan-filtered" : "All active models"}).\n`,
+      );
+
+      const pickedPrimary = await interactiveSelect({
+        title: "Step 1/4: Select Default Primary Agent Model (Enter for deepseek-v4.1-flash)",
+        initialValue: fallbackDefault,
+        items: eligible.map((m) => ({
+          value: m.id,
+          label: m.id,
+          badge: m.id === DEFAULT_MODEL ? "[Default]" : undefined,
+          detail: `${Math.round(m.contextWindow / 1000)}K ctx`,
+        })),
+      });
+      if (pickedPrimary) chosenPrimary = pickedPrimary;
+
+      const pickedEffort = await interactiveSelect<ReasoningEffort>({
+        title: "Step 2/4: Select Primary Reasoning Effort",
+        initialValue: "off",
+        items: [
+          { value: "off", label: "off", detail: "Fastest direct streaming" },
+          { value: "low", label: "low", detail: "Light thinking" },
+          { value: "medium", label: "medium", detail: "Balanced reasoning" },
+          { value: "high", label: "high", detail: "Deep architectural reasoning" },
+          { value: "xhigh", label: "xhigh", detail: "Extended reasoning" },
+          { value: "max", label: "max", detail: "Maximum thinking budget" },
+        ],
+      });
+      if (pickedEffort) chosenEffort = pickedEffort;
+
+      const pickedFast = await interactiveSelect({
+        title: "Step 3/4: Select Default Subagent / Fast Model (Enter for deepseek-v4.1-flash)",
+        initialValue: eligible.some((m) => m.id === DEFAULT_FAST_MODEL)
+          ? DEFAULT_FAST_MODEL
+          : chosenPrimary,
+        items: eligible.map((m) => ({
+          value: m.id,
+          label: m.id,
+          badge: m.id === DEFAULT_FAST_MODEL ? "[Default]" : undefined,
+          detail: `${Math.round(m.contextWindow / 1000)}K ctx`,
+        })),
+      });
+      if (pickedFast) chosenFast = pickedFast;
+
+      const pickedSubEffort = await interactiveSelect<ReasoningEffort>({
+        title: "Step 4/4: Select Subagent Reasoning Effort",
+        initialValue: "low",
+        items: [
+          { value: "off", label: "off", detail: "No thinking delay on subagents" },
+          { value: "low", label: "low", detail: "Light reasoning (Recommended)" },
+          { value: "medium", label: "medium", detail: "Balanced reasoning" },
+          { value: "high", label: "high", detail: "Deep reasoning" },
+          { value: "max", label: "max", detail: "Maximum thinking budget" },
+        ],
+      });
+      if (pickedSubEffort) chosenSubEffort = pickedSubEffort;
+    }
+
     saveUserConfig(
       {
         apiKey: keyToSave,
         baseUrl: config.baseUrl,
-        model: config.model,
+        model: chosenPrimary,
+        fastModel: chosenFast,
+        reasoningEffort: chosenEffort,
+        subagentEffort: chosenSubEffort,
+        setupCompleted: true,
       },
       config.globalConfigPath,
     );
     writeOut(
-      `${c.emerald("✓")} Saved AivoKey configuration to ${config.globalConfigPath} (key: ${maskApiKey(keyToSave)}, gateway: ${config.baseUrl})`,
+      `${c.emerald("✓")} Saved AivoKey configuration to ${config.globalConfigPath}\n` +
+        `  • Key            : ${maskApiKey(keyToSave)}\n` +
+        `  • Gateway        : ${config.baseUrl}\n` +
+        `  • Primary Model  : ${c.bold(c.emerald(chosenPrimary))} (effort: ${chosenEffort})\n` +
+        `  • Subagent Model : ${c.bold(c.teal(chosenFast))} (effort: ${chosenSubEffort})`,
     );
     return 0;
   }
@@ -390,9 +497,8 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
 
   bootSpinner.stop();
 
-  if (catalog.length > 0 && !config.fastModel) {
-    const rec = recommendCodingModels(catalog, keyStatus, config.model);
-    config.fastModel = rec.fastModel;
+  if (!config.fastModel) {
+    config.fastModel = DEFAULT_FAST_MODEL;
   }
 
   if (parsed.command === "models") {

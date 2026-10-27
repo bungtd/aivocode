@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import type { TeamId } from "./teams.js";
 
 export const DEFAULT_GATEWAY_ORIGIN = "https://api.aivokey.dev";
-export const DEFAULT_MODEL = "deepseek-v4-flash";
+export const DEFAULT_MODEL = "deepseek-v4.1-flash";
+export const DEFAULT_FAST_MODEL = "deepseek-v4.1-flash";
 
 export type AivoWire = "chat" | "messages" | "responses";
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "off";
@@ -53,6 +54,7 @@ export interface UserConfigFile {
   team?: TeamId;
   strategy?: ExecutionStrategy;
   autoReviewFix?: boolean;
+  setupCompleted?: boolean;
   webSearch?: boolean;
 }
 
@@ -71,6 +73,7 @@ export interface AivoConfig {
   team?: TeamId;
   strategy?: ExecutionStrategy;
   autoReviewFix?: boolean;
+  setupCompleted?: boolean;
   webSearch: boolean;
   cwd: string;
   globalConfigPath: string;
@@ -234,6 +237,9 @@ export function loadUserConfig(path: string = defaultGlobalConfigPath()): UserCo
     }
     if (typeof raw.autoReviewFix === "boolean") {
       cfg.autoReviewFix = raw.autoReviewFix;
+    }
+    if (typeof raw.setupCompleted === "boolean") {
+      cfg.setupCompleted = raw.setupCompleted;
     }
     if (typeof raw.webSearch === "boolean") {
       cfg.webSearch = raw.webSearch;
@@ -411,6 +417,7 @@ export function resolveConfig(opts: ResolveConfigOptions = {}): AivoConfig {
     ...(rawTeam && VALID_TEAMS.has(rawTeam) ? { team: rawTeam } : {}),
     strategy: VALID_STRATEGIES.has(rawStrategy) ? rawStrategy : "auto",
     autoReviewFix,
+    setupCompleted: globalCfg.setupCompleted ?? workspaceCfg.setupCompleted ?? false,
     webSearch,
     cwd,
     globalConfigPath,

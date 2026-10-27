@@ -8,13 +8,25 @@ import { loadImageAttachment, type ImageAttachment } from "./vision.js";
 
 export type ComputerUseAction =
   | "screenshot"
+  | "serve_preview"
+  | "inspect_viewports"
   | "window_list"
   | "open_url"
-  | "serve_preview"
   | "mouse_move"
   | "mouse_click"
   | "keyboard_type"
   | "key_press";
+
+export type ViewportPresetName = "desktop" | "tablet" | "mobile";
+
+export const VIEWPORT_PRESETS: Record<
+  ViewportPresetName,
+  { width: number; height: number; label: string }
+> = {
+  desktop: { width: 1440, height: 900, label: "Desktop (1440×900)" },
+  tablet: { width: 768, height: 1024, label: "Tablet (768×1024)" },
+  mobile: { width: 390, height: 844, label: "Mobile (390×844)" },
+};
 
 export interface ComputerUseInput {
   action: ComputerUseAction;
@@ -25,12 +37,14 @@ export interface ComputerUseInput {
   key?: string;
   url?: string;
   cwd?: string;
+  viewports?: ViewportPresetName[];
 }
 
 export interface ComputerUseResult {
   output: string;
   isError?: boolean;
   screenshotAttachment?: ImageAttachment;
+  screenshotAttachments?: ImageAttachment[];
 }
 
 export interface ComputerUseDeps {
@@ -224,6 +238,28 @@ const WIN32_DPI_PREAMBLE = [
   `if ($dpiType) { [void]$dpiType::SetProcessDPIAware() };`,
 ].join(" ");
 
+export function findHeadlessBrowserBinary(): string | null {
+  const candidates =
+    process.platform === "win32"
+      ? [
+          "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+          "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+          "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+          "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        ]
+      : process.platform === "darwin"
+        ? [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+          ]
+        : ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
+
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
 export async function executeComputerUse(
   input: ComputerUseInput,
   deps: ComputerUseDeps = {},
@@ -289,11 +325,60 @@ export async function executeComputerUse(
         }
       }
 
-      case "serve_preview": {
+      case "serve_preview":
+      case "inspect_viewports": {
         const previewUrl = await ensureLocalPreviewServer(cwd);
-        const targetUrl = input.url
-          ? new URL(input.url.replace(/^\/+/, ""), previewUrl).href
-          : previewUrl;
+        const targetUrl =
+          input.url && /^https?:\/\//i.test(input.url)
+            ? input.url
+            : input.url
+              ? new URL(input.url.replace(/^\/+/, ""), previewUrl).href
+              : previewUrl;
+
+        const browserBin = findHeadlessBrowserBinary();
+        const requestedViewports: ViewportPresetName[] =
+          Array.isArray(input.viewports) && input.viewports.length > 0
+            ? input.viewports
+            : ["desktop", "tablet", "mobile"];
+
+        if (browserBin) {
+          const dir = join(tmpdir(), "aivokey-cli-screenshots");
+          mkdirSync(dir, { recursive: true });
+          const captured: ImageAttachment[] = [];
+          const summaryParts: string[] = [];
+
+          for (const vpName of requestedViewports) {
+            const preset = VIEWPORT_PRESETS[vpName] ?? VIEWPORT_PRESETS.desktop;
+            const outPath = join(dir, `viewport-${vpName}-${Date.now()}.png`);
+            const cmd =
+              platform === "win32"
+                ? `& '${browserBin.replace(/'/g, "''")}' --headless=new --disable-gpu --hide-scrollbars --window-size=${preset.width},${preset.height} --screenshot='${outPath.replace(/'/g, "''")}' '${targetUrl.replace(/'/g, "''")}'`
+                : `"${browserBin}" --headless=new --disable-gpu --hide-scrollbars --window-size=${preset.width},${preset.height} --screenshot="${outPath}" "${targetUrl}"`;
+            try {
+              await runCmd(cmd, platform === "win32" ? "powershell.exe" : "/bin/sh");
+              if (existsSync(outPath)) {
+                const att = loadImageAttachment(outPath);
+                captured.push(att);
+                summaryParts.push(`${preset.label} -> ${outPath}`);
+              }
+            } catch {
+              /* fallback if one viewport fails */
+            }
+          }
+
+          if (captured.length > 0) {
+            return {
+              output: [
+                `Rendered multi-viewport preview of ${targetUrl} across ${captured.length} viewports (isolated headless browser, no desktop clutter):`,
+                ...summaryParts.map((s) => `  - ${s}`),
+              ].join("\n"),
+              screenshotAttachment: captured[0],
+              screenshotAttachments: captured,
+            };
+          }
+        }
+
+        // Fallback if no headless Chromium/Edge binary was found
         if (platform === "win32") {
           await runCmd(
             `Start-Process '${targetUrl.replace(/'/g, "''")}'; Start-Sleep -Milliseconds 1500`,
@@ -308,6 +393,7 @@ export async function executeComputerUse(
         return {
           output: `Started local preview server at ${targetUrl}, opened in browser, and captured screenshot.`,
           screenshotAttachment: shot.screenshotAttachment,
+          screenshotAttachments: shot.screenshotAttachment ? [shot.screenshotAttachment] : undefined,
         };
       }
 

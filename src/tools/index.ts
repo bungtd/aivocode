@@ -15,7 +15,8 @@ import type { ToolSpec } from "../protocol.js";
 import type { CheckpointManager } from "../checkpoint.js";
 import { ClientWebSearchRouter, clientWebFetch } from "../web.js";
 import { isImageFilePath, loadImageAttachment, type ImageAttachment } from "../vision.js";
-import { executeComputerUse, type ComputerUseAction } from "../computer-use.js";
+import { executeComputerUse, type ComputerUseAction, type ViewportPresetName } from "../computer-use.js";
+import { BackgroundJobManager } from "../background-jobs.js";
 import { SelfLearningMemory, type MemoryCategory } from "../memory.js";
 import { SkillRegistry } from "../skills.js";
 import { auditCodeForSlop } from "../anti-slop.js";
@@ -40,6 +41,7 @@ export interface ToolExecutionResult {
   durationMs?: number;
   diff?: ToolExecutionDiff;
   imageAttachment?: ImageAttachment;
+  imageAttachments?: ImageAttachment[];
 }
 
 export interface ToolsetOptions {
@@ -49,6 +51,7 @@ export interface ToolsetOptions {
   todos: TodoItem[];
   memory?: SelfLearningMemory;
   skills?: SkillRegistry;
+  backgroundJobs?: BackgroundJobManager;
   webSearchRouter?: ClientWebSearchRouter;
   readOnlyOnly?: boolean;
   confirmAction?: (description: string) => Promise<boolean>;
@@ -414,15 +417,16 @@ export function createToolset(opts: ToolsetOptions) {
       {
         name: "computer_use",
         description:
-          "Interact with the desktop environment: 'serve_preview' (starts local HTTP server for workspace, opens browser & captures full-DPI screenshot), 'screenshot', 'window_list', 'open_url', 'mouse_move', 'mouse_click', 'keyboard_type', or 'key_press'.",
+          "Inspect and interact with UI: 'inspect_viewports' / 'serve_preview' (renders web app in isolated headless Desktop 1440×900, Tablet 768×1024, and Mobile 390×844 viewports without desktop clutter), 'screenshot', 'window_list', 'open_url', 'mouse_move', 'mouse_click', 'keyboard_type', or 'key_press'.",
         parameters: {
           type: "object",
           properties: {
             action: {
               type: "string",
               enum: [
-                "screenshot",
+                "inspect_viewports",
                 "serve_preview",
+                "screenshot",
                 "window_list",
                 "open_url",
                 "mouse_move",
@@ -430,6 +434,11 @@ export function createToolset(opts: ToolsetOptions) {
                 "keyboard_type",
                 "key_press",
               ],
+            },
+            viewports: {
+              type: "array",
+              items: { type: "string", enum: ["desktop", "tablet", "mobile"] },
+              description: "Viewports to capture (default: ['desktop', 'tablet', 'mobile'])",
             },
             x: { type: "number" },
             y: { type: "number" },
@@ -922,6 +931,14 @@ export function createToolset(opts: ToolsetOptions) {
             : opts.cwd;
 
           if (args.background === true) {
+            if (opts.backgroundJobs) {
+              const job = opts.backgroundJobs.startJob({ command, cwd: workdir });
+              return {
+                output: `Started background job ${job.id} (PID: ${job.pid ?? "running"}): ${command}\nUse /jobs or /logs ${job.id} to view output.`,
+                summary: `${job.id} (PID ${job.pid ?? "ok"})`,
+                durationMs: Date.now() - startedAt,
+              };
+            }
             const shellBin = process.platform === "win32" ? "powershell.exe" : "/bin/sh";
             const shellArgs =
               process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-c", command];
@@ -1126,14 +1143,25 @@ export function createToolset(opts: ToolsetOptions) {
         case "computer_use": {
           const startedAt = Date.now();
           const action = String(args.action ?? "window_list") as ComputerUseAction;
-          if (action !== "window_list" && action !== "screenshot" && action !== "serve_preview") {
+          if (
+            action !== "window_list" &&
+            action !== "screenshot" &&
+            action !== "serve_preview" &&
+            action !== "inspect_viewports"
+          ) {
             const guard = await checkMutationAllowed(`computer_use(${action})`);
             if (guard) return guard;
           }
+          const viewports = Array.isArray(args.viewports)
+            ? (args.viewports.filter((v) =>
+                ["desktop", "tablet", "mobile"].includes(String(v)),
+              ) as ViewportPresetName[])
+            : undefined;
           const res = await executeComputerUse(
             {
               action,
               cwd: opts.cwd,
+              viewports,
               x: typeof args.x === "number" ? args.x : undefined,
               y: typeof args.y === "number" ? args.y : undefined,
               button:
@@ -1150,6 +1178,7 @@ export function createToolset(opts: ToolsetOptions) {
             summary: action,
             durationMs: Date.now() - startedAt,
             imageAttachment: res.screenshotAttachment,
+            imageAttachments: res.screenshotAttachments,
           };
         }
 
