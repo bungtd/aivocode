@@ -57,6 +57,8 @@ export async function startFullScreenTui(
   let showSidebar = true;
   let selection: PaneSelectionRange | null = null;
   let isDraggingSelection = false;
+  let inputSelection: InputSelectionRange | null = null;
+  let isDraggingInputSelection = false;
 
   const transcriptLines: string[] = [
     `${c.cyan("◆")} ${c.bold("Welcome to AivoCode Full-Screen Studio")} ${c.slate("(Native AivoKey Harness)")}`,
@@ -152,6 +154,7 @@ export async function startFullScreenTui(
       modal,
       notice,
       selection,
+      inputSelection,
     };
   };
 
@@ -971,6 +974,73 @@ export async function startFullScreenTui(
   const keyboardStream = new PassThrough();
   emitKeypressEvents(keyboardStream);
 
+  const getComposerLineLayout = (cols: number, rows: number) => {
+    const rawLines = buffer.length > 0 ? buffer.split("\n") : [""];
+    const lineMeta: Array<{
+      lineIdx: number;
+      text: string;
+      startOffset: number;
+      endOffset: number;
+    }> = [];
+    let offset = 0;
+    for (let i = 0; i < rawLines.length; i++) {
+      const txt = rawLines[i]!;
+      lineMeta.push({
+        lineIdx: i,
+        text: txt,
+        startOffset: offset,
+        endOffset: offset + txt.length,
+      });
+      offset += txt.length + 1; // +1 for "\n"
+    }
+
+    let activeLineIdx = 0;
+    for (let i = 0; i < lineMeta.length; i++) {
+      if (cursorPos >= lineMeta[i]!.startOffset && cursorPos <= lineMeta[i]!.endOffset) {
+        activeLineIdx = i;
+        break;
+      }
+    }
+
+    const maxVisibleInputRows = Math.min(6, Math.max(1, rawLines.length));
+    let startLine = Math.max(0, activeLineIdx - Math.floor(maxVisibleInputRows / 2));
+    const endLine = Math.min(lineMeta.length, startLine + maxVisibleInputRows);
+    if (endLine - startLine < maxVisibleInputRows) {
+      startLine = Math.max(0, endLine - maxVisibleInputRows);
+    }
+    const visibleLines = lineMeta.slice(startLine, endLine);
+    const composerTotalRows = 3 + visibleLines.length;
+    const bodyH = Math.max(4, rows - 2 - composerTotalRows);
+    // 1-based terminal rows where the composer input lines are rendered:
+    // Row 1..2: Header, Row 3..(2+bodyH): Body, Row (3+bodyH): compTop, Row (4+bodyH)..(3+bodyH+visibleLines.length): Input lines
+    const firstInputRowY = 4 + bodyH;
+    const lastInputRowY = firstInputRowY + visibleLines.length - 1;
+
+    return {
+      lineMeta,
+      visibleLines,
+      activeLineIdx,
+      bodyH,
+      firstInputRowY,
+      lastInputRowY,
+    };
+  };
+
+  const mapMouseToInputOffset = (
+    x: number,
+    y: number,
+    layout: ReturnType<typeof getComposerLineLayout>,
+  ): number => {
+    const relRow = Math.max(
+      0,
+      Math.min(layout.visibleLines.length - 1, y - layout.firstInputRowY),
+    );
+    const meta = layout.visibleLines[relRow]!;
+    // Input text starts at 1-based column 4 (` ❯ ` or `   ` is 3 columns: col 1..3)
+    const localCol = Math.max(0, Math.min(meta.text.length, x - 4));
+    return meta.startOffset + localCol;
+  };
+
   const handleMouseEvent = (ev: SgrMouseEvent) => {
     if (ev.type === "wheel_up") {
       scrollOffset += 4;
@@ -988,14 +1058,31 @@ export async function startFullScreenTui(
     const hasSb = showSidebar && cols >= 95;
     const sbW = hasSb ? Math.min(36, Math.max(28, Math.floor(cols * 0.28))) : 0;
     const mainW = hasSb ? cols - sbW - 1 : cols;
-    const bodyH = Math.max(6, rows - 6);
+    const compLayout = getComposerLineLayout(cols, rows);
+    const bodyH = compLayout.bodyH;
 
     // 1-based terminal coordinates -> 0-based transcript row & col
     const bodyRow = ev.y - 3;
     const bodyCol = Math.max(0, Math.min(mainW - 2, ev.x - 2));
 
     if (ev.type === "down") {
-      // Click in Right Sidebar -> open Subagent or Terminal Job Inspector
+      // 1. Click inside Bottom Input Composer -> position cursor & start partial input text selection!
+      if (ev.y >= compLayout.firstInputRowY - 1 && ev.y <= compLayout.lastInputRowY + 1) {
+        selection = null;
+        isDraggingSelection = false;
+        const offset = mapMouseToInputOffset(ev.x, ev.y, compLayout);
+        cursorPos = offset;
+        inputSelection = { anchor: offset, focus: offset };
+        isDraggingInputSelection = true;
+        render();
+        return;
+      }
+
+      // Clear any input selection when clicking outside composer
+      inputSelection = null;
+      isDraggingInputSelection = false;
+
+      // 2. Click in Right Sidebar -> open Subagent or Terminal Job Inspector
       if (hasSb && ev.x > mainW) {
         selection = null;
         isDraggingSelection = false;
@@ -1010,7 +1097,7 @@ export async function startFullScreenTui(
         return;
       }
 
-      // Click inside Left Transcript Pane -> start pane-scoped text selection
+      // 3. Click inside Left Transcript Pane -> start pane-scoped text selection
       if (bodyRow >= 0 && bodyRow < bodyH && ev.x <= mainW) {
         selection = {
           startRow: bodyRow,
@@ -1023,15 +1110,6 @@ export async function startFullScreenTui(
         return;
       }
 
-      // Click inside Bottom Input Composer -> copy clean input buffer on click/drag without borders
-      if (ev.y >= rows - 3 && ev.y <= rows - 1 && buffer.trim().length > 0) {
-        copyTextToSystemClipboard(buffer);
-        stdout.write(`\x1b]52;c;${Buffer.from(buffer, "utf8").toString("base64")}\x07`);
-        notice = `Copied input text (${buffer.length} chars) to clipboard!`;
-        render();
-        return;
-      }
-
       if (selection) {
         selection = null;
         isDraggingSelection = false;
@@ -1040,43 +1118,69 @@ export async function startFullScreenTui(
       return;
     }
 
-    if (ev.type === "drag" && isDraggingSelection && selection) {
-      const clampedRow = Math.max(0, Math.min(bodyH - 1, bodyRow));
-      selection = {
-        ...selection,
-        endRow: clampedRow,
-        endCol: bodyCol,
-      };
-      render();
+    if (ev.type === "drag") {
+      if (isDraggingInputSelection && inputSelection) {
+        const offset = mapMouseToInputOffset(ev.x, ev.y, compLayout);
+        cursorPos = offset;
+        inputSelection = { anchor: inputSelection.anchor, focus: offset };
+        render();
+        return;
+      }
+      if (isDraggingSelection && selection) {
+        const clampedRow = Math.max(0, Math.min(bodyH - 1, bodyRow));
+        selection = {
+          ...selection,
+          endRow: clampedRow,
+          endCol: bodyCol,
+        };
+        render();
+        return;
+      }
       return;
     }
 
-    if (ev.type === "up" && isDraggingSelection && selection) {
-      isDraggingSelection = false;
-      const hasSpan =
-        selection.startRow !== selection.endRow ||
-        Math.abs(selection.endCol - selection.startCol) >= 2;
-      if (hasSpan) {
-        const st = computeState();
-        const wrapped = wrapTranscriptLines(st.transcriptLines, Math.max(20, mainW - 2));
-        const availRows = Math.max(1, bodyH - (st.busyLabel ? 1 : 0));
-        const maxSc = Math.max(0, wrapped.length - availRows);
-        const clampedSc = Math.min(maxSc, Math.max(0, st.scrollOffset));
-        const endI = wrapped.length - clampedSc;
-        const startI = Math.max(0, endI - availRows);
-        const visSlice = wrapped.slice(startI, endI);
-
-        const copied = extractPaneScopedSelection(visSlice, selection);
-        if (copied.length > 0) {
-          copyTextToSystemClipboard(copied);
-          // Also emit OSC 52 clipboard sequence for terminal emulators
-          stdout.write(`\x1b]52;c;${Buffer.from(copied, "utf8").toString("base64")}\x07`);
-          notice = `Copied ${copied.length} chars from transcript (sidebar excluded)!`;
+    if (ev.type === "up") {
+      if (isDraggingInputSelection && inputSelection) {
+        isDraggingInputSelection = false;
+        const selectedInput = extractSelectedInputText(buffer, inputSelection);
+        if (selectedInput.length > 0) {
+          copyTextToSystemClipboard(selectedInput);
+          stdout.write(`\x1b]52;c;${Buffer.from(selectedInput, "utf8").toString("base64")}\x07`);
+          notice = `Copied selected input (${selectedInput.length} chars) to clipboard! (Backspace to delete)`;
+        } else {
+          inputSelection = null;
         }
-      } else {
-        selection = null;
+        render();
+        return;
       }
-      render();
+
+      if (isDraggingSelection && selection) {
+        isDraggingSelection = false;
+        const hasSpan =
+          selection.startRow !== selection.endRow ||
+          Math.abs(selection.endCol - selection.startCol) >= 2;
+        if (hasSpan) {
+          const st = computeState();
+          const wrapped = wrapTranscriptLines(st.transcriptLines, Math.max(20, mainW - 2));
+          const availRows = Math.max(1, bodyH - (st.busyLabel ? 1 : 0));
+          const maxSc = Math.max(0, wrapped.length - availRows);
+          const clampedSc = Math.min(maxSc, Math.max(0, st.scrollOffset));
+          const endI = wrapped.length - clampedSc;
+          const startI = Math.max(0, endI - availRows);
+          const visSlice = wrapped.slice(startI, endI);
+
+          const copied = extractPaneScopedSelection(visSlice, selection);
+          if (copied.length > 0) {
+            copyTextToSystemClipboard(copied);
+            // Also emit OSC 52 clipboard sequence for terminal emulators
+            stdout.write(`\x1b]52;c;${Buffer.from(copied, "utf8").toString("base64")}\x07`);
+            notice = `Copied ${copied.length} chars from transcript (sidebar excluded)!`;
+          }
+        } else {
+          selection = null;
+        }
+        render();
+      }
     }
   };
 
@@ -1100,8 +1204,8 @@ export async function startFullScreenTui(
     stdin.off("data", onRawStdinData);
     keyboardStream.off("keypress", onKeypress);
     if (stdin.isTTY) stdin.setRawMode(false);
-    // Explicitly disable all mouse tracking modes, restore auto-wrap, cursor, and normal screen buffer
-    stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?7h\x1b[?25h\x1b[?1049l");
+    // Explicitly disable all mouse tracking & modifyOtherKeys modes, restore auto-wrap, cursor, and normal screen buffer
+    stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[>4;0m\x1b[<u\x1b[?7h\x1b[?25h\x1b[?1049l");
     // Print the session summary card on the normal terminal screen!
     stdout.write(
       "\n" +
@@ -1463,8 +1567,8 @@ export async function startFullScreenTui(
       return;
     }
 
-    // Ctrl+J -> Open Background Terminal Jobs Modal
-    if (key?.ctrl && key.name === "j") {
+    // Alt+J -> Open Background Terminal Jobs Modal (Ctrl+J is reserved for newline / Shift+Enter in terminals!)
+    if (key?.meta && key.name === "j") {
       openJobsListModal();
       return;
     }
@@ -1489,8 +1593,18 @@ export async function startFullScreenTui(
       return;
     }
 
-    // Ctrl+Y -> Copy last assistant response to clipboard
+    // Ctrl+Y -> Copy selected input text (if active), else copy last assistant response to clipboard
     if (key?.ctrl && key.name === "y") {
+      const selInput = extractSelectedInputText(buffer, inputSelection);
+      if (selInput.length > 0) {
+        const ok = copyTextToSystemClipboard(selInput);
+        stdout.write(`\x1b]52;c;${Buffer.from(selInput, "utf8").toString("base64")}\x07`);
+        notice = ok
+          ? `Copied selected input (${selInput.length} chars) to clipboard!`
+          : "Failed to access system clipboard";
+        render();
+        return;
+      }
       const lastAssistant = [...agent.session.messages]
         .reverse()
         .find((m) => m.role === "assistant" && m.content.trim().length > 0);
@@ -1506,6 +1620,23 @@ export async function startFullScreenTui(
       return;
     }
 
+    // Ctrl+X -> Cut selected input text to clipboard
+    if (key?.ctrl && key.name === "x") {
+      const selInput = extractSelectedInputText(buffer, inputSelection);
+      if (selInput.length > 0 && inputSelection) {
+        copyTextToSystemClipboard(selInput);
+        stdout.write(`\x1b]52;c;${Buffer.from(selInput, "utf8").toString("base64")}\x07`);
+        const s = Math.min(inputSelection.anchor, inputSelection.focus);
+        const e = Math.max(inputSelection.anchor, inputSelection.focus);
+        buffer = buffer.slice(0, s) + buffer.slice(e);
+        cursorPos = s;
+        inputSelection = null;
+        notice = `Cut selected input (${selInput.length} chars) to clipboard!`;
+        render();
+        return;
+      }
+    }
+
     // PageUp / PageDown -> Scroll Transcript
     if (key?.name === "pageup") {
       scrollOffset += 8;
@@ -1518,11 +1649,23 @@ export async function startFullScreenTui(
       return;
     }
 
-    // Ctrl+C / Ctrl+D -> Clear buffer or exit
+    // Ctrl+C / Ctrl+D -> Copy selected input if selection active, else clear buffer or exit
     if (key?.ctrl && (key.name === "c" || key.name === "d")) {
+      if (key.name === "c") {
+        const selInput = extractSelectedInputText(buffer, inputSelection);
+        if (selInput.length > 0) {
+          copyTextToSystemClipboard(selInput);
+          stdout.write(`\x1b]52;c;${Buffer.from(selInput, "utf8").toString("base64")}\x07`);
+          inputSelection = null;
+          notice = `Copied selected input (${selInput.length} chars) to clipboard!`;
+          render();
+          return;
+        }
+      }
       if (buffer.length > 0) {
         buffer = "";
         cursorPos = 0;
+        inputSelection = null;
         notice = "Cleared input (press Ctrl+C again to exit)";
         render();
         return;
@@ -1532,6 +1675,13 @@ export async function startFullScreenTui(
     }
 
     if (key?.name === "escape") {
+      if (inputSelection || selection) {
+        inputSelection = null;
+        selection = null;
+        notice = null;
+        render();
+        return;
+      }
       buffer = "";
       cursorPos = 0;
       scrollOffset = 0;
@@ -1543,10 +1693,29 @@ export async function startFullScreenTui(
     const catalogIds = getAvailableCatalog().map((m) => m.id);
     const suggestions = computeComposerSuggestions(buffer, workspaceFiles, catalogIds);
 
+    // Multi-line Newline Insertion: Shift+Enter, Alt+Enter, Ctrl+Enter, Ctrl+J, or CSI-u Shift+Enter
+    if (isNewlineKeyEvent(str, key)) {
+      if (inputSelection) {
+        const s = Math.min(inputSelection.anchor, inputSelection.focus);
+        const e = Math.max(inputSelection.anchor, inputSelection.focus);
+        buffer = buffer.slice(0, s) + "\n" + buffer.slice(e);
+        cursorPos = s + 1;
+        inputSelection = null;
+      } else {
+        buffer = buffer.slice(0, cursorPos) + "\n" + buffer.slice(cursorPos);
+        cursorPos++;
+      }
+      selectedSuggestionIdx = 0;
+      notice = null;
+      render();
+      return;
+    }
+
     // Up / Down arrows:
     // 1. If `/` or `@` suggestion dropdown is open -> navigate suggestions
-    // 2. If buffer is empty -> scroll transcript up/down (supports mouse wheel via Alternate Scroll Mode \x1b[?1007h!)
-    // 3. If Ctrl+Up/Down or buffer is non-empty -> navigate prompt history
+    // 2. If buffer is multi-line and no Ctrl -> move cursor up/down between lines inside composer
+    // 3. If buffer is empty -> scroll transcript up/down
+    // 4. Otherwise -> navigate prompt history
     if (key?.name === "up") {
       if (suggestions.items.length > 0) {
         selectedSuggestionIdx =
@@ -1554,6 +1723,18 @@ export async function startFullScreenTui(
           suggestions.items.length;
         render();
         return;
+      }
+      if (buffer.includes("\n") && !key.ctrl) {
+        const layout = getComposerLineLayout(stdout.columns || 110, stdout.rows || 30);
+        if (layout.activeLineIdx > 0) {
+          const curLine = layout.lineMeta[layout.activeLineIdx]!;
+          const prevLine = layout.lineMeta[layout.activeLineIdx - 1]!;
+          const colInLine = cursorPos - curLine.startOffset;
+          cursorPos = prevLine.startOffset + Math.min(prevLine.text.length, colInLine);
+          inputSelection = null;
+          render();
+          return;
+        }
       }
       if (buffer.length === 0 && !key.ctrl) {
         scrollOffset += 3;
@@ -1564,6 +1745,7 @@ export async function startFullScreenTui(
         historyIdx--;
         buffer = history[historyIdx] ?? "";
         cursorPos = buffer.length;
+        inputSelection = null;
         render();
       }
       return;
@@ -1576,6 +1758,18 @@ export async function startFullScreenTui(
         render();
         return;
       }
+      if (buffer.includes("\n") && !key.ctrl) {
+        const layout = getComposerLineLayout(stdout.columns || 110, stdout.rows || 30);
+        if (layout.activeLineIdx < layout.lineMeta.length - 1) {
+          const curLine = layout.lineMeta[layout.activeLineIdx]!;
+          const nextLine = layout.lineMeta[layout.activeLineIdx + 1]!;
+          const colInLine = cursorPos - curLine.startOffset;
+          cursorPos = nextLine.startOffset + Math.min(nextLine.text.length, colInLine);
+          inputSelection = null;
+          render();
+          return;
+        }
+      }
       if (buffer.length === 0 && scrollOffset > 0 && !key.ctrl) {
         scrollOffset = Math.max(0, scrollOffset - 3);
         render();
@@ -1585,33 +1779,69 @@ export async function startFullScreenTui(
         historyIdx++;
         buffer = history[historyIdx] ?? "";
         cursorPos = buffer.length;
+        inputSelection = null;
         render();
       } else if (historyIdx === history.length - 1) {
         historyIdx = history.length;
         buffer = "";
         cursorPos = 0;
+        inputSelection = null;
         render();
       }
       return;
     }
 
     if (key?.name === "left") {
-      cursorPos = Math.max(0, cursorPos - 1);
+      if (key.shift) {
+        const anchor = inputSelection ? inputSelection.anchor : cursorPos;
+        cursorPos = Math.max(0, cursorPos - 1);
+        inputSelection = { anchor, focus: cursorPos };
+      } else if (inputSelection && inputSelection.anchor !== inputSelection.focus) {
+        cursorPos = Math.min(inputSelection.anchor, inputSelection.focus);
+        inputSelection = null;
+      } else {
+        inputSelection = null;
+        cursorPos = Math.max(0, cursorPos - 1);
+      }
       render();
       return;
     }
     if (key?.name === "right") {
-      cursorPos = Math.min(buffer.length, cursorPos + 1);
+      if (key.shift) {
+        const anchor = inputSelection ? inputSelection.anchor : cursorPos;
+        cursorPos = Math.min(buffer.length, cursorPos + 1);
+        inputSelection = { anchor, focus: cursorPos };
+      } else if (inputSelection && inputSelection.anchor !== inputSelection.focus) {
+        cursorPos = Math.max(inputSelection.anchor, inputSelection.focus);
+        inputSelection = null;
+      } else {
+        inputSelection = null;
+        cursorPos = Math.min(buffer.length, cursorPos + 1);
+      }
       render();
       return;
     }
-    if (key?.name === "home" || (key?.ctrl && key.name === "a")) {
-      cursorPos = 0;
+    if (key?.name === "home") {
+      if (key.shift) {
+        const anchor = inputSelection ? inputSelection.anchor : cursorPos;
+        cursorPos = 0;
+        inputSelection = { anchor, focus: 0 };
+      } else {
+        inputSelection = null;
+        cursorPos = 0;
+      }
       render();
       return;
     }
     if (key?.name === "end") {
-      cursorPos = buffer.length;
+      if (key.shift) {
+        const anchor = inputSelection ? inputSelection.anchor : cursorPos;
+        cursorPos = buffer.length;
+        inputSelection = { anchor, focus: buffer.length };
+      } else {
+        inputSelection = null;
+        cursorPos = buffer.length;
+      }
       scrollOffset = 0;
       render();
       return;
@@ -1634,19 +1864,28 @@ export async function startFullScreenTui(
           cursorPos = buffer.length;
           selectedSuggestionIdx = 0;
         }
+        inputSelection = null;
         render();
       }
       return;
     }
 
-    // Enter / Return
+    // Enter / Return (Plain Enter submits unless preceded by trailing `\`)
     if (key?.name === "return" || key?.name === "enter") {
+      // Support trailing backslash `\` + Enter for newline continuation
+      if (cursorPos > 0 && buffer[cursorPos - 1] === "\\") {
+        buffer = buffer.slice(0, cursorPos - 1) + "\n" + buffer.slice(cursorPos);
+        inputSelection = null;
+        render();
+        return;
+      }
       if (suggestions.kind === "file" && suggestions.items.length > 0) {
         const chosen = suggestions.items[selectedSuggestionIdx];
         if (chosen) {
           buffer = buffer.replace(/(^|\s)@([^\s]*)$/, `$1@${chosen.value} `);
           cursorPos = buffer.length;
           selectedSuggestionIdx = 0;
+          inputSelection = null;
           render();
           return;
         }
@@ -1661,6 +1900,7 @@ export async function startFullScreenTui(
           cursorPos = buffer.length;
           if (chosen.value.endsWith(" ")) {
             selectedSuggestionIdx = 0;
+            inputSelection = null;
             render();
             return;
           }
@@ -1669,6 +1909,7 @@ export async function startFullScreenTui(
       const lineToRun = buffer.trim();
       buffer = "";
       cursorPos = 0;
+      inputSelection = null;
       selectedSuggestionIdx = 0;
       notice = null;
       render();
@@ -1679,6 +1920,17 @@ export async function startFullScreenTui(
     }
 
     if (key?.name === "backspace") {
+      if (inputSelection && inputSelection.anchor !== inputSelection.focus) {
+        const s = Math.min(inputSelection.anchor, inputSelection.focus);
+        const e = Math.max(inputSelection.anchor, inputSelection.focus);
+        buffer = buffer.slice(0, s) + buffer.slice(e);
+        cursorPos = s;
+        inputSelection = null;
+        selectedSuggestionIdx = 0;
+        notice = null;
+        render();
+        return;
+      }
       if (cursorPos > 0) {
         buffer = buffer.slice(0, cursorPos - 1) + buffer.slice(cursorPos);
         cursorPos--;
@@ -1690,6 +1942,16 @@ export async function startFullScreenTui(
     }
 
     if (key?.name === "delete") {
+      if (inputSelection && inputSelection.anchor !== inputSelection.focus) {
+        const s = Math.min(inputSelection.anchor, inputSelection.focus);
+        const e = Math.max(inputSelection.anchor, inputSelection.focus);
+        buffer = buffer.slice(0, s) + buffer.slice(e);
+        cursorPos = s;
+        inputSelection = null;
+        selectedSuggestionIdx = 0;
+        render();
+        return;
+      }
       if (cursorPos < buffer.length) {
         buffer = buffer.slice(0, cursorPos) + buffer.slice(cursorPos + 1);
         selectedSuggestionIdx = 0;
@@ -1699,12 +1961,20 @@ export async function startFullScreenTui(
     }
 
     if (str && !key?.ctrl && !key?.meta) {
-      const clean = stripMouseEscapeGarbage(str.replace(/[\r\n]+/g, " "));
-      if (clean.length > 0 && clean >= " ") {
-        buffer = stripMouseEscapeGarbage(
-          buffer.slice(0, cursorPos) + clean + buffer.slice(cursorPos),
-        );
-        cursorPos = Math.min(buffer.length, cursorPos + clean.length);
+      const clean = stripMouseEscapeGarbage(str.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
+      if (clean.length > 0 && (clean >= " " || clean.includes("\n"))) {
+        if (inputSelection && inputSelection.anchor !== inputSelection.focus) {
+          const s = Math.min(inputSelection.anchor, inputSelection.focus);
+          const e = Math.max(inputSelection.anchor, inputSelection.focus);
+          buffer = stripMouseEscapeGarbage(buffer.slice(0, s) + clean + buffer.slice(e));
+          cursorPos = Math.min(buffer.length, s + clean.length);
+          inputSelection = null;
+        } else {
+          buffer = stripMouseEscapeGarbage(
+            buffer.slice(0, cursorPos) + clean + buffer.slice(cursorPos),
+          );
+          cursorPos = Math.min(buffer.length, cursorPos + clean.length);
+        }
         selectedSuggestionIdx = 0;
         notice = null;
         render();
@@ -1717,11 +1987,11 @@ export async function startFullScreenTui(
   });
 
   // Enter Alternate Screen Buffer + Enable Button-Drag SGR Mouse Mode (\x1b[?1002h\x1b[?1006h — only reports button press/drag/wheel, NEVER hover!)
-  // Mouse sequences are intercepted in `onRawStdinData` BEFORE `keyboardStream`, so they NEVER leak into the input box!
+  // + Enable xterm modifyOtherKeys (\x1b[>4;1m) & Kitty keyboard disambiguation (\x1b[>1u) so Shift+Enter / Ctrl+Enter send distinct newline sequences!
   if (stdin.isTTY) stdin.setRawMode(true);
   stdin.resume();
   stdout.write(
-    "\x1b[?1049h\x1b[?1003l\x1b[?1002h\x1b[?1006h\x1b[?7l\x1b[?25l\x1b[2J\x1b[H",
+    "\x1b[?1049h\x1b[?1003l\x1b[?1002h\x1b[?1006h\x1b[>4;1m\x1b[>1u\x1b[?7l\x1b[?25l\x1b[2J\x1b[H",
   );
 
   stdout.on("resize", onResize);
@@ -1778,6 +2048,11 @@ export interface PaneSelectionRange {
   endCol: number;
 }
 
+export interface InputSelectionRange {
+  anchor: number;
+  focus: number;
+}
+
 export interface FullScreenTuiState {
   cols: number;
   rows: number;
@@ -1813,6 +2088,7 @@ export interface FullScreenTuiState {
   modal: FullScreenModalState | null;
   notice: string | null;
   selection?: PaneSelectionRange | null;
+  inputSelection?: InputSelectionRange | null;
 }
 
 /**
@@ -2085,12 +2361,47 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
   const sidebarWidth = hasSidebar ? Math.min(36, Math.max(28, Math.floor(cols * 0.28))) : 0;
   const mainWidth = hasSidebar ? cols - sidebarWidth - 1 : cols;
 
+  // Compute multi-line composer rows first so bodyHeight dynamically adjusts when prompt has multiple lines
+  const rawInputLines = state.buffer.length > 0 ? state.buffer.split("\n") : [""];
+  const lineMeta: Array<{
+    lineIdx: number;
+    text: string;
+    startOffset: number;
+    endOffset: number;
+  }> = [];
+  let runOff = 0;
+  for (let i = 0; i < rawInputLines.length; i++) {
+    const txt = rawInputLines[i]!;
+    lineMeta.push({
+      lineIdx: i,
+      text: txt,
+      startOffset: runOff,
+      endOffset: runOff + txt.length,
+    });
+    runOff += txt.length + 1;
+  }
+
+  let activeInputLineIdx = 0;
+  for (let i = 0; i < lineMeta.length; i++) {
+    if (state.cursorPos >= lineMeta[i]!.startOffset && state.cursorPos <= lineMeta[i]!.endOffset) {
+      activeInputLineIdx = i;
+      break;
+    }
+  }
+
+  const maxVisibleInputRows = Math.min(6, Math.max(1, rawInputLines.length));
+  let startInputLine = Math.max(0, activeInputLineIdx - Math.floor(maxVisibleInputRows / 2));
+  const endInputLine = Math.min(lineMeta.length, startInputLine + maxVisibleInputRows);
+  if (endInputLine - startInputLine < maxVisibleInputRows) {
+    startInputLine = Math.max(0, endInputLine - maxVisibleInputRows);
+  }
+  const visibleInputMeta = lineMeta.slice(startInputLine, endInputLine);
+
   // Layout row allocation:
-  // Row 0: Top Header Bar (1 row)
-  // Row 1: Top Separator (1 row)
-  // Middle Body: bodyHeight = rows - 6
-  // Bottom Composer: 3 rows (top border, input line, bottom border) + 1 bottom status bar = 4 rows
-  const bodyHeight = Math.max(6, rows - 6);
+  // Row 0..1: Top Header Bar (2 rows)
+  // Middle Body: bodyHeight = rows - 2 - (3 + visibleInputMeta.length)
+  // Bottom Composer: compTop (1) + visibleInputMeta.length (1..6) + compBot (1) + footerBar (1)
+  const bodyHeight = Math.max(4, rows - 5 - visibleInputMeta.length);
 
   // ── 1. Top Header Bar (Row 0 & Row 1) ─────────────────────────────────────
   const shortCwd =
@@ -2276,31 +2587,69 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
         : c.cyan("❯ ");
 
   const innerCompW = Math.max(10, cols - 4);
-  let inputContent: string;
+  const compMidRows: string[] = [];
+
   if (!state.buffer) {
-    inputContent = `${glyph}${c.white("▏")}${c.dim("Ask anything, @file to attach, / for commands, !cmd for shell…")}`;
+    const placeholder = `${glyph}${c.white("▏")}${c.dim("Ask anything, @file to attach, / for commands, Shift+Enter for new line…")}`;
+    compMidRows.push(` ${truncateLineToWidth(placeholder, innerCompW)}`);
   } else {
-    const before = state.buffer.slice(0, state.cursorPos);
-    const after = state.buffer.slice(state.cursorPos);
-    const rawStr = `${before}▏${after}`;
-    const maxInputChars = innerCompW - 3;
-    const clipped =
-      rawStr.length > maxInputChars
-        ? "…" + rawStr.slice(rawStr.length - (maxInputChars - 1))
-        : rawStr;
-    inputContent = `${glyph}${c.white(clipped)}`;
+    const hasInputSel =
+      Boolean(state.inputSelection) &&
+      state.inputSelection!.anchor !== state.inputSelection!.focus;
+    const selStart = hasInputSel
+      ? Math.min(state.inputSelection!.anchor, state.inputSelection!.focus)
+      : -1;
+    const selEnd = hasInputSel
+      ? Math.max(state.inputSelection!.anchor, state.inputSelection!.focus)
+      : -1;
+
+    for (let vIdx = 0; vIdx < visibleInputMeta.length; vIdx++) {
+      const meta = visibleInputMeta[vIdx]!;
+      const linePrefix = meta.lineIdx === 0 ? glyph : "  ";
+      const rawLine = meta.text;
+      let formattedLine: string;
+
+      if (hasInputSel) {
+        const localSelStart = Math.max(0, selStart - meta.startOffset);
+        const localSelEnd = Math.min(rawLine.length, selEnd - meta.startOffset);
+        if (localSelEnd > localSelStart && localSelStart < rawLine.length) {
+          const beforeSel = rawLine.slice(0, localSelStart);
+          const selectedPart = rawLine.slice(localSelStart, localSelEnd);
+          const afterSel = rawLine.slice(localSelEnd);
+          formattedLine = `${c.white(beforeSel)}\x1b[7m${selectedPart}\x1b[27m${c.white(afterSel)}`;
+        } else {
+          formattedLine = c.white(rawLine);
+        }
+      } else if (
+        state.cursorPos >= meta.startOffset &&
+        state.cursorPos <= meta.endOffset
+      ) {
+        const localCur = state.cursorPos - meta.startOffset;
+        const before = rawLine.slice(0, localCur);
+        const after = rawLine.slice(localCur);
+        const withCaret = `${before}▏${after}`;
+        const maxInputChars = innerCompW - 3;
+        const clipped =
+          withCaret.length > maxInputChars
+            ? "…" + withCaret.slice(withCaret.length - (maxInputChars - 1))
+            : withCaret;
+        formattedLine = c.white(clipped);
+      } else {
+        formattedLine = c.white(rawLine);
+      }
+
+      compMidRows.push(` ${truncateLineToWidth(`${linePrefix}${formattedLine}`, innerCompW)}`);
+    }
   }
 
-  // No left/right │ walls and no trailing spaces so selecting input text copies cleanly!
-  const compMid = ` ${truncateLineToWidth(inputContent, innerCompW)}`;
   const compBot = borderColor("─".repeat(Math.max(2, cols)));
 
   const footerBar = truncateLineToWidth(
-    ` ${c.bold("Shift+Tab:")} Mode ${c.slate("│")} ${c.bold("Ctrl+K:")} Model ${c.slate("│")} ${c.bold("Ctrl+G:")} Subagents ${c.slate("│")} ${c.bold("Ctrl+O:")} Config ${c.slate("│")} ${c.bold("Ctrl+Y:")} Copy ${c.slate("│")} ${c.bold("Ctrl+B:")} Sidebar ${c.slate("│")} ${c.bold("/:")} Cmds`,
+    ` ${c.bold("Shift+Enter:")} Newline ${c.slate("│")} ${c.bold("Shift+Tab:")} Mode ${c.slate("│")} ${c.bold("Ctrl+K:")} Model ${c.slate("│")} ${c.bold("Ctrl+G:")} Subagents ${c.slate("│")} ${c.bold("Ctrl+O:")} Config ${c.slate("│")} ${c.bold("Ctrl+Y:")} Copy ${c.slate("│")} ${c.bold("Ctrl+B:")} Sidebar`,
     cols,
   );
 
-  const allRows = [row0, row1, ...bodyLines, compTop, compMid, compBot, footerBar];
+  const allRows = [row0, row1, ...bodyLines, compTop, ...compMidRows, compBot, footerBar];
   return allRows.slice(0, rows).join("\n");
 }
 
@@ -2372,8 +2721,62 @@ export function extractPaneScopedSelection(
 }
 
 /**
+ * Extracts the selected substring from `buffer` using `InputSelectionRange` (`anchor`..`focus`).
+ */
+export function extractSelectedInputText(
+  buffer: string,
+  sel: InputSelectionRange | null | undefined,
+): string {
+  if (!sel) return "";
+  const start = Math.max(0, Math.min(sel.anchor, sel.focus));
+  const end = Math.min(buffer.length, Math.max(sel.anchor, sel.focus));
+  if (end <= start) return "";
+  return buffer.slice(start, end);
+}
+
+/**
+ * Determines whether a keypress event should insert a newline (`\n`) into the multi-line input buffer
+ * instead of submitting the prompt:
+ * - `Shift+Enter`, `Alt+Enter`, `Ctrl+Enter`
+ * - `Ctrl+J` (`\n` / Line Feed, which emits `key.name === "enter"` in Node `readline` whereas plain Enter `\r` emits `key.name === "return"`)
+ * - CSI-u / xterm `modifyOtherKeys` modified Enter (`\x1b[13;2u`, `\x1b[27;2;13~`, etc.)
+ */
+export function isNewlineKeyEvent(
+  str: string | undefined,
+  key:
+    | {
+        name?: string;
+        ctrl?: boolean;
+        shift?: boolean;
+        meta?: boolean;
+        sequence?: string;
+      }
+    | undefined,
+): boolean {
+  const rawSeq = str ?? key?.sequence ?? "";
+  // eslint-disable-next-line no-control-regex
+  if (/\x1b\[(?:13;[2-8]u|27;[2-8];13~)/.test(rawSeq)) {
+    return true;
+  }
+  if (key?.ctrl && key.name === "j") {
+    return true;
+  }
+  if (key?.name === "enter") {
+    // In Node readline, `\n` (0x0A from Ctrl+Enter / Ctrl+J / translated CSI-u Shift+Enter) emits `name: "enter"`,
+    // whereas plain Enter (`\r`, 0x0D) emits `name: "return"`.
+    return true;
+  }
+  if (key?.name === "return" && Boolean(key.shift || key.meta || key.ctrl)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Splits a raw `stdin` chunk into parsed SGR mouse events (`down`, `drag`, `up`, `wheel_up`, `wheel_down`)
  * and pure keyboard text BEFORE `readline.emitKeypressEvents` ever sees the bytes.
+ * Also translates CSI-u / xterm modifyOtherKeys modified Enter (`\x1b[13;2u`, `\x1b[27;2;13~`) into `\n`
+ * so `Shift+Enter` / `Ctrl+Enter` reliably inserts a newline across all terminals.
  */
 export function splitMouseAndKeyboardBytes(chunk: Buffer | string): {
   keyboardText: string;
@@ -2402,7 +2805,16 @@ export function splitMouseAndKeyboardBytes(chunk: Buffer | string): {
     }
   }
 
-  const keyboardText = stripMouseEscapeGarbage(raw.replace(sgrRegex, ""));
+  const withoutMouse = raw
+    .replace(sgrRegex, "")
+    // Translate CSI-u / modifyOtherKeys Shift+Enter, Alt+Enter, Ctrl+Enter into \n (Line Feed -> `key.name === "enter"`)
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[(?:13;[2-8](?::\d+)?u|27;[2-8];13~)/g, "\n")
+    // Translate plain CSI-u Enter (\x1b[13u / \x1b[13;1u) into \r (Carriage Return -> `key.name === "return"`)
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[13(?:;1(?::\d+)?)?u/g, "\r");
+
+  const keyboardText = stripMouseEscapeGarbage(withoutMouse);
   return { keyboardText, mouseEvents };
 }
 

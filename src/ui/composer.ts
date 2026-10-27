@@ -705,8 +705,27 @@ export async function readInteractiveComposerLine(opts: {
         return;
       }
 
+      // Multi-line newline insertion via Shift+Enter, Alt+Enter, Ctrl+Enter, or Ctrl+J
+      if (
+        (key?.ctrl && key.name === "j") ||
+        key?.name === "enter" ||
+        (key?.name === "return" && Boolean(key.shift || key.meta || key.ctrl))
+      ) {
+        buffer = buffer.slice(0, cursorPos) + "\n" + buffer.slice(cursorPos);
+        cursorPos++;
+        selectedSuggestionIdx = 0;
+        notice = null;
+        render();
+        return;
+      }
+
       // Enter / Return
-      if (key?.name === "return" || key?.name === "enter") {
+      if (key?.name === "return") {
+        if (cursorPos > 0 && buffer[cursorPos - 1] === "\\") {
+          buffer = buffer.slice(0, cursorPos - 1) + "\n" + buffer.slice(cursorPos);
+          render();
+          return;
+        }
         if (suggestions.kind === "file" && suggestions.items.length > 0) {
           // Pressing Enter while @file dropdown is open attaches the file into the prompt
           acceptSuggestion(suggestions);

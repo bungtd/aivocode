@@ -7,6 +7,8 @@ import {
   renderFullScreenViewport,
   extractLastCodeBlock,
   extractPaneScopedSelection,
+  extractSelectedInputText,
+  isNewlineKeyEvent,
   splitMouseAndKeyboardBytes,
 } from "../src/ui/fullscreen.js";
 import { renderTerminalMarkdown } from "../src/ui/markdown.js";
@@ -407,5 +409,65 @@ describe("Deep Review Round 1 Fixes", () => {
     expect(copied).toBe("Baris pertama jawaban agen.\nBaris kedua jawaban agen.");
     expect(copied).not.toContain("Cache");
     expect(copied).not.toContain("│");
+  });
+
+  it("8. supports Shift+Enter / Alt+Enter / Ctrl+J multi-line input and partial input text selection for copying", () => {
+    // Shift+Enter, Alt+Enter, Ctrl+J, and CSI-u Shift+Enter must be recognized as newline, NOT submit
+    expect(isNewlineKeyEvent(undefined, { name: "return", shift: true })).toBe(true);
+    expect(isNewlineKeyEvent(undefined, { name: "return", meta: true })).toBe(true);
+    expect(isNewlineKeyEvent(undefined, { name: "j", ctrl: true })).toBe(true);
+    expect(isNewlineKeyEvent("\x1b[13;2u", { name: "return" })).toBe(true);
+    expect(isNewlineKeyEvent("\r", { name: "return", shift: false, meta: false, ctrl: false })).toBe(false);
+
+    // CSI-u Shift+Enter in raw chunk must translate to a newline token, not submit
+    const csiChunk = Buffer.from("baris 1\x1b[13;2ubaris 2");
+    const splitCsi = splitMouseAndKeyboardBytes(csiChunk);
+    expect(splitCsi.keyboardText).toBe("baris 1\nbaris 2");
+
+    // Partial selection inside input buffer
+    const inputBuf = "tolong perbaiki fungsi login sekarang";
+    const selectedSub = extractSelectedInputText(inputBuf, { anchor: 7, focus: 28 });
+    expect(selectedSub).toBe("perbaiki fungsi login");
+
+    // Multi-line input + inputSelection highlight in renderFullScreenViewport
+    const vp = renderFullScreenViewport({
+      cols: 100,
+      rows: 24,
+      showSidebar: true,
+      version: "1.2.0",
+      cwd: "C:/Dev/Projects/app",
+      gitBranch: "main",
+      gatewayUrl: "https://api.aivokey.dev",
+      model: "deepseek-v4.1-flash",
+      fastModel: "deepseek-v4.1-flash",
+      wire: "chat",
+      effort: "off",
+      mode: "auto",
+      sessionId: "ses_multiline",
+      usedContextTokens: 500,
+      maxContextTokens: 1_000_000,
+      cacheHitPct: 90,
+      sessionCostMicro: 1000n,
+      balanceMicro: 5_000_000n,
+      keyStatus: null,
+      todos: [],
+      modifiedFiles: [],
+      transcriptLines: ["◆ Ready"],
+      scrollOffset: 0,
+      busyLabel: null,
+      buffer: "Baris pertama prompt\nBaris kedua prompt",
+      cursorPos: 39,
+      inputSelection: { anchor: 0, focus: 13 },
+      suggestions: { kind: "none", query: "", items: [] },
+      selectedSuggestionIdx: 0,
+      modal: null,
+      notice: null,
+    });
+
+    const plainVp = stripAnsi(vp);
+    expect(plainVp).toContain("Baris pertama prompt");
+    expect(plainVp).toContain("Baris kedua prompt");
+    // Highlight ANSI sequence \x1b[7m must appear on the selected input substring
+    expect(vp).toContain("\x1b[7mBaris pertama\x1b[27m");
   });
 });
