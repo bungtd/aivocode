@@ -965,10 +965,9 @@ export async function startFullScreenTui(
     agent.backgroundJobs.stopAll();
     stdout.off("resize", onResize);
     stdin.off("keypress", onKeypress);
-    stdin.off("data", onRawMouseData);
     if (stdin.isTTY) stdin.setRawMode(false);
-    // Disable SGR mouse mode, restore auto-wrap, cursor, and normal screen buffer
-    stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?7h\x1b[?25h\x1b[?1049l");
+    // Explicitly disable all mouse tracking modes, restore auto-wrap, cursor, and normal screen buffer
+    stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?7h\x1b[?25h\x1b[?1049l");
     // Print the session summary card on the normal terminal screen!
     stdout.write(
       "\n" +
@@ -994,38 +993,6 @@ export async function startFullScreenTui(
     resizeTimer = setTimeout(() => {
       render(true);
     }, 30);
-  };
-
-  const onRawMouseData = (chunk: Buffer) => {
-    const raw = chunk.toString("utf8");
-    const mouse = parseSgrMouseEvent(raw);
-    if (!mouse) return;
-    if (mouse.type === "wheel_up") {
-      scrollOffset += 4;
-      render();
-      return;
-    }
-    if (mouse.type === "wheel_down") {
-      scrollOffset = Math.max(0, scrollOffset - 4);
-      render();
-      return;
-    }
-    if (mouse.type === "click") {
-      const cols = stdout.columns || 110;
-      const sidebarWidth = showSidebar && cols >= 95 ? Math.min(36, Math.max(28, Math.floor(cols * 0.28))) : 0;
-      const mainWidth = sidebarWidth > 0 ? cols - sidebarWidth - 1 : cols;
-      // Clicking in the right sidebar area opens Subagent Inspector or Jobs Inspector
-      if (sidebarWidth > 0 && mouse.x > mainWidth) {
-        if (agent.subagentRuns.length > 0) {
-          openSubagentInspectorListModal();
-          return;
-        }
-        if (agent.backgroundJobs.listJobs().length > 0) {
-          openJobsListModal();
-          return;
-        }
-      }
-    }
   };
 
   const onKeypress = (
@@ -1258,7 +1225,7 @@ export async function startFullScreenTui(
         return;
       }
       if (str && str.length === 1 && str >= " " && !key?.ctrl && !key?.meta) {
-        m.filter += str;
+        m.filter = stripMouseEscapeGarbage(m.filter + str);
         m.selectedIdx = 0;
         render();
       }
@@ -1266,13 +1233,23 @@ export async function startFullScreenTui(
     }
 
     // Allow scrolling at ALL times (even while the agent is busy working!)
-    if (key?.name === "pageup" || (key?.shift && key.name === "up") || (key?.meta && key.name === "up")) {
-      scrollOffset += 8;
+    if (
+      key?.name === "pageup" ||
+      (key?.shift && key.name === "up") ||
+      (key?.meta && key.name === "up") ||
+      (activeAbort && key?.name === "up")
+    ) {
+      scrollOffset += key?.name === "pageup" ? 8 : 3;
       render();
       return;
     }
-    if (key?.name === "pagedown" || (key?.shift && key.name === "down") || (key?.meta && key.name === "down")) {
-      scrollOffset = Math.max(0, scrollOffset - 8);
+    if (
+      key?.name === "pagedown" ||
+      (key?.shift && key.name === "down") ||
+      (key?.meta && key.name === "down") ||
+      (activeAbort && key?.name === "down")
+    ) {
+      scrollOffset = Math.max(0, scrollOffset - (key?.name === "pagedown" ? 8 : 3));
       render();
       return;
     }
@@ -1415,12 +1392,20 @@ export async function startFullScreenTui(
     const catalogIds = getAvailableCatalog().map((m) => m.id);
     const suggestions = computeComposerSuggestions(buffer, workspaceFiles, catalogIds);
 
-    // Up / Down arrows: navigate suggestion dropdown or prompt history
+    // Up / Down arrows:
+    // 1. If `/` or `@` suggestion dropdown is open -> navigate suggestions
+    // 2. If buffer is empty -> scroll transcript up/down (supports mouse wheel via Alternate Scroll Mode \x1b[?1007h!)
+    // 3. If Ctrl+Up/Down or buffer is non-empty -> navigate prompt history
     if (key?.name === "up") {
       if (suggestions.items.length > 0) {
         selectedSuggestionIdx =
           (selectedSuggestionIdx - 1 + suggestions.items.length) %
           suggestions.items.length;
+        render();
+        return;
+      }
+      if (buffer.length === 0 && !key.ctrl) {
+        scrollOffset += 3;
         render();
         return;
       }
@@ -1437,6 +1422,11 @@ export async function startFullScreenTui(
       if (suggestions.items.length > 0) {
         selectedSuggestionIdx =
           (selectedSuggestionIdx + 1) % suggestions.items.length;
+        render();
+        return;
+      }
+      if (buffer.length === 0 && scrollOffset > 0 && !key.ctrl) {
+        scrollOffset = Math.max(0, scrollOffset - 3);
         render();
         return;
       }
@@ -1558,10 +1548,12 @@ export async function startFullScreenTui(
     }
 
     if (str && !key?.ctrl && !key?.meta) {
-      const clean = str.replace(/[\r\n]+/g, " ");
+      const clean = stripMouseEscapeGarbage(str.replace(/[\r\n]+/g, " "));
       if (clean.length > 0 && clean >= " ") {
-        buffer = buffer.slice(0, cursorPos) + clean + buffer.slice(cursorPos);
-        cursorPos += clean.length;
+        buffer = stripMouseEscapeGarbage(
+          buffer.slice(0, cursorPos) + clean + buffer.slice(cursorPos),
+        );
+        cursorPos = Math.min(buffer.length, cursorPos + clean.length);
         selectedSuggestionIdx = 0;
         notice = null;
         render();
@@ -1573,15 +1565,18 @@ export async function startFullScreenTui(
     render();
   });
 
-  // Enter Alternate Screen Buffer + Enable SGR Mouse Wheel/Click + Disable Auto-Wrap + Hide hardware cursor
+  // Enter Alternate Screen Buffer + Disable raw mouse coordinate tracking (\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l)
+  // + Enable xterm Alternate Scroll Mode (\x1b[?1007h so mouse wheel sends clean Up/Down arrows!)
+  // + Disable Auto-Wrap (\x1b[?7l) + Hide hardware cursor (\x1b[?25l)
   emitKeypressEvents(stdin);
   if (stdin.isTTY) stdin.setRawMode(true);
   stdin.resume();
-  stdout.write("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?7l\x1b[?25l\x1b[2J\x1b[H");
+  stdout.write(
+    "\x1b[?1049h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007h\x1b[?7l\x1b[?25l\x1b[2J\x1b[H",
+  );
 
   stdout.on("resize", onResize);
   stdin.on("keypress", onKeypress);
-  stdin.on("data", onRawMouseData);
   render(true);
 
   return new Promise<void>((resPromise) => {
@@ -2064,6 +2059,20 @@ export interface SgrMouseEvent {
   type: "wheel_up" | "wheel_down" | "click";
   x: number;
   y: number;
+}
+
+/**
+ * Strips both complete and partial SGR / X10 mouse coordinate fragments
+ * (e.g. `<35;84;19M`, `<35;84;`, `\x1b[<64;80;20M`) even when emitted character-by-character
+ * by Node's `readline.emitKeypressEvents`, so mouse movement or wheel sequences can NEVER
+ * pollute the text input buffer.
+ */
+export function stripMouseEscapeGarbage(text: string): string {
+  return text
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b?\[?<?\d{1,3};\d{1,4};\d{1,4}[Mm]/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b?\[?<\d+;\d+;?\d*$/g, "");
 }
 
 /**

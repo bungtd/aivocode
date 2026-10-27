@@ -13,6 +13,7 @@ import {
 } from "../src/workflow-review.js";
 import {
   parseSgrMouseEvent,
+  stripMouseEscapeGarbage,
   formatSessionExitBanner,
   renderFullScreenAnsiBuffer,
   type FullScreenTuiState,
@@ -137,6 +138,20 @@ describe("AivoCode v1.1 Fixes: Background Jobs, Plan-Aware Model Filtering, Iter
 
     const leftClick = parseSgrMouseEvent("\x1b[<0;105;18M");
     expect(leftClick).toEqual({ type: "click", x: 105, y: 18 });
+
+    // Verify both complete and character-by-character partial SGR mouse sequences are stripped immediately
+    expect(stripMouseEscapeGarbage("halo<35;84;19M")).toBe("halo");
+    expect(stripMouseEscapeGarbage("\x1b[<64;80;20M<0;45;12mtest")).toBe("test");
+    expect(stripMouseEscapeGarbage("<35;102;24M")).toBe("");
+    expect(stripMouseEscapeGarbage("halo<35;84;")).toBe("halo");
+
+    // Simulate character-by-character arrival from Node's emitKeypressEvents
+    let simulatedBuf = "cek ";
+    for (const ch of "<35;84;19M<0;12;8m") {
+      simulatedBuf += ch;
+    }
+    expect(stripMouseEscapeGarbage(simulatedBuf)).toBe("cek ");
+    expect(stripMouseEscapeGarbage("cek 35;84;19M0;12;8m")).toBe("cek ");
 
     const dummyState: FullScreenTuiState = {
       cols: 100,
