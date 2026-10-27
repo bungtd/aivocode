@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { wrapTranscriptLines, renderFullScreenViewport, extractLastCodeBlock } from "../src/ui/fullscreen.js";
+import {
+  wrapTranscriptLines,
+  renderFullScreenViewport,
+  extractLastCodeBlock,
+  extractPaneScopedSelection,
+  splitMouseAndKeyboardBytes,
+} from "../src/ui/fullscreen.js";
 import { renderTerminalMarkdown } from "../src/ui/markdown.js";
 import { c, stripAnsi } from "../src/ui/theme.js";
 import { CheckpointManager } from "../src/checkpoint.js";
@@ -374,5 +380,32 @@ describe("Deep Review Round 1 Fixes", () => {
     // Input line must not have │ box walls around it
     expect(inputLine).not.toContain("│");
     expect(inputLine.endsWith("   ")).toBe(false);
+  });
+
+  it("7. OpenTUI-style pane-scoped mouse selection: keeps sidebar visible while selecting ONLY left-pane text and filtering mouse bytes before readline", () => {
+    const rawChunk = Buffer.from("a\x1b[<0;5;3M\x1b[<32;20;4M\x1b[<0;20;4mb");
+    const split = splitMouseAndKeyboardBytes(rawChunk);
+    expect(split.keyboardText).toBe("ab");
+    expect(split.mouseEvents).toEqual([
+      { type: "down", x: 5, y: 3 },
+      { type: "drag", x: 20, y: 4 },
+      { type: "up", x: 20, y: 4 },
+    ]);
+
+    const leftPaneLines = [
+      "❯ halo",
+      "◆ deepseek-v4.1-flash",
+      "  Baris pertama jawaban agen.",
+      "  Baris kedua jawaban agen.",
+    ];
+    const copied = extractPaneScopedSelection(leftPaneLines, {
+      startRow: 2,
+      startCol: 2,
+      endRow: 3,
+      endCol: 27,
+    });
+    expect(copied).toBe("Baris pertama jawaban agen.\nBaris kedua jawaban agen.");
+    expect(copied).not.toContain("Cache");
+    expect(copied).not.toContain("│");
   });
 });

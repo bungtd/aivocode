@@ -1,4 +1,5 @@
 import { emitKeypressEvents } from "node:readline";
+import { PassThrough } from "node:stream";
 import { stdin, stdout } from "node:process";
 import { execSync } from "node:child_process";
 import type { AivoWire, ExecutionStrategy, PermissionMode, ReasoningEffort } from "../config.js";
@@ -51,8 +52,11 @@ export async function startFullScreenTui(
   let keyStatus = initialKeyStatus;
   let workspaceFiles = walkWorkspaceFiles(agent.config.cwd);
   let gitBranch = getGitBranchLabel(agent.config.cwd);
-  // Default showSidebar to false so mouse selection copies pure transcript text without right-column pollution (Ctrl+B toggles drawer)
-  let showSidebar = false;
+  // Sidebar stays visible by default (like OpenCode V2); OpenTUI-style pane-scoped mouse selection
+  // selects & copies ONLY from the left transcript pane without ever copying the right sidebar!
+  let showSidebar = true;
+  let selection: PaneSelectionRange | null = null;
+  let isDraggingSelection = false;
 
   const transcriptLines: string[] = [
     `${c.cyan("◆")} ${c.bold("Welcome to AivoCode Full-Screen Studio")} ${c.slate("(Native AivoKey Harness)")}`,
@@ -147,6 +151,7 @@ export async function startFullScreenTui(
       selectedSuggestionIdx,
       modal,
       notice,
+      selection,
     };
   };
 
@@ -963,6 +968,128 @@ export async function startFullScreenTui(
   let exitResolve: (() => void) | null = null;
   let cleanedUp = false;
 
+  const keyboardStream = new PassThrough();
+  emitKeypressEvents(keyboardStream);
+
+  const handleMouseEvent = (ev: SgrMouseEvent) => {
+    if (ev.type === "wheel_up") {
+      scrollOffset += 4;
+      render();
+      return;
+    }
+    if (ev.type === "wheel_down") {
+      scrollOffset = Math.max(0, scrollOffset - 4);
+      render();
+      return;
+    }
+
+    const cols = stdout.columns || 110;
+    const rows = stdout.rows || 30;
+    const hasSb = showSidebar && cols >= 95;
+    const sbW = hasSb ? Math.min(36, Math.max(28, Math.floor(cols * 0.28))) : 0;
+    const mainW = hasSb ? cols - sbW - 1 : cols;
+    const bodyH = Math.max(6, rows - 6);
+
+    // 1-based terminal coordinates -> 0-based transcript row & col
+    const bodyRow = ev.y - 3;
+    const bodyCol = Math.max(0, Math.min(mainW - 2, ev.x - 2));
+
+    if (ev.type === "down") {
+      // Click in Right Sidebar -> open Subagent or Terminal Job Inspector
+      if (hasSb && ev.x > mainW) {
+        selection = null;
+        isDraggingSelection = false;
+        if (agent.subagentRuns.length > 0) {
+          openSubagentInspectorListModal();
+          return;
+        }
+        if (agent.backgroundJobs.listJobs().length > 0) {
+          openJobsListModal();
+          return;
+        }
+        return;
+      }
+
+      // Click inside Left Transcript Pane -> start pane-scoped text selection
+      if (bodyRow >= 0 && bodyRow < bodyH && ev.x <= mainW) {
+        selection = {
+          startRow: bodyRow,
+          startCol: bodyCol,
+          endRow: bodyRow,
+          endCol: bodyCol,
+        };
+        isDraggingSelection = true;
+        render();
+        return;
+      }
+
+      // Click inside Bottom Input Composer -> copy clean input buffer on click/drag without borders
+      if (ev.y >= rows - 3 && ev.y <= rows - 1 && buffer.trim().length > 0) {
+        copyTextToSystemClipboard(buffer);
+        stdout.write(`\x1b]52;c;${Buffer.from(buffer, "utf8").toString("base64")}\x07`);
+        notice = `Copied input text (${buffer.length} chars) to clipboard!`;
+        render();
+        return;
+      }
+
+      if (selection) {
+        selection = null;
+        isDraggingSelection = false;
+        render();
+      }
+      return;
+    }
+
+    if (ev.type === "drag" && isDraggingSelection && selection) {
+      const clampedRow = Math.max(0, Math.min(bodyH - 1, bodyRow));
+      selection = {
+        ...selection,
+        endRow: clampedRow,
+        endCol: bodyCol,
+      };
+      render();
+      return;
+    }
+
+    if (ev.type === "up" && isDraggingSelection && selection) {
+      isDraggingSelection = false;
+      const hasSpan =
+        selection.startRow !== selection.endRow ||
+        Math.abs(selection.endCol - selection.startCol) >= 2;
+      if (hasSpan) {
+        const st = computeState();
+        const wrapped = wrapTranscriptLines(st.transcriptLines, Math.max(20, mainW - 2));
+        const availRows = Math.max(1, bodyH - (st.busyLabel ? 1 : 0));
+        const maxSc = Math.max(0, wrapped.length - availRows);
+        const clampedSc = Math.min(maxSc, Math.max(0, st.scrollOffset));
+        const endI = wrapped.length - clampedSc;
+        const startI = Math.max(0, endI - availRows);
+        const visSlice = wrapped.slice(startI, endI);
+
+        const copied = extractPaneScopedSelection(visSlice, selection);
+        if (copied.length > 0) {
+          copyTextToSystemClipboard(copied);
+          // Also emit OSC 52 clipboard sequence for terminal emulators
+          stdout.write(`\x1b]52;c;${Buffer.from(copied, "utf8").toString("base64")}\x07`);
+          notice = `Copied ${copied.length} chars from transcript (sidebar excluded)!`;
+        }
+      } else {
+        selection = null;
+      }
+      render();
+    }
+  };
+
+  const onRawStdinData = (chunk: Buffer) => {
+    const { keyboardText, mouseEvents } = splitMouseAndKeyboardBytes(chunk);
+    for (const ev of mouseEvents) {
+      handleMouseEvent(ev);
+    }
+    if (keyboardText.length > 0) {
+      keyboardStream.write(keyboardText);
+    }
+  };
+
   const cleanupAndExit = () => {
     if (cleanedUp) return;
     cleanedUp = true;
@@ -970,7 +1097,8 @@ export async function startFullScreenTui(
     if (resizeTimer) clearTimeout(resizeTimer);
     agent.backgroundJobs.stopAll();
     stdout.off("resize", onResize);
-    stdin.off("keypress", onKeypress);
+    stdin.off("data", onRawStdinData);
+    keyboardStream.off("keypress", onKeypress);
     if (stdin.isTTY) stdin.setRawMode(false);
     // Explicitly disable all mouse tracking modes, restore auto-wrap, cursor, and normal screen buffer
     stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007l\x1b[?7h\x1b[?25h\x1b[?1049l");
@@ -1588,18 +1716,17 @@ export async function startFullScreenTui(
     render();
   });
 
-  // Enter Alternate Screen Buffer + Disable raw mouse coordinate tracking (\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l)
-  // + Enable xterm Alternate Scroll Mode (\x1b[?1007h so mouse wheel sends clean Up/Down arrows!)
-  // + Disable Auto-Wrap (\x1b[?7l) + Hide hardware cursor (\x1b[?25l)
-  emitKeypressEvents(stdin);
+  // Enter Alternate Screen Buffer + Enable Button-Drag SGR Mouse Mode (\x1b[?1002h\x1b[?1006h — only reports button press/drag/wheel, NEVER hover!)
+  // Mouse sequences are intercepted in `onRawStdinData` BEFORE `keyboardStream`, so they NEVER leak into the input box!
   if (stdin.isTTY) stdin.setRawMode(true);
   stdin.resume();
   stdout.write(
-    "\x1b[?1049h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1007h\x1b[?7l\x1b[?25l\x1b[2J\x1b[H",
+    "\x1b[?1049h\x1b[?1003l\x1b[?1002h\x1b[?1006h\x1b[?7l\x1b[?25l\x1b[2J\x1b[H",
   );
 
   stdout.on("resize", onResize);
-  stdin.on("keypress", onKeypress);
+  stdin.on("data", onRawStdinData);
+  keyboardStream.on("keypress", onKeypress);
   render(true);
 
   if (initialPrompt && initialPrompt.trim()) {
@@ -1644,6 +1771,13 @@ export interface FullScreenModalState {
   items: ModalOption[];
 }
 
+export interface PaneSelectionRange {
+  startRow: number;
+  startCol: number;
+  endRow: number;
+  endCol: number;
+}
+
 export interface FullScreenTuiState {
   cols: number;
   rows: number;
@@ -1678,6 +1812,7 @@ export interface FullScreenTuiState {
   selectedSuggestionIdx: number;
   modal: FullScreenModalState | null;
   notice: string | null;
+  selection?: PaneSelectionRange | null;
 }
 
 /**
@@ -1985,7 +2120,21 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
   const visibleSlice = wrappedTranscript.slice(startIdx, endIdx);
 
   const leftRows: string[] = [];
-  for (const line of visibleSlice) {
+  const normSel = state.selection ? normalizeSelection(state.selection) : null;
+
+  for (let r = 0; r < visibleSlice.length; r++) {
+    let line = visibleSlice[r]!;
+    if (normSel && r >= normSel.startRow && r <= normSel.endRow) {
+      const plain = stripAnsi(line);
+      const fromC = r === normSel.startRow ? Math.max(0, normSel.startCol) : 0;
+      const toC = r === normSel.endRow ? Math.min(plain.length, normSel.endCol + 1) : plain.length;
+      if (toC > fromC && fromC < plain.length) {
+        line =
+          plain.slice(0, fromC) +
+          `\x1b[7m${plain.slice(fromC, toC)}\x1b[27m` +
+          plain.slice(toC);
+      }
+    }
     leftRows.push(
       hasSidebar ? fitLineToWidth(` ${line}`, mainWidth) : truncateLineToWidth(` ${line}`, mainWidth),
     );
@@ -2173,9 +2322,88 @@ export function renderFullScreenAnsiBuffer(
 }
 
 export interface SgrMouseEvent {
-  type: "wheel_up" | "wheel_down" | "click";
+  type: "down" | "drag" | "up" | "wheel_up" | "wheel_down" | "click";
   x: number;
   y: number;
+}
+
+function normalizeSelection(sel: PaneSelectionRange): PaneSelectionRange {
+  if (
+    sel.startRow < sel.endRow ||
+    (sel.startRow === sel.endRow && sel.startCol <= sel.endCol)
+  ) {
+    return sel;
+  }
+  return {
+    startRow: sel.endRow,
+    startCol: sel.endCol,
+    endRow: sel.startRow,
+    endCol: sel.startCol,
+  };
+}
+
+/**
+ * OpenTUI-style Pane-Scoped Selection Extractor:
+ * Extracts selected text ONLY from the Left Transcript Pane lines (`visibleLines`),
+ * completely excluding the Right Sidebar (`│ ...`) and trimming trailing whitespace.
+ */
+export function extractPaneScopedSelection(
+  visibleLines: string[],
+  sel: PaneSelectionRange,
+): string {
+  const norm = normalizeSelection(sel);
+  const extracted: string[] = [];
+
+  for (let r = norm.startRow; r <= norm.endRow; r++) {
+    if (r < 0 || r >= visibleLines.length) continue;
+    const plain = stripAnsi(visibleLines[r]!);
+    const startCol = r === norm.startRow ? Math.max(0, norm.startCol) : 0;
+    const endCol = r === norm.endRow ? Math.min(plain.length, norm.endCol + 1) : plain.length;
+    if (endCol >= startCol) {
+      let slice = plain.slice(startCol, endCol).trimEnd();
+      if (startCol === 0) {
+        slice = slice.replace(/^  /, "");
+      }
+      extracted.push(slice);
+    }
+  }
+
+  return extracted.join("\n").trim();
+}
+
+/**
+ * Splits a raw `stdin` chunk into parsed SGR mouse events (`down`, `drag`, `up`, `wheel_up`, `wheel_down`)
+ * and pure keyboard text BEFORE `readline.emitKeypressEvents` ever sees the bytes.
+ */
+export function splitMouseAndKeyboardBytes(chunk: Buffer | string): {
+  keyboardText: string;
+  mouseEvents: SgrMouseEvent[];
+} {
+  const raw = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  const mouseEvents: SgrMouseEvent[] = [];
+  // eslint-disable-next-line no-control-regex
+  const sgrRegex = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+
+  let match: RegExpExecArray | null;
+  while ((match = sgrRegex.exec(raw)) !== null) {
+    const btn = Number(match[1]);
+    const x = Number(match[2]);
+    const y = Number(match[3]);
+    const isRelease = match[4] === "m";
+
+    if (btn === 64) {
+      mouseEvents.push({ type: "wheel_up", x, y });
+    } else if (btn === 65) {
+      mouseEvents.push({ type: "wheel_down", x, y });
+    } else if ((btn & 32) !== 0 && !isRelease) {
+      mouseEvents.push({ type: "drag", x, y });
+    } else if ((btn & 3) === 0) {
+      mouseEvents.push({ type: isRelease ? "up" : "down", x, y });
+    }
+  }
+
+  const keyboardText = stripMouseEscapeGarbage(raw.replace(sgrRegex, ""));
+  return { keyboardText, mouseEvents };
 }
 
 /**
@@ -2193,7 +2421,7 @@ export function stripMouseEscapeGarbage(text: string): string {
 }
 
 /**
- * Parses SGR mouse escape sequences (`\x1b[<btn;x;yM`).
+ * Parses a single SGR mouse escape sequence (`\x1b[<btn;x;yM`).
  */
 export function parseSgrMouseEvent(raw: string): SgrMouseEvent | null {
   const m = raw.match(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
