@@ -42,6 +42,7 @@ export async function startFullScreenTui(
   agent: AivoAgent,
   initialKeyStatus: KeyInspectStatus | null,
   fetchFn: typeof fetch = fetch,
+  initialPrompt?: string,
 ): Promise<void> {
   if (!stdin.isTTY || !stdout.isTTY) {
     return;
@@ -84,7 +85,11 @@ export async function startFullScreenTui(
   let pendingStrategyResolve: ((choice: "subagent-driven" | "native") => void) | null = null;
 
   const computeState = (): FullScreenTuiState => {
-    const sysPrompt = buildSystemPrompt(agent.config.cwd, agent.config.mode);
+    const sysPrompt = buildSystemPrompt(
+      agent.config.cwd,
+      agent.config.mode,
+      agent.config.team,
+    );
     const usedCtx = estimateConversationTokens(sysPrompt, agent.session.messages);
     const modelInfo = agent.getActiveModelInfo();
     const maxCtx = modelInfo?.contextWindow ?? 1_000_000;
@@ -1579,6 +1584,10 @@ export async function startFullScreenTui(
   stdin.on("keypress", onKeypress);
   render(true);
 
+  if (initialPrompt && initialPrompt.trim()) {
+    void executePromptOrCommand(initialPrompt.trim());
+  }
+
   return new Promise<void>((resPromise) => {
     exitResolve = resPromise;
   });
@@ -1685,30 +1694,65 @@ export function fitLineToWidth(line: string, width: number): string {
 }
 
 /**
- * Word-wraps plain or styled text lines so they fit inside `maxWidth` columns.
+ * Word-wraps plain or ANSI-styled text lines so they fit inside `maxWidth` columns
+ * without truncating long styled Markdown sentences.
  */
 export function wrapTranscriptLines(lines: string[], maxWidth: number): string[] {
   if (maxWidth <= 8) return lines;
   const wrapped: string[] = [];
+
   for (const raw of lines) {
     const subLines = raw.split(/\r?\n/);
     for (const line of subLines) {
       if (visibleLength(line) <= maxWidth) {
         wrapped.push(line);
-      } else {
-        // If line has ANSI codes, fit or wrap plain text
-        const plain = stripAnsi(line);
-        const hasAnsi = plain.length !== line.length;
-        if (hasAnsi) {
-          wrapped.push(fitLineToWidth(line, maxWidth));
-        } else {
-          let rest = plain;
-          while (rest.length > maxWidth) {
-            wrapped.push(rest.slice(0, maxWidth));
-            rest = "  " + rest.slice(maxWidth);
+        continue;
+      }
+
+      // Tokenize into ANSI sequences and single visible code units, wrapping at word boundaries
+      const tokens: Array<{ isAnsi: boolean; val: string }> = [];
+      let i = 0;
+      while (i < line.length) {
+        if (line[i] === "\x1b" && line[i + 1] === "[") {
+          const endSeq = line.indexOf("m", i);
+          if (endSeq !== -1) {
+            tokens.push({ isAnsi: true, val: line.slice(i, endSeq + 1) });
+            i = endSeq + 1;
+            continue;
           }
-          if (rest.length > 0) wrapped.push(rest);
         }
+        tokens.push({ isAnsi: false, val: line[i]! });
+        i++;
+      }
+
+      let curLine = "";
+      let curVis = 0;
+      let activeAnsi = "";
+
+      for (let t = 0; t < tokens.length; t++) {
+        const tok = tokens[t]!;
+        if (tok.isAnsi) {
+          curLine += tok.val;
+          if (tok.val === "\x1b[0m" || tok.val === "\x1b[22m" || tok.val === "\x1b[39m") {
+            activeAnsi = "";
+          } else {
+            activeAnsi += tok.val;
+          }
+          continue;
+        }
+
+        curLine += tok.val;
+        curVis++;
+
+        if (curVis >= maxWidth) {
+          wrapped.push(curLine + (activeAnsi ? "\x1b[0m" : ""));
+          curLine = "  " + activeAnsi;
+          curVis = 2;
+        }
+      }
+
+      if (curVis > 0 && stripAnsi(curLine).trim().length > 0) {
+        wrapped.push(curLine + (activeAnsi ? "\x1b[0m" : ""));
       }
     }
   }

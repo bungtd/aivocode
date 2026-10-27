@@ -196,10 +196,15 @@ function buildAnthropicMessagesBody(opts: StreamTurnOptions): Record<string, unk
         m.images && m.images.length > 0
           ? buildMultimodalContentForWire(m.content, m.images, "messages")
           : [{ type: "text", text: m.content }];
-      anthropicMessages.push({
-        role: "user",
-        content: blocks,
-      });
+      const prev = anthropicMessages[anthropicMessages.length - 1];
+      if (prev && prev.role === "user" && Array.isArray(prev.content)) {
+        (prev.content as Array<Record<string, unknown>>).push(...blocks);
+      } else {
+        anthropicMessages.push({
+          role: "user",
+          content: blocks,
+        });
+      }
     } else if (m.role === "assistant") {
       const blocks: Array<Record<string, unknown>> = [];
       if (m.content) {
@@ -587,6 +592,8 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
 
   // wire === "responses"
   const toolCalls: ToolCall[] = [];
+  const respToolStreams = new Map<number, { name: string; args: string }>();
+
   for await (const data of iterateSseData(res.body)) {
     if (data === "[DONE]") break;
     let event: Record<string, unknown>;
@@ -606,6 +613,34 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
     } else if (type === "response.output_text.delta" && typeof event.delta === "string") {
       text += event.delta;
       opts.onTextDelta?.(event.delta);
+    } else if (
+      type === "response.output_item.added" &&
+      typeof event.item === "object" &&
+      event.item !== null
+    ) {
+      const idx = typeof event.output_index === "number" ? event.output_index : 0;
+      const item = event.item as Record<string, unknown>;
+      if (item.type === "function_call" && typeof item.name === "string") {
+        respToolStreams.set(idx, { name: item.name, args: "" });
+      }
+    } else if (
+      type === "response.function_call_arguments.delta" &&
+      typeof event.delta === "string"
+    ) {
+      const idx = typeof event.output_index === "number" ? event.output_index : 0;
+      let entry = respToolStreams.get(idx);
+      if (!entry) {
+        entry = { name: "tool", args: "" };
+        respToolStreams.set(idx, entry);
+      }
+      entry.args += event.delta;
+      if (opts.onToolCallProgress) {
+        const lines = (entry.args.match(/\\n/g)?.length ?? 0) + 1;
+        const pathMatch = entry.args.match(/"path"\s*:\s*"([^"]+)"/);
+        const target = pathMatch?.[1] ? `${entry.name}(${pathMatch[1]})` : entry.name;
+        const tail = entry.args.slice(-180).replace(/\\n/g, " ↵ ").replace(/\\"/g, '"');
+        opts.onToolCallProgress(target, entry.args.length, lines, tail);
+      }
     } else if (
       type === "response.output_item.done" &&
       typeof event.item === "object" &&

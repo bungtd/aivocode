@@ -53,6 +53,7 @@ export interface ToolsetOptions {
   skills?: SkillRegistry;
   backgroundJobs?: BackgroundJobManager;
   webSearchRouter?: ClientWebSearchRouter;
+  webSearchEnabled?: boolean;
   readOnlyOnly?: boolean;
   confirmAction?: (description: string) => Promise<boolean>;
   onSubagent?: (input: {
@@ -714,6 +715,7 @@ export function createToolset(opts: ToolsetOptions) {
 
           const lines = patchText.replace(/\r\n/g, "\n").split("\n");
           const touched: string[] = [];
+          let lastDiff: ToolExecutionDiff | undefined;
           let i = 0;
 
           while (i < lines.length) {
@@ -728,17 +730,22 @@ export function createToolset(opts: ToolsetOptions) {
                 i++;
               }
               const abs = resolveWorkspacePath(opts.cwd, relPath);
+              const before = existsSync(abs) ? readFileSync(abs, "utf8") : "";
+              const after = contentLines.join("\n") + "\n";
               opts.checkpoints.snapshotBeforeWrite(abs);
               mkdirSync(dirname(abs), { recursive: true });
-              writeFileSync(abs, contentLines.join("\n") + "\n", "utf8");
+              writeFileSync(abs, after, "utf8");
+              lastDiff = { filePath: relPath, before, after };
               touched.push(`added ${relPath}`);
               continue;
             }
             if (line.startsWith("*** Delete File:")) {
               const relPath = line.slice("*** Delete File:".length).trim();
               const abs = resolveWorkspacePath(opts.cwd, relPath);
+              const before = existsSync(abs) ? readFileSync(abs, "utf8") : "";
               opts.checkpoints.snapshotBeforeWrite(abs);
               if (existsSync(abs)) rmSync(abs, { force: true });
+              lastDiff = { filePath: relPath, before, after: "" };
               touched.push(`deleted ${relPath}`);
               i++;
               continue;
@@ -747,23 +754,89 @@ export function createToolset(opts: ToolsetOptions) {
               const relPath = line.slice("*** Update File:".length).trim();
               const abs = resolveWorkspacePath(opts.cwd, relPath);
               i++;
-              const removedLines: string[] = [];
-              const addedLines: string[] = [];
+              if (!existsSync(abs)) {
+                return { isError: true, output: `apply_patch error: file not found: ${relPath}` };
+              }
+              const rawOriginal = readFileSync(abs, "utf8");
+              const usesCrlf = rawOriginal.includes("\r\n");
+              let cur = rawOriginal.replace(/\r\n/g, "\n");
+              const before = cur;
+
+              // Parse one or more @@ hunks inside this *** Update File section
+              const hunks: Array<{ oldLines: string[]; newLines: string[] }> = [];
+              let currentHunk: { oldLines: string[]; newLines: string[] } | null = null;
+
               while (i < lines.length && !lines[i]!.startsWith("*** ")) {
                 const l = lines[i]!;
-                if (l.startsWith("-") && !l.startsWith("---")) removedLines.push(l.slice(1));
-                else if (l.startsWith("+") && !l.startsWith("+++")) addedLines.push(l.slice(1));
+                if (l.startsWith("@@")) {
+                  if (currentHunk && (currentHunk.oldLines.length > 0 || currentHunk.newLines.length > 0)) {
+                    hunks.push(currentHunk);
+                  }
+                  currentHunk = { oldLines: [], newLines: [] };
+                  i++;
+                  continue;
+                }
+                if (l.startsWith("---") || l.startsWith("+++")) {
+                  i++;
+                  continue;
+                }
+                if (!currentHunk) {
+                  currentHunk = { oldLines: [], newLines: [] };
+                }
+                if (l.startsWith("-")) {
+                  currentHunk.oldLines.push(l.slice(1));
+                } else if (l.startsWith("+")) {
+                  currentHunk.newLines.push(l.slice(1));
+                } else if (l.startsWith(" ")) {
+                  currentHunk.oldLines.push(l.slice(1));
+                  currentHunk.newLines.push(l.slice(1));
+                } else if (l.length > 0) {
+                  currentHunk.oldLines.push(l);
+                  currentHunk.newLines.push(l);
+                }
                 i++;
               }
-              if (existsSync(abs) && removedLines.length > 0) {
-                const cur = readFileSync(abs, "utf8").replace(/\r\n/g, "\n");
-                const oldBlock = removedLines.join("\n");
-                const newBlock = addedLines.join("\n");
-                if (cur.includes(oldBlock)) {
-                  opts.checkpoints.snapshotBeforeWrite(abs);
-                  writeFileSync(abs, cur.replace(oldBlock, () => newBlock), "utf8");
-                  touched.push(`updated ${relPath}`);
+              if (currentHunk && (currentHunk.oldLines.length > 0 || currentHunk.newLines.length > 0)) {
+                hunks.push(currentHunk);
+              }
+
+              let appliedAny = false;
+              for (const hunk of hunks) {
+                const oldBlock = hunk.oldLines.join("\n");
+                const newBlock = hunk.newLines.join("\n");
+                if (oldBlock.length > 0 && cur.includes(oldBlock)) {
+                  cur = cur.replace(oldBlock, () => newBlock);
+                  appliedAny = true;
+                } else if (oldBlock.length > 0) {
+                  // Fallback: line-trimmed matching
+                  const curArr = cur.split("\n");
+                  const oldArr = hunk.oldLines;
+                  for (let s = 0; s <= curArr.length - oldArr.length; s++) {
+                    let ok = true;
+                    for (let k = 0; k < oldArr.length; k++) {
+                      if (curArr[s + k]!.trim() !== oldArr[k]!.trim()) {
+                        ok = false;
+                        break;
+                      }
+                    }
+                    if (ok) {
+                      curArr.splice(s, oldArr.length, ...hunk.newLines);
+                      cur = curArr.join("\n");
+                      appliedAny = true;
+                      break;
+                    }
+                  }
+                } else if (newBlock.length > 0) {
+                  cur = cur + (cur.endsWith("\n") ? "" : "\n") + newBlock + "\n";
+                  appliedAny = true;
                 }
+              }
+
+              if (appliedAny) {
+                opts.checkpoints.snapshotBeforeWrite(abs);
+                writeFileSync(abs, usesCrlf ? cur.replace(/\n/g, "\r\n") : cur, "utf8");
+                lastDiff = { filePath: relPath, before, after: cur };
+                touched.push(`updated ${relPath}`);
               }
               continue;
             }
@@ -771,12 +844,13 @@ export function createToolset(opts: ToolsetOptions) {
           }
 
           if (touched.length === 0) {
-            return { isError: true, output: "No valid *** Add/Update/Delete File sections found in patchText." };
+            return { isError: true, output: "No valid *** Add/Update/Delete File sections matched in patchText." };
           }
           return {
             output: `Applied patch: ${touched.join(", ")}`,
             summary: touched.join(", "),
             durationMs: Date.now() - startedAt,
+            diff: lastDiff,
           };
         }
 
@@ -860,6 +934,12 @@ export function createToolset(opts: ToolsetOptions) {
         }
 
         case "web_search": {
+          if (opts.webSearchEnabled === false) {
+            return {
+              isError: true,
+              output: "Web search is currently disabled in settings (enable with `/web on`).",
+            };
+          }
           const startedAt = Date.now();
           const query = String(args.query ?? "").trim();
           if (!query) return { isError: true, output: "query is required" };

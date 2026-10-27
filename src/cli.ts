@@ -719,6 +719,6 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     return 0;
   }
 
-  await startFullScreenTui(agent, keyStatus, fetchFn);
+  await startFullScreenTui(agent, keyStatus, fetchFn, parsed.prompt);
   return 0;
 }

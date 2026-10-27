@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { extname, isAbsolute, join, resolve } from "node:path";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { exec } from "node:child_process";
 import { createServer, type Server } from "node:http";
@@ -88,7 +88,8 @@ export async function ensureLocalPreviewServer(rootDir: string): Promise<string>
       const urlPath = decodeURIComponent((req.url ?? "/").split("?")[0] ?? "/");
       const rel = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, "");
       const filePath = resolve(rootDir, rel);
-      if (!filePath.startsWith(resolve(rootDir))) {
+      const relCheck = relative(resolve(rootDir), filePath);
+      if (relCheck.startsWith("..") || isAbsolute(relCheck)) {
         res.writeHead(403);
         res.end("Forbidden");
         return;

@@ -5,7 +5,7 @@ import {
   type TurnUsageMetrics,
 } from "./aivokey-client.js";
 import { AivoApiError } from "./errors.js";
-import { streamTurn } from "./protocol.js";
+import { streamTurn, type ChatMessage } from "./protocol.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { createToolset, type TodoItem, type ToolExecutionResult } from "./tools/index.js";
 import {
@@ -74,6 +74,8 @@ export interface AgentOptions {
   catalog?: AivoModelInfo[];
   sessionStore?: SessionStore;
   session?: AivoSession;
+  checkpoints?: CheckpointManager;
+  ephemeralSession?: boolean;
   memory?: SelfLearningMemory;
   skills?: SkillRegistry;
   callbacks?: AgentCallbacks;
@@ -82,6 +84,40 @@ export interface AgentOptions {
   maxSteps?: number;
   readOnlyOnly?: boolean;
   allowSubagents?: boolean;
+}
+
+/**
+ * Ensures every assistant message with `toolCalls` has matching `role: "tool"` result messages.
+ * If a previous turn was interrupted mid-flight (e.g. via Esc), inserts synthetic cancelled
+ * tool result blocks so subsequent turns never fail upstream tool_call_id validation.
+ */
+export function sanitizeDanglingToolCalls(messages: ChatMessage[]): void {
+  let i = 0;
+  while (i < messages.length) {
+    const msg = messages[i]!;
+    if (msg.role === "assistant" && msg.toolCalls && msg.toolCalls.length > 0) {
+      const answeredIds = new Set<string>();
+      let j = i + 1;
+      while (j < messages.length && messages[j]!.role === "tool") {
+        if (messages[j]!.toolCallId) answeredIds.add(messages[j]!.toolCallId!);
+        j++;
+      }
+      const missing = msg.toolCalls.filter((tc) => !answeredIds.has(tc.id));
+      if (missing.length > 0) {
+        const synthetic: ChatMessage[] = missing.map((tc) => ({
+          role: "tool",
+          toolCallId: tc.id,
+          toolName: tc.name,
+          content: "[Tool call interrupted before completion]",
+          isError: true,
+        }));
+        messages.splice(j, 0, ...synthetic);
+        i = j + synthetic.length;
+        continue;
+      }
+    }
+    i++;
+  }
 }
 
 export interface RunPromptResult {
@@ -109,13 +145,15 @@ export class AivoAgent {
   private maxSteps: number;
   private readOnlyOnly: boolean;
   private allowSubagents: boolean;
+  private ephemeralSession: boolean;
 
   constructor(opts: AgentOptions) {
     this.config = { ...opts.config };
     this.catalog = opts.catalog ?? [];
-    this.checkpoints = new CheckpointManager();
+    this.checkpoints = opts.checkpoints ?? new CheckpointManager();
     this.todos = [];
     this.sessionStore = opts.sessionStore ?? new SessionStore();
+    this.ephemeralSession = opts.ephemeralSession ?? false;
     this.memory = opts.memory ?? new SelfLearningMemory();
     this.skills = opts.skills ?? new SkillRegistry({ cwd: this.config.cwd });
     this.backgroundJobs = new BackgroundJobManager();
@@ -135,6 +173,12 @@ export class AivoAgent {
     this.allowSubagents = opts.allowSubagents ?? true;
   }
 
+  private persistSession(): void {
+    if (!this.ephemeralSession) {
+      this.sessionStore.saveSession(this.session);
+    }
+  }
+
   getActiveModelInfo(): AivoModelInfo | undefined {
     return this.catalog.find((m) => m.id === this.config.model);
   }
@@ -148,7 +192,7 @@ export class AivoAgent {
       modifiedFiles: this.checkpoints.listModifiedFiles(),
     });
     const afterTokens = estimateConversationTokens(sys, this.session.messages);
-    this.sessionStore.saveSession(this.session);
+    this.persistSession();
     return { beforeTokens, afterTokens };
   }
 
@@ -275,6 +319,8 @@ export class AivoAgent {
           },
           catalog: this.catalog,
           sessionStore: this.sessionStore,
+          checkpoints: this.checkpoints,
+          ephemeralSession: true,
           memory: this.memory,
           skills: this.skills,
           fetchFn: this.fetchFn,
@@ -296,6 +342,13 @@ export class AivoAgent {
 
         try {
           const res = await stageAgent.runUserPrompt(stagePrompt, signal);
+          this.session.totalInputTokens += res.turnUsage.inputTokens;
+          this.session.totalOutputTokens += res.turnUsage.outputTokens;
+          this.session.totalCacheReadTokens += res.turnUsage.cacheReadTokens;
+          this.session.totalCacheWriteTokens += res.turnUsage.cacheWriteTokens;
+          this.session.totalCostMicro = (
+            BigInt(this.session.totalCostMicro || "0") + res.turnCostMicro
+          ).toString();
           subRecord.status = "completed";
           subRecord.logs.push("", "--- Final Stage Output ---", res.finalText);
           return res.finalText || "(stage finished)";
@@ -311,7 +364,10 @@ export class AivoAgent {
   }
 
   async runUserPrompt(rawPrompt: string, signal?: AbortSignal): Promise<RunPromptResult> {
-    this.checkpoints.beginTurn(`turn_${Date.now()}`);
+    if (!this.ephemeralSession) {
+      this.checkpoints.beginTurn(`turn_${Date.now()}`);
+    }
+    sanitizeDanglingToolCalls(this.session.messages);
 
     // 1. Strategy Selection & Initial Live Task Seeding for substantial builds
     if (this.allowSubagents && !this.readOnlyOnly) {
@@ -385,6 +441,15 @@ export class AivoAgent {
       );
     }
 
+    const totalUsage: TurnUsageMetrics = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    };
+    let totalCostMicro = 0n;
+    let totalCacheSavedMicro = 0n;
+
     const toolset = createToolset({
       cwd: this.config.cwd,
       mode: this.config.mode,
@@ -393,6 +458,7 @@ export class AivoAgent {
       memory: this.memory,
       skills: this.skills,
       backgroundJobs: this.backgroundJobs,
+      webSearchEnabled: this.config.webSearch,
       readOnlyOnly: this.readOnlyOnly,
       confirmAction: this.callbacks.confirmAction,
       fetchFn: this.fetchFn,
@@ -431,6 +497,8 @@ export class AivoAgent {
               },
               catalog: this.catalog,
               sessionStore: this.sessionStore,
+              checkpoints: this.checkpoints,
+              ephemeralSession: true,
               memory: this.memory,
               skills: this.skills,
               fetchFn: this.fetchFn,
@@ -451,6 +519,19 @@ export class AivoAgent {
             });
             try {
               const subRes = await subAgent.runUserPrompt(prompt, signal);
+              totalUsage.inputTokens += subRes.turnUsage.inputTokens;
+              totalUsage.outputTokens += subRes.turnUsage.outputTokens;
+              totalUsage.cacheReadTokens += subRes.turnUsage.cacheReadTokens;
+              totalUsage.cacheWriteTokens += subRes.turnUsage.cacheWriteTokens;
+              totalCostMicro += subRes.turnCostMicro;
+              totalCacheSavedMicro += subRes.turnCacheSavedMicro;
+              this.session.totalInputTokens += subRes.turnUsage.inputTokens;
+              this.session.totalOutputTokens += subRes.turnUsage.outputTokens;
+              this.session.totalCacheReadTokens += subRes.turnUsage.cacheReadTokens;
+              this.session.totalCacheWriteTokens += subRes.turnUsage.cacheWriteTokens;
+              this.session.totalCostMicro = (
+                BigInt(this.session.totalCostMicro || "0") + subRes.turnCostMicro
+              ).toString();
               subRecord.status = "completed";
               subRecord.logs.push("", "--- Subagent Report ---", subRes.finalText);
               return subRes.finalText || "(subagent completed with no output)";
@@ -468,14 +549,6 @@ export class AivoAgent {
         : undefined,
     });
 
-    const totalUsage: TurnUsageMetrics = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      cacheWriteTokens: 0,
-    };
-    let totalCostMicro = 0n;
-    let totalCacheSavedMicro = 0n;
     let finalText = "";
     let steps = 0;
     let reviewFixPassDone = false;
@@ -597,6 +670,8 @@ export class AivoAgent {
                   },
                   catalog: this.catalog,
                   sessionStore: this.sessionStore,
+                  checkpoints: this.checkpoints,
+                  ephemeralSession: true,
                   memory: this.memory,
                   skills: this.skills,
                   fetchFn: this.fetchFn,
@@ -628,7 +703,7 @@ export class AivoAgent {
         }
 
         finalText = stepRes.text;
-        this.sessionStore.saveSession(this.session);
+        this.persistSession();
         break;
       }
 
@@ -709,7 +784,7 @@ export class AivoAgent {
         });
       }
 
-      this.sessionStore.saveSession(this.session);
+      this.persistSession();
     }
 
     // OpenCode V2 rule: if `maxSteps` was reached while the last message was a tool result,
@@ -747,7 +822,7 @@ export class AivoAgent {
         for (const t of this.todos) t.status = "completed";
         this.callbacks.onTodoUpdate?.(this.todos);
       }
-      this.sessionStore.saveSession(this.session);
+      this.persistSession();
     }
 
     return {

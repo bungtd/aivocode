@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { exec, spawn, type ChildProcess } from "node:child_process";
 
 export interface BackgroundJob {
   id: string;
@@ -118,6 +118,9 @@ export class BackgroundJobManager {
     job.status = "killed";
     job.endedAt = new Date().toISOString();
     if (proc) {
+      if (process.platform === "win32" && typeof job.pid === "number") {
+        exec(`taskkill /PID ${job.pid} /T /F`, () => {});
+      }
       try {
         proc.kill();
       } catch {
