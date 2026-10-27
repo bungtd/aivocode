@@ -14,7 +14,120 @@ export interface WebSearchResult {
   sources: WebSearchSource[];
 }
 
-export type WebSearchProviderKind = "exa" | "tavily" | "firecrawl" | "brave" | "duckduckgo";
+export type WebSearchProviderKind =
+  | "exa-mcp"
+  | "parallel-mcp"
+  | "exa"
+  | "tavily"
+  | "firecrawl"
+  | "brave"
+  | "duckduckgo";
+
+export const EXA_MCP_BASE_URL = "https://mcp.exa.ai/mcp";
+export const PARALLEL_MCP_URL = "https://search.parallel.ai/mcp";
+
+/**
+ * Parses a JSON-RPC 2.0 or SSE (`data: {...}`) MCP response body and returns the first `result.content[].text`.
+ */
+export function parseMcpTextResponse(body: string): string | undefined {
+  const tryParseJson = (raw: string): string | undefined => {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith("{")) return undefined;
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        result?: { content?: Array<{ type?: string; text?: string }> };
+      };
+      const item = parsed.result?.content?.find((c) => typeof c.text === "string" && c.text.trim());
+      return item?.text;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const direct = tryParseJson(body);
+  if (direct) return direct;
+
+  for (const line of body.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    const extracted = tryParseJson(payload);
+    if (extracted) return extracted;
+  }
+  return undefined;
+}
+
+/**
+ * Parses Exa MCP `web_search_exa` / `get_code_context_exa` formatted text blocks into `WebSearchSource[]`.
+ */
+export function parseExaMcpSearchText(text: string, maxResults: number): WebSearchSource[] {
+  const sources: WebSearchSource[] = [];
+  const blocks = text.split(/\n(?=Title:\s)/g);
+
+  for (const block of blocks) {
+    if (sources.length >= maxResults) break;
+    const titleMatch = block.match(/^Title:\s*(.+)$/m);
+    const urlMatch = block.match(/^URL:\s*(https?:\/\/[^\s]+)$/m);
+    if (!urlMatch?.[1]) continue;
+
+    const pubMatch = block.match(/^Published:\s*(.+)$/m);
+    const publishedRaw = pubMatch?.[1]?.trim();
+    const publishedAt =
+      publishedRaw && publishedRaw !== "N/A" ? publishedRaw : undefined;
+
+    const highlightsIdx = block.search(/^(?:Code\/)?Highlights:\s*$/m);
+    let snippet: string | undefined;
+    if (highlightsIdx !== -1) {
+      snippet = block
+        .slice(highlightsIdx)
+        .replace(/^(?:Code\/)?Highlights:\s*\r?\n?/m, "")
+        .replace(/\n---\s*$/g, "")
+        .trim()
+        .slice(0, 800);
+    } else {
+      snippet = block.trim().slice(0, 600);
+    }
+
+    const titleRaw = titleMatch?.[1]?.trim();
+    sources.push({
+      title: titleRaw && titleRaw !== "N/A" ? titleRaw : urlMatch[1],
+      url: urlMatch[1].trim(),
+      ...(snippet ? { snippet } : {}),
+      ...(publishedAt ? { publishedAt } : {}),
+    });
+  }
+
+  return sources;
+}
+
+/**
+ * Parses Parallel MCP (`https://search.parallel.ai/mcp`) JSON text into `WebSearchSource[]`.
+ */
+export function parseParallelMcpSearchText(text: string, maxResults: number): WebSearchSource[] {
+  const parsed = JSON.parse(text) as {
+    results?: Array<{
+      url?: string;
+      title?: string;
+      publish_date?: string | null;
+      excerpts?: string[];
+    }>;
+  };
+  if (!Array.isArray(parsed.results)) {
+    throw new Error("Invalid Parallel MCP response payload");
+  }
+  return parsed.results
+    .filter((r) => typeof r.url === "string" && r.url.trim().length > 0)
+    .slice(0, maxResults)
+    .map((r) => ({
+      title: typeof r.title === "string" && r.title.trim() ? r.title.trim() : String(r.url),
+      url: String(r.url).trim(),
+      ...(Array.isArray(r.excerpts) && r.excerpts.length > 0
+        ? { snippet: r.excerpts.join("\n").replace(/\s+/g, " ").trim().slice(0, 800) }
+        : {}),
+      ...(typeof r.publish_date === "string" && r.publish_date
+        ? { publishedAt: r.publish_date }
+        : {}),
+    }));
+}
 
 interface ProviderHealth {
   cooldownUntil: number;
@@ -104,12 +217,20 @@ export class ClientWebSearchRouter {
     this.health.set(id, { failures: 0, cooldownUntil: 0 });
   }
 
-  private resolveCandidates(): WebSearchProviderKind[] {
+  private resolveCandidates(searchType?: "auto" | "fast" | "deep" | "code"): WebSearchProviderKind[] {
+    if (searchType === "code") {
+      return ["exa-mcp", "parallel-mcp", "duckduckgo"];
+    }
+
     const configured: WebSearchProviderKind[] = [];
+    // If user explicitly configured REST API keys, include those first
     if (this.env.EXA_API_KEY?.trim()) configured.push("exa");
     if (this.env.TAVILY_API_KEY?.trim()) configured.push("tavily");
     if (this.env.FIRECRAWL_API_KEY?.trim()) configured.push("firecrawl");
     if (this.env.BRAVE_API_KEY?.trim()) configured.push("brave");
+
+    // Always include OpenCode-style Keyless MCP providers (work with ZERO API keys!)
+    configured.push("exa-mcp", "parallel-mcp");
 
     if (this.preferred === "random" && configured.length > 1) {
       configured.sort(() => Math.random() - 0.5);
@@ -123,7 +244,7 @@ export class ClientWebSearchRouter {
       configured.unshift(this.preferred);
     }
 
-    // Always append zero-key DuckDuckGo fallback last
+    // Always append zero-key DuckDuckGo HTML fallback last
     configured.push("duckduckgo");
 
     const healthy = configured.filter((p) => !this.isCoolingDown(p));
@@ -134,19 +255,34 @@ export class ClientWebSearchRouter {
   async search(input: {
     query: string;
     maxResults?: number;
+    type?: "auto" | "fast" | "deep" | "code";
+    livecrawl?: "fallback" | "preferred";
     signal?: AbortSignal;
   }): Promise<WebSearchResult> {
     const query = input.query.trim();
     const maxResults = Math.min(20, Math.max(1, input.maxResults ?? 8));
-    const candidates = this.resolveCandidates();
+    const searchType = input.type ?? "auto";
+    const livecrawl = input.livecrawl ?? "fallback";
+    const candidates = this.resolveCandidates(searchType);
     const errors: string[] = [];
 
     for (const provider of candidates) {
-      if (this.isCoolingDown(provider) && provider !== "duckduckgo") {
+      if (
+        this.isCoolingDown(provider) &&
+        provider !== "duckduckgo" &&
+        !(searchType === "code" && provider === "exa-mcp")
+      ) {
         continue;
       }
       try {
-        const sources = await this.executeProvider(provider, query, maxResults, input.signal);
+        const sources = await this.executeProvider(
+          provider,
+          query,
+          maxResults,
+          searchType,
+          livecrawl,
+          input.signal,
+        );
         this.markSuccess(provider);
         return { provider, sources };
       } catch (err) {
@@ -161,8 +297,116 @@ export class ClientWebSearchRouter {
     provider: WebSearchProviderKind,
     query: string,
     maxResults: number,
+    searchType: "auto" | "fast" | "deep" | "code" = "auto",
+    livecrawl: "fallback" | "preferred" = "fallback",
     signal?: AbortSignal,
   ): Promise<WebSearchSource[]> {
+    // 1. OpenCode-style Keyless Exa MCP (`https://mcp.exa.ai/mcp` — works WITHOUT any API key!)
+    if (provider === "exa-mcp") {
+      const exaKey = this.env.EXA_API_KEY?.trim();
+      const queryParams = new URLSearchParams();
+      if (searchType === "code") {
+        queryParams.set("tools", "web_search_exa,get_code_context_exa,web_fetch_exa");
+      }
+      if (exaKey) {
+        queryParams.set("exaApiKey", exaKey);
+      }
+      const qs = queryParams.toString();
+      const mcpUrl = qs ? `${EXA_MCP_BASE_URL}?${qs}` : EXA_MCP_BASE_URL;
+
+      const toolName = searchType === "code" ? "get_code_context_exa" : "web_search_exa";
+      const toolArgs =
+        searchType === "code"
+          ? { query, numResults: maxResults }
+          : {
+              query,
+              type: searchType,
+              numResults: maxResults,
+              livecrawl,
+              contextMaxCharacters: 10_000,
+            };
+
+      const res = await this.fetchFn(mcpUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          "user-agent": USER_AGENT,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: toolName,
+            arguments: toolArgs,
+          },
+        }),
+        signal,
+      });
+
+      if (!res.ok) {
+        this.markCooldown("exa-mcp", res.status, res.headers.get("retry-after"));
+        throw new Error(`Exa MCP HTTP ${res.status}`);
+      }
+
+      const rawBody = await res.text();
+      const mcpText = parseMcpTextResponse(rawBody);
+      if (!mcpText) {
+        throw new Error("Exa MCP returned non-MCP response");
+      }
+      const sources = parseExaMcpSearchText(mcpText, maxResults);
+      if (sources.length === 0) {
+        throw new Error("Exa MCP returned 0 parseable sources");
+      }
+      return sources;
+    }
+
+    // 2. OpenCode-style Keyless Parallel MCP (`https://search.parallel.ai/mcp` — works WITHOUT any API key!)
+    if (provider === "parallel-mcp") {
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "user-agent": USER_AGENT,
+      };
+      if (this.env.PARALLEL_API_KEY?.trim()) {
+        headers.authorization = `Bearer ${this.env.PARALLEL_API_KEY.trim()}`;
+      }
+
+      const res = await this.fetchFn(PARALLEL_MCP_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "web_search",
+            arguments: {
+              objective: query,
+              search_queries: [query],
+            },
+          },
+        }),
+        signal,
+      });
+
+      if (!res.ok) {
+        this.markCooldown("parallel-mcp", res.status, res.headers.get("retry-after"));
+        throw new Error(`Parallel MCP HTTP ${res.status}`);
+      }
+
+      const rawBody = await res.text();
+      const mcpText = parseMcpTextResponse(rawBody);
+      if (!mcpText) {
+        throw new Error("Parallel MCP returned non-MCP response");
+      }
+      const sources = parseParallelMcpSearchText(mcpText, maxResults);
+      if (sources.length === 0) {
+        throw new Error("Parallel MCP returned 0 parseable sources");
+      }
+      return sources;
+    }
     if (provider === "exa") {
       const apiKey = this.env.EXA_API_KEY!.trim();
       const res = await this.fetchFn("https://api.exa.ai/search", {
@@ -436,15 +680,68 @@ export async function clientWebFetch(
     : timeoutSignal;
 
   const fetchFn = opts.fetchFn ?? fetch;
-  const res = await fetchFn(url, {
-    headers: {
-      "user-agent": USER_AGENT,
-      accept: "text/html,application/xhtml+xml,application/json,text/plain,*/*;q=0.8",
-    },
-    signal,
-  });
+
+  const tryExaMcpFetch = async (): Promise<ClientWebFetchResult | null> => {
+    if (format === "html" || /^https?:\/\/(?:localhost|127\.0\.0\.1)\b/i.test(url)) {
+      return null;
+    }
+    try {
+      const mcpRes = await fetchFn(EXA_MCP_BASE_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          "user-agent": USER_AGENT,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: {
+            name: "web_fetch_exa",
+            arguments: {
+              urls: [url],
+              maxCharacters: MAX_WEBFETCH_INLINE_CHARS,
+            },
+          },
+        }),
+        signal,
+      });
+      if (!mcpRes.ok) return null;
+      const mcpBody = await mcpRes.text();
+      const extractedText = parseMcpTextResponse(mcpBody);
+      if (extractedText && extractedText.trim().length > 0) {
+        return {
+          url,
+          contentType: "text/markdown",
+          content: extractedText.trim(),
+        };
+      }
+    } catch {
+      /* fallback failed */
+    }
+    return null;
+  };
+
+  let res: Response | null = null;
+  try {
+    res = await fetchFn(url, {
+      headers: {
+        "user-agent": USER_AGENT,
+        accept: "text/html,application/xhtml+xml,application/json,text/plain,*/*;q=0.8",
+      },
+      signal,
+    });
+  } catch (fetchErr) {
+    const exaFallback = await tryExaMcpFetch();
+    if (exaFallback) return exaFallback;
+    throw fetchErr;
+  }
 
   if (!res.ok) {
+    // If blocked by Cloudflare / 403 / 429 on direct fetch, fallback to Keyless Exa MCP `web_fetch_exa`!
+    const exaFallback = await tryExaMcpFetch();
+    if (exaFallback) return exaFallback;
     throw new Error(`HTTP ${res.status} (${res.statusText}) fetching ${url}`);
   }
 

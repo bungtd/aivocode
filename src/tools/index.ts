@@ -234,11 +234,37 @@ export function createToolset(opts: ToolsetOptions) {
     {
       name: "web_search",
       description:
-        "Search the web using the client-side multi-provider router (Exa, Tavily, Firecrawl, Brave, DuckDuckGo) for up-to-date information and docs.",
+        "Search the web using OpenCode-style keyless Exa MCP (mcp.exa.ai) & Parallel MCP (search.parallel.ai) with zero API keys required (plus optional Exa/Tavily/Firecrawl/Brave/DuckDuckGo failover). Set type='code' for code examples & SDK documentation.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "Search query" },
+          maxResults: { type: "number", description: "Max results (default: 8)" },
+          type: {
+            type: "string",
+            enum: ["auto", "fast", "deep", "code"],
+            description: "Search mode: 'auto' (default), 'fast', 'deep', or 'code' (SDK/library code examples)",
+          },
+          livecrawl: {
+            type: "string",
+            enum: ["fallback", "preferred"],
+            description: "Live crawl mode (default: 'fallback')",
+          },
+        },
+        required: ["query"],
+      },
+    },
+    {
+      name: "code_search",
+      description:
+        "Search for code examples, library/SDK documentation, and programming solutions via keyless Exa MCP (get_code_context_exa) with zero API keys required.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Programming/SDK query (e.g. 'React useState hook examples', 'Node.js test runner mocking')",
+          },
           maxResults: { type: "number", description: "Max results (default: 8)" },
         },
         required: ["query"],
@@ -933,6 +959,7 @@ export function createToolset(opts: ToolsetOptions) {
           };
         }
 
+        case "code_search":
         case "web_search": {
           if (opts.webSearchEnabled === false) {
             return {
@@ -944,11 +971,23 @@ export function createToolset(opts: ToolsetOptions) {
           const query = String(args.query ?? "").trim();
           if (!query) return { isError: true, output: "query is required" };
           const maxResults = typeof args.maxResults === "number" ? args.maxResults : 8;
-          const res = await webSearchRouter.search({ query, maxResults });
+          const searchType =
+            name === "code_search"
+              ? "code"
+              : args.type === "fast" || args.type === "deep" || args.type === "code"
+                ? args.type
+                : "auto";
+          const livecrawl = args.livecrawl === "preferred" ? "preferred" : "fallback";
+          const res = await webSearchRouter.search({
+            query,
+            maxResults,
+            type: searchType,
+            livecrawl,
+          });
           const formatted = res.sources
             .map(
               (s, idx) =>
-                `${idx + 1}. **${s.title}**\n   URL: ${s.url}${s.snippet ? `\n   Snippet: ${s.snippet}` : ""}`,
+                `${idx + 1}. **${s.title}**\n   URL: ${s.url}${s.publishedAt ? `\n   Published: ${s.publishedAt}` : ""}${s.snippet ? `\n   Highlights: ${s.snippet}` : ""}`,
             )
             .join("\n\n");
           return {
