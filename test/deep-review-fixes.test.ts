@@ -10,6 +10,7 @@ import {
   extractSelectedInputText,
   isNewlineKeyEvent,
   splitMouseAndKeyboardBytes,
+  stripMouseEscapeGarbage,
 } from "../src/ui/fullscreen.js";
 import { renderTerminalMarkdown } from "../src/ui/markdown.js";
 import { c, stripAnsi } from "../src/ui/theme.js";
@@ -469,5 +470,37 @@ describe("Deep Review Round 1 Fixes", () => {
     expect(plainVp).toContain("Baris kedua prompt");
     // Highlight ANSI sequence \x1b[7m must appear on the selected input substring
     expect(vp).toContain("\x1b[7mBaris pertama\x1b[27m");
+  });
+
+  it("9. resolves code-review findings: translates CSI-u & modifyOtherKeys sequences (Esc, Ctrl+C, Ctrl+K, Shift+Tab, Shift+Space), preserves multi-line paste without premature submit, protects literal '1;2;3m', and supports c++/filename code fences", () => {
+    // 1. CSI-u Esc, Ctrl+C, Ctrl+K, Shift+Tab, Shift+Space, and modifyOtherKeys Shift+Space
+    expect(splitMouseAndKeyboardBytes("\x1b[27u").keyboardText).toBe("\x1b");
+    expect(splitMouseAndKeyboardBytes("\x1b[99;5u").keyboardText).toBe("\x03");
+    expect(splitMouseAndKeyboardBytes("\x1b[107;5u").keyboardText).toBe("\x0b");
+    expect(splitMouseAndKeyboardBytes("\x1b[9;2u").keyboardText).toBe("\x1b[Z");
+    expect(splitMouseAndKeyboardBytes("A\x1b[32;2uB\x1b[27;2;32~C").keyboardText).toBe("A B C");
+    expect(splitMouseAndKeyboardBytes("\x1b[27;5;127~").keyboardText).toBe("\x7f");
+
+    // 2. Multi-line paste chunk normalizes \r\n and multi-char \r into \n so it doesn't prematurely submit
+    expect(splitMouseAndKeyboardBytes("const a = 1;\r\nconst b = 2;\rconst c = 3;").keyboardText).toBe(
+      "const a = 1;\nconst b = 2;\nconst c = 3;",
+    );
+    // Single plain Enter key (\r) remains \r so it submits
+    expect(splitMouseAndKeyboardBytes("\r").keyboardText).toBe("\r");
+
+    // 3. stripMouseEscapeGarbage preserves normal text like "1;2;3m" while stripping actual SGR mouse fragments
+    expect(stripMouseEscapeGarbage("ratio 1;2;3m and 10;20;30M")).toBe("ratio 1;2;3m and 10;20;30M");
+    expect(stripMouseEscapeGarbage("hello<35;84;19Mworld\x1b[<0;12;8m")).toBe("helloworld");
+
+    // 4. extractLastCodeBlock & renderTerminalMarkdown support c++, c#, and filename info strings
+    expect(extractLastCodeBlock("Here:\n```c++\nint main() { return 0; }\n```")).toBe(
+      "int main() { return 0; }",
+    );
+    expect(extractLastCodeBlock("Here:\n```ts src/index.ts\nexport const ok = true;\n```")).toBe(
+      "export const ok = true;",
+    );
+    const mdCpp = stripAnsi(renderTerminalMarkdown("```c++\nstd::cout << 1;\n```"));
+    expect(mdCpp).toContain("c++");
+    expect(mdCpp).toContain("std::cout << 1;");
   });
 });

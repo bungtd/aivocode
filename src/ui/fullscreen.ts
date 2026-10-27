@@ -252,7 +252,7 @@ export async function startFullScreenTui(
       lastProgressRenderAt = now;
 
       if (streamingReasoningLineIdx !== null) {
-        transcriptLines.push(`${c.slate("╰─ End Thinking ───")}`);
+        transcriptLines.push(`${c.slate("  ── End Thinking ─────────────────────────────")}`);
         streamingReasoningLineIdx = null;
       }
       if (streamingToolProgressLineIdx === null) {
@@ -911,8 +911,12 @@ export async function startFullScreenTui(
       return;
     }
 
-    // Standard user prompt to LLM agent
-    transcriptLines.push(`${c.cyan("❯")} ${c.bold(c.white(line))}`);
+    // Standard user prompt to LLM agent (format multi-line prompts cleanly per line)
+    for (const [idx, subLine] of line.split(/\r?\n/).entries()) {
+      transcriptLines.push(
+        idx === 0 ? `${c.cyan("❯")} ${c.bold(c.white(subLine))}` : `  ${c.bold(c.white(subLine))}`,
+      );
+    }
     streamingAssistantLineIdx = null;
     streamingReasoningLineIdx = null;
     scrollOffset = 0;
@@ -1029,6 +1033,7 @@ export async function startFullScreenTui(
   const mapMouseToInputOffset = (
     x: number,
     y: number,
+    cols: number,
     layout: ReturnType<typeof getComposerLineLayout>,
   ): number => {
     const relRow = Math.max(
@@ -1036,8 +1041,18 @@ export async function startFullScreenTui(
       Math.min(layout.visibleLines.length - 1, y - layout.firstInputRowY),
     );
     const meta = layout.visibleLines[relRow]!;
+    const innerCompW = Math.max(10, cols - 4);
+    const maxInputChars = Math.max(10, innerCompW - 3);
+    const horizShift =
+      meta.text.length + 1 > maxInputChars
+        ? meta.text.length + 1 - (maxInputChars - 1)
+        : 0;
     // Input text starts at 1-based column 4 (` ❯ ` or `   ` is 3 columns: col 1..3)
-    const localCol = Math.max(0, Math.min(meta.text.length, x - 4));
+    const clickedVisCol = Math.max(0, x - 4);
+    const localCol =
+      horizShift > 0
+        ? Math.max(0, Math.min(meta.text.length, horizShift + Math.max(0, clickedVisCol - 1)))
+        : Math.max(0, Math.min(meta.text.length, clickedVisCol));
     return meta.startOffset + localCol;
   };
 
@@ -1050,6 +1065,11 @@ export async function startFullScreenTui(
     if (ev.type === "wheel_down") {
       scrollOffset = Math.max(0, scrollOffset - 4);
       render();
+      return;
+    }
+
+    // Never allow mouse clicks to overwrite an active modal (especially confirm / strategy modals)
+    if (modal) {
       return;
     }
 
@@ -1070,7 +1090,7 @@ export async function startFullScreenTui(
       if (ev.y >= compLayout.firstInputRowY - 1 && ev.y <= compLayout.lastInputRowY + 1) {
         selection = null;
         isDraggingSelection = false;
-        const offset = mapMouseToInputOffset(ev.x, ev.y, compLayout);
+        const offset = mapMouseToInputOffset(ev.x, ev.y, cols, compLayout);
         cursorPos = offset;
         inputSelection = { anchor: offset, focus: offset };
         isDraggingInputSelection = true;
@@ -1082,8 +1102,8 @@ export async function startFullScreenTui(
       inputSelection = null;
       isDraggingInputSelection = false;
 
-      // 2. Click in Right Sidebar -> open Subagent or Terminal Job Inspector
-      if (hasSb && ev.x > mainW) {
+      // 2. Click in Right Sidebar body rows -> open Subagent or Terminal Job Inspector
+      if (hasSb && ev.x > mainW && bodyRow >= 0 && bodyRow < bodyH) {
         selection = null;
         isDraggingSelection = false;
         if (agent.subagentRuns.length > 0) {
@@ -1120,7 +1140,7 @@ export async function startFullScreenTui(
 
     if (ev.type === "drag") {
       if (isDraggingInputSelection && inputSelection) {
-        const offset = mapMouseToInputOffset(ev.x, ev.y, compLayout);
+        const offset = mapMouseToInputOffset(ev.x, ev.y, cols, compLayout);
         cursorPos = offset;
         inputSelection = { anchor: inputSelection.anchor, focus: offset };
         render();
@@ -1492,13 +1512,13 @@ export async function startFullScreenTui(
       return;
     }
 
-    // 2. If agent is busy streaming, Esc or Ctrl+C interrupts the stream, and Ctrl+U/Ctrl+J inspect subagents/jobs
+    // 2. If agent is busy streaming, Esc or Ctrl+C interrupts the stream, and Ctrl+U/Alt+J inspect subagents/jobs
     if (activeAbort) {
       if (key?.name === "escape" || (key?.ctrl && key?.name === "c")) {
         activeAbort.abort();
       } else if (key?.ctrl && key?.name === "u") {
         openSubagentInspectorListModal();
-      } else if (key?.ctrl && key?.name === "j") {
+      } else if (key?.meta && key?.name === "j") {
         openJobsListModal();
       }
       return;
@@ -2106,7 +2126,7 @@ export function truncateLineToWidth(line: string, width: number): string {
  * or returns the full text if no code block is present.
  */
 export function extractLastCodeBlock(markdown: string): string {
-  const regex = /```(?:\w*)\r?\n([\s\S]*?)```/g;
+  const regex = /```[^\r\n]*\r?\n([\s\S]*?)```/g;
   let lastMatch: string | null = null;
   let m: RegExpExecArray | null;
   while ((m = regex.exec(markdown)) !== null) {
@@ -2116,15 +2136,18 @@ export function extractLastCodeBlock(markdown: string): string {
 }
 
 /**
- * Copies text directly to the OS clipboard (`Set-Clipboard` on Windows, `pbcopy` on macOS, `xclip` on Linux).
+ * Copies text directly to the OS clipboard (`Set-Clipboard` on Windows with explicit UTF-8 input encoding, `pbcopy` on macOS, `xclip` on Linux).
  */
 export function copyTextToSystemClipboard(text: string): boolean {
   try {
     if (process.platform === "win32") {
-      execSync("powershell.exe -NoProfile -Command \"$input | Set-Clipboard\"", {
-        input: text,
-        stdio: ["pipe", "ignore", "ignore"],
-      });
+      execSync(
+        'powershell.exe -NoProfile -Command "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())"',
+        {
+          input: text,
+          stdio: ["pipe", "ignore", "ignore"],
+        },
+      );
       return true;
     }
     if (process.platform === "darwin") {
@@ -2337,7 +2360,7 @@ function buildSidebarLines(state: FullScreenTuiState, width: number, height: num
 
   if (state.backgroundJobs && state.backgroundJobs.length > 0) {
     addDivider();
-    addSection(`Terminals (${state.backgroundJobs.length}) [Ctrl+J]`);
+    addSection(`Terminals (${state.backgroundJobs.length}) [Alt+J]`);
     for (const j of state.backgroundJobs.slice(-2)) {
       const stIcon = j.status === "running" ? c.emerald("●") : c.slate("○");
       addRow(`${stIcon} ${c.cyan(j.id)} ${j.detectedUrl ?? j.command.slice(0, 18)}`);
@@ -2609,16 +2632,27 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
       const rawLine = meta.text;
       let formattedLine: string;
 
+      const maxInputChars = Math.max(10, innerCompW - 3);
+      const horizShift =
+        rawLine.length + 1 > maxInputChars
+          ? rawLine.length + 1 - (maxInputChars - 1)
+          : 0;
+      const visibleRaw = horizShift > 0 ? rawLine.slice(horizShift) : rawLine;
+      const prefixEllipsis = horizShift > 0 ? "…" : "";
+
       if (hasInputSel) {
-        const localSelStart = Math.max(0, selStart - meta.startOffset);
-        const localSelEnd = Math.min(rawLine.length, selEnd - meta.startOffset);
-        if (localSelEnd > localSelStart && localSelStart < rawLine.length) {
-          const beforeSel = rawLine.slice(0, localSelStart);
-          const selectedPart = rawLine.slice(localSelStart, localSelEnd);
-          const afterSel = rawLine.slice(localSelEnd);
-          formattedLine = `${c.white(beforeSel)}\x1b[7m${selectedPart}\x1b[27m${c.white(afterSel)}`;
+        const localSelStart = Math.max(0, selStart - meta.startOffset - horizShift);
+        const localSelEnd = Math.min(
+          visibleRaw.length,
+          selEnd - meta.startOffset - horizShift,
+        );
+        if (localSelEnd > localSelStart && localSelStart < visibleRaw.length) {
+          const beforeSel = visibleRaw.slice(0, localSelStart);
+          const selectedPart = visibleRaw.slice(localSelStart, localSelEnd);
+          const afterSel = visibleRaw.slice(localSelEnd);
+          formattedLine = `${c.white(prefixEllipsis + beforeSel)}\x1b[7m${selectedPart}\x1b[27m${c.white(afterSel)}`;
         } else {
-          formattedLine = c.white(rawLine);
+          formattedLine = c.white(prefixEllipsis + visibleRaw);
         }
       } else if (
         state.cursorPos >= meta.startOffset &&
@@ -2628,14 +2662,13 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
         const before = rawLine.slice(0, localCur);
         const after = rawLine.slice(localCur);
         const withCaret = `${before}▏${after}`;
-        const maxInputChars = innerCompW - 3;
         const clipped =
           withCaret.length > maxInputChars
             ? "…" + withCaret.slice(withCaret.length - (maxInputChars - 1))
             : withCaret;
         formattedLine = c.white(clipped);
       } else {
-        formattedLine = c.white(rawLine);
+        formattedLine = c.white(prefixEllipsis + visibleRaw);
       }
 
       compMidRows.push(` ${truncateLineToWidth(`${linePrefix}${formattedLine}`, innerCompW)}`);
@@ -2772,11 +2805,50 @@ export function isNewlineKeyEvent(
   return false;
 }
 
+function translateCsiKeyCode(code: number, mod: number): string {
+  const modBits = Math.max(0, mod - 1);
+  const shift = (modBits & 1) !== 0;
+  const alt = (modBits & 2) !== 0;
+  const ctrl = (modBits & 4) !== 0;
+
+  if (code === 13) {
+    return mod > 1 ? "\n" : "\r";
+  }
+  if (code === 27) {
+    return "\x1b";
+  }
+  if (code === 9) {
+    return shift ? "\x1b[Z" : "\t";
+  }
+  if (code === 32) {
+    return " ";
+  }
+  if (code === 127 || code === 8) {
+    return "\x7f";
+  }
+  if (code >= 97 && code <= 122) {
+    if (ctrl) return String.fromCharCode(code - 96);
+    const ch = shift ? String.fromCharCode(code - 32) : String.fromCharCode(code);
+    return alt ? `\x1b${ch}` : ch;
+  }
+  if (code >= 65 && code <= 90) {
+    if (ctrl) return String.fromCharCode(code - 64);
+    const ch = String.fromCharCode(code);
+    return alt ? `\x1b${ch}` : ch;
+  }
+  if (code >= 33 && code <= 126) {
+    const ch = String.fromCharCode(code);
+    return alt ? `\x1b${ch}` : ch;
+  }
+  return "";
+}
+
 /**
  * Splits a raw `stdin` chunk into parsed SGR mouse events (`down`, `drag`, `up`, `wheel_up`, `wheel_down`)
  * and pure keyboard text BEFORE `readline.emitKeypressEvents` ever sees the bytes.
- * Also translates CSI-u / xterm modifyOtherKeys modified Enter (`\x1b[13;2u`, `\x1b[27;2;13~`) into `\n`
- * so `Shift+Enter` / `Ctrl+Enter` reliably inserts a newline across all terminals.
+ * Also translates CSI-u (`\x1b[code;modu`) and xterm modifyOtherKeys (`\x1b[27;mod;code~`) sequences
+ * into standard VT sequences so `Shift+Enter`, `Esc`, `Ctrl+C`, `Ctrl+K`, `Shift+Tab`, and `Shift+Space`
+ * work across all modern terminals, and normalizes multi-line paste chunks to `\n` so pasting never submits early.
  */
 export function splitMouseAndKeyboardBytes(chunk: Buffer | string): {
   keyboardText: string;
@@ -2805,14 +2877,24 @@ export function splitMouseAndKeyboardBytes(chunk: Buffer | string): {
     }
   }
 
-  const withoutMouse = raw
+  let withoutMouse = raw
     .replace(sgrRegex, "")
-    // Translate CSI-u / modifyOtherKeys Shift+Enter, Alt+Enter, Ctrl+Enter into \n (Line Feed -> `key.name === "enter"`)
+    // Translate Kitty CSI-u (\x1b[code;modu or \x1b[codeu)
     // eslint-disable-next-line no-control-regex
-    .replace(/\x1b\[(?:13;[2-8](?::\d+)?u|27;[2-8];13~)/g, "\n")
-    // Translate plain CSI-u Enter (\x1b[13u / \x1b[13;1u) into \r (Carriage Return -> `key.name === "return"`)
+    .replace(/\x1b\[(\d+)(?:;(\d+)(?::\d+)?)?u/g, (_m, cStr, mStr) =>
+      translateCsiKeyCode(Number(cStr), mStr ? Number(mStr) : 1),
+    )
+    // Translate xterm modifyOtherKeys (\x1b[27;mod;code~)
     // eslint-disable-next-line no-control-regex
-    .replace(/\x1b\[13(?:;1(?::\d+)?)?u/g, "\r");
+    .replace(/\x1b\[27;(\d+);(\d+)~/g, (_m, mStr, cStr) =>
+      translateCsiKeyCode(Number(cStr), Number(mStr)),
+    );
+
+  // Normalize CRLF and multi-character CR paste chunks to LF (\n) so multi-line paste inserts newlines instead of submitting
+  withoutMouse = withoutMouse.replace(/\r\n/g, "\n");
+  if (withoutMouse.length > 1 && withoutMouse.includes("\r")) {
+    withoutMouse = withoutMouse.replace(/\r/g, "\n");
+  }
 
   const keyboardText = stripMouseEscapeGarbage(withoutMouse);
   return { keyboardText, mouseEvents };
@@ -2822,12 +2904,12 @@ export function splitMouseAndKeyboardBytes(chunk: Buffer | string): {
  * Strips both complete and partial SGR / X10 mouse coordinate fragments
  * (e.g. `<35;84;19M`, `<35;84;`, `\x1b[<64;80;20M`) even when emitted character-by-character
  * by Node's `readline.emitKeypressEvents`, so mouse movement or wheel sequences can NEVER
- * pollute the text input buffer.
+ * pollute the text input buffer, while preserving normal text like `1;2;3m`.
  */
 export function stripMouseEscapeGarbage(text: string): string {
   return text
     // eslint-disable-next-line no-control-regex
-    .replace(/\x1b?\[?<?\d{1,3};\d{1,4};\d{1,4}[Mm]/g, "")
+    .replace(/(?:(?:\x1b\[<?|<)\d{1,3}|(?<!\d)(?:0|2|3[2-5]|6[45]));\d{1,4};\d{1,4}[Mm]/g, "")
     // eslint-disable-next-line no-control-regex
     .replace(/\x1b?\[?<\d+;\d+;?\d*$/g, "");
 }

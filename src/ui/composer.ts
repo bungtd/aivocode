@@ -90,8 +90,8 @@ export function computeComposerSuggestions(
       ? catalogModelIds
       : DEFAULT_AIVOKEY_CATALOG.map((m) => m.id);
 
-  // 1. Live `/` Command Palette when buffer starts with `/` and has no space yet
-  if (buffer.startsWith("/") && !buffer.includes(" ")) {
+  // 1. Live `/` Command Palette when buffer starts with `/` and has no space or newline yet
+  if (buffer.startsWith("/") && !buffer.includes(" ") && !buffer.includes("\n")) {
     const q = buffer.slice(1).toLowerCase();
     const matched = SLASH_COMMANDS.filter(
       (s) =>
@@ -111,7 +111,7 @@ export function computeComposerSuggestions(
   }
 
   // 2. Live Slash Argument Autocomplete (`/model ...`, `/subagent ...`, `/team ...`, `/effort ...`, `/mode ...`, `/wire ...`, `/strategy ...`, `/config ...`)
-  if (buffer.startsWith("/") && buffer.includes(" ")) {
+  if (buffer.startsWith("/") && buffer.includes(" ") && !buffer.includes("\n")) {
     const firstSpace = buffer.indexOf(" ");
     const cmd = buffer.slice(0, firstSpace).toLowerCase();
     const argQuery = buffer.slice(firstSpace + 1).trim().toLowerCase();
@@ -400,29 +400,30 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
         ? c.amber("❯ ")
         : c.cyan("❯ ");
 
-  let inputDisplay: string;
+  const middleRows: string[] = [];
   if (!opts.buffer) {
     const placeholder = "Ask anything, @file to attach, / for commands, !cmd for shell…";
-    inputDisplay = `${glyph}${c.white("▏")}${c.dim(placeholder)}`;
+    middleRows.push(` ${glyph}${c.white("▏")}${c.dim(placeholder)}`);
   } else {
     const beforeCursor = opts.buffer.slice(0, opts.cursorPos);
     const afterCursor = opts.buffer.slice(opts.cursorPos);
-    const rawLine = `${beforeCursor}▏${afterCursor}`;
+    const rawWithCaret = `${beforeCursor}▏${afterCursor}`;
     const maxChars = inner - 3;
-    const clipped =
-      rawLine.length > maxChars ? "…" + rawLine.slice(rawLine.length - (maxChars - 1)) : rawLine;
-    inputDisplay = `${glyph}${c.white(clipped)}`;
+    const rawLines = rawWithCaret.split("\n");
+    rawLines.forEach((rawLine, idx) => {
+      const clipped =
+        rawLine.length > maxChars ? "…" + rawLine.slice(rawLine.length - (maxChars - 1)) : rawLine;
+      const prefix = idx === 0 ? glyph : "   ";
+      middleRows.push(` ${prefix}${c.white(clipped)}`);
+    });
   }
-
-  // Borderless left/right so mouse selection copies pure input text without │ borders!
-  const middleRow = ` ${inputDisplay}`;
 
   const footerHint =
     "── Shift+Tab: Mode · Ctrl+K: Models · Ctrl+E: Effort · Ctrl+W: Wire · /: Cmds ";
   const bottomDashCount = Math.max(1, width - footerHint.length);
   const bottomBorder = borderColor(`${footerHint}${"─".repeat(bottomDashCount)}`);
 
-  const lines: string[] = [statusBar, topBorder, middleRow, bottomBorder];
+  const lines: string[] = [statusBar, topBorder, ...middleRows, bottomBorder];
 
   if (opts.notice) {
     lines.push(`  ${c.teal("⚡")} ${c.slate(opts.notice)}`);

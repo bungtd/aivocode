@@ -108,7 +108,7 @@ export function renderTerminalMarkdown(markdown: string): string {
   let codeLang = "";
 
   for (const rawLine of lines) {
-    const fenceMatch = rawLine.match(/^```(\w*)\s*$/);
+    const fenceMatch = rawLine.match(/^```([^\s`]*).*$/);
     if (fenceMatch) {
       if (!inCodeBlock) {
         inCodeBlock = true;
