@@ -85,9 +85,14 @@ export function resolveStepReasoningEffort(opts: {
   if (lastStepHadError) {
     return configuredEffort === "max" || configuredEffort === "xhigh" ? "high" : configuredEffort;
   }
-  // When a read-only Q&A task or pre-hydrated workspace task runs without errors, use 'low' consistently across steps
-  if (isReadOnlyQa || hasPrehydratedFiles) {
+  // When a read-only Q&A task or pre-hydrated workspace task runs without errors,
+  // or on follow-up steps (step >= 2), use 'low' consistently across steps
+  if (isReadOnlyQa || hasPrehydratedFiles || opts.step >= 2) {
     return "low";
+  }
+  // On Step 1 of unhydrated tasks, cap 'max'/'xhigh' to 'high' so initial prefill never stalls >30s
+  if (configuredEffort === "max" || configuredEffort === "xhigh") {
+    return "high";
   }
   return configuredEffort;
 }
@@ -108,7 +113,8 @@ export function buildSystemPrompt(
     `Permission mode: ${mode}`,
     [
       "## Core Engineering & Execution Rules",
-      "- Prefer dedicated tools (`read_file`, `edit_file`, `write_file`, `apply_patch`, `glob_files`, `grep_search`) over shell commands whenever possible, and batch independent tool calls in parallel in a single turn.",
+      "- Prefer dedicated tools (`read_file`, `edit_file`, `write_file`, `apply_patch`, `glob_files`, `grep_search`, `image_generate`) over shell commands whenever possible, and batch independent tool calls in parallel in a single turn.",
+      "- When asked to generate or edit an image (e.g. with `gemini-2.5-flash-image` or `gpt-image-2`), call the `image_generate` tool directly — never search the disk for API keys or write custom HTTP scripts for image generation.",
       "- When `<file path=\"...\">` or `<git_context>` blocks are already attached in the user message, use their contents directly without calling `read_file` or `git log` on those same items again.",
       "- Before editing an unattached file, read it with `read_file`. Never include the `1: ` line-number prefix in `edit_file` oldString or newString.",
       "- Anti-AI-Slop Mandate: NEVER leave `// TODO: implement`, `// ... rest of code`, fake mocked data, or unverified claims. Write complete, clean code.",

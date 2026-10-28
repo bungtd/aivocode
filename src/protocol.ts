@@ -39,6 +39,7 @@ export interface StreamTurnOptions {
   reasoningEffort?: ReasoningEffort;
   maxTokens?: number;
   webSearch?: boolean;
+  connectTimeoutMs?: number;
   chunkIdleTimeoutMs?: number;
   signal?: AbortSignal;
   fetchFn?: typeof fetch;
@@ -104,7 +105,7 @@ async function readWithIdleTimeout(
 
 async function* iterateSseData(
   stream: ReadableStream<Uint8Array>,
-  chunkIdleTimeoutMs: number = 25_000,
+  chunkIdleTimeoutMs: number = 90_000,
   onTimeoutAbort?: () => void,
 ): AsyncGenerator<string> {
   const reader = stream.getReader();
@@ -433,7 +434,8 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
         ? buildResponsesBody(opts)
         : buildChatCompletionsBody(opts);
 
-  const idleTimeout = opts.chunkIdleTimeoutMs ?? 30_000;
+  const connectTimeout = opts.connectTimeoutMs ?? opts.chunkIdleTimeoutMs ?? 180_000;
+  const idleTimeout = opts.chunkIdleTimeoutMs ?? 90_000;
   const connectAbort = new AbortController();
   const onParentAbort = () => connectAbort.abort();
   opts.signal?.addEventListener("abort", onParentAbort, { once: true });
@@ -449,7 +451,7 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
         signal: opts.signal ?? connectAbort.signal,
       }),
       new Promise<never>((_, reject) => {
-        if (idleTimeout > 0) {
+        if (connectTimeout > 0) {
           connectTimer = setTimeout(() => {
             connectAbort.abort();
             reject(
@@ -457,14 +459,14 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
                 status: 504,
                 code: "stream_stalled",
                 type: "upstream_error",
-                message: `Upstream connection timed out before response headers (${idleTimeout}ms)`,
+                message: `Upstream connection timed out before response headers (${connectTimeout}ms)`,
                 requestId: null,
                 resetAt: null,
                 retryAfterS: 1,
                 recoveryAction: "wait_and_retry",
               }),
             );
-          }, idleTimeout);
+          }, connectTimeout);
         }
       }),
     ]);

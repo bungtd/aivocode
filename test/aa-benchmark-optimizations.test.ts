@@ -201,4 +201,47 @@ describe("AA Benchmark Optimizations: Shell Normalization, Auto-Hydration, Strea
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("5. executes built-in image_generate tool via /v1/images/generations and saves PNG to workspace", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "aivo-img-gen-"));
+    try {
+      // Minimal valid 1x1 PNG base64
+      const png1x1Base64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+      let capturedUrl = "";
+      let capturedBody: Record<string, unknown> = {};
+
+      const tools = createToolset({
+        cwd: dir,
+        mode: "auto",
+        checkpoints: new CheckpointManager(),
+        todos: [],
+        apiKey: "sk-aivo_test_img",
+        baseUrl: "https://api.aivokey.dev",
+        fetchFn: async (input, init) => {
+          capturedUrl = String(input);
+          capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          return new Response(
+            JSON.stringify({
+              data: [{ b64_json: png1x1Base64 }],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        },
+      });
+
+      const res = await tools.execute("image_generate", {
+        prompt: "A red sports car colliding with a sport motorcycle",
+        model: "gemini-2.5-flash-image",
+        outputPath: "crash.png",
+      });
+      expect(res.isError).toBeFalsy();
+      expect(capturedUrl).toBe("https://api.aivokey.dev/v1/images/generations");
+      expect(capturedBody.model).toBe("gemini-2.5-flash-image");
+      expect(res.output).toContain("crash.png");
+      expect(res.output).toContain("1x1 image/png");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

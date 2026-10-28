@@ -10,11 +10,11 @@ import {
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { exec, spawn, spawnSync } from "node:child_process";
-import type { PermissionMode } from "../config.js";
+import { endpointUrl, normalizeModelId, type PermissionMode } from "../config.js";
 import type { ToolSpec } from "../protocol.js";
 import type { CheckpointManager } from "../checkpoint.js";
 import { ClientWebSearchRouter, clientWebFetch } from "../web.js";
-import { isImageFilePath, loadImageAttachment, type ImageAttachment } from "../vision.js";
+import { detectImageMagic, isImageFilePath, loadImageAttachment, type ImageAttachment } from "../vision.js";
 import { executeComputerUse, type ComputerUseAction, type ViewportPresetName } from "../computer-use.js";
 import { BackgroundJobManager } from "../background-jobs.js";
 import { SelfLearningMemory, type MemoryCategory } from "../memory.js";
@@ -49,6 +49,9 @@ export interface ToolsetOptions {
   mode: PermissionMode;
   checkpoints: CheckpointManager;
   todos: TodoItem[];
+  apiKey?: string;
+  baseUrl?: string;
+  defaultImageModel?: string;
   memory?: SelfLearningMemory;
   skills?: SkillRegistry;
   backgroundJobs?: BackgroundJobManager;
@@ -506,6 +509,34 @@ export function createToolset(opts: ToolsetOptions) {
         },
       },
       {
+        name: "image_generate",
+        description:
+          "Generate or edit an image using AivoKey's image models ('gemini-2.5-flash-image' or 'gpt-image-2') via /v1/images/generations or /v1/images/edits and save the resulting PNG/JPEG file to the workspace.",
+        parameters: {
+          type: "object",
+          properties: {
+            prompt: { type: "string", description: "Detailed image generation or edit prompt" },
+            outputPath: {
+              type: "string",
+              description: "Workspace file path to save the generated image (default: 'generated-image.png')",
+            },
+            model: {
+              type: "string",
+              description: "Image model ID on AivoKey (default: 'gemini-2.5-flash-image'; also supports 'gpt-image-2')",
+            },
+            size: {
+              type: "string",
+              description: "Image size such as '1024x1024' (default: '1024x1024')",
+            },
+            sourceImagePath: {
+              type: "string",
+              description: "Optional existing local image file path to edit via /v1/images/edits",
+            },
+          },
+          required: ["prompt"],
+        },
+      },
+      {
         name: "edit_file",
         description:
           "Replace exact text in a file (`oldString` -> `newString`). Preserves CRLF/LF line endings and records an undo checkpoint.",
@@ -756,6 +787,119 @@ export function createToolset(opts: ToolsetOptions) {
             summary: `${lineCount} lines`,
             durationMs: Date.now() - startedAt,
             diff: { filePath: rawPath, before, after: content },
+          };
+        }
+
+        case "image_generate": {
+          const startedAt = Date.now();
+          const prompt = String(args.prompt ?? "").trim();
+          if (!prompt) {
+            return { isError: true, output: "image_generate error: 'prompt' is required." };
+          }
+          const rawOut =
+            typeof args.outputPath === "string" && args.outputPath.trim()
+              ? args.outputPath.trim()
+              : "generated-image.png";
+          const guard = await checkMutationAllowed(`image_generate(${rawOut})`);
+          if (guard) return guard;
+
+          const apiKey = (opts.apiKey || process.env.AIVOKEY_API_KEY || "").trim();
+          if (!apiKey) {
+            return {
+              isError: true,
+              output: "image_generate error: AivoKey API key is not configured.",
+            };
+          }
+          const baseUrl = opts.baseUrl || "https://api.aivokey.dev";
+          const requestedModel = normalizeModelId(
+            typeof args.model === "string" && args.model.trim()
+              ? args.model
+              : opts.defaultImageModel || "gemini-2.5-flash-image",
+          );
+          const size =
+            typeof args.size === "string" && args.size.trim() ? args.size.trim() : "1024x1024";
+          const sourceRel =
+            typeof args.sourceImagePath === "string" ? args.sourceImagePath.trim() : "";
+
+          const fetchImpl = opts.fetchFn ?? fetch;
+          const isEdit = sourceRel.length > 0;
+          const url = isEdit
+            ? `${endpointUrl(baseUrl, "images").replace(/\/generations$/, "")}/edits`
+            : endpointUrl(baseUrl, "images");
+
+          const reqBody: Record<string, unknown> = {
+            model: requestedModel,
+            prompt,
+            size,
+            n: 1,
+          };
+          if (isEdit) {
+            const srcAttachment = loadImageAttachment(resolveWorkspacePath(opts.cwd, sourceRel));
+            reqBody.image = srcAttachment.dataUrl;
+          }
+
+          const res = await fetchImpl(url, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${apiKey}`,
+            },
+            body: JSON.stringify(reqBody),
+          });
+
+          const rawText = await res.text();
+          if (!res.ok) {
+            return {
+              isError: true,
+              output: `image_generate failed (${res.status}): ${rawText.slice(0, 500)}`,
+            };
+          }
+
+          let parsed: Record<string, unknown> = {};
+          try {
+            parsed = JSON.parse(rawText) as Record<string, unknown>;
+          } catch {
+            return {
+              isError: true,
+              output: `image_generate returned invalid JSON: ${rawText.slice(0, 300)}`,
+            };
+          }
+
+          const dataArr = Array.isArray(parsed.data) ? parsed.data : [];
+          const firstItem =
+            dataArr.length > 0 && typeof dataArr[0] === "object" && dataArr[0] !== null
+              ? (dataArr[0] as Record<string, unknown>)
+              : {};
+
+          let imgBuffer: Buffer | null = null;
+          if (typeof firstItem.b64_json === "string" && firstItem.b64_json.length > 0) {
+            imgBuffer = Buffer.from(firstItem.b64_json, "base64");
+          } else if (typeof firstItem.url === "string" && firstItem.url.length > 0) {
+            const dl = await fetchImpl(firstItem.url);
+            if (dl.ok) {
+              imgBuffer = Buffer.from(await dl.arrayBuffer());
+            }
+          }
+
+          if (!imgBuffer || imgBuffer.length === 0) {
+            return {
+              isError: true,
+              output: `image_generate response contained no image payload: ${rawText.slice(0, 300)}`,
+            };
+          }
+
+          const absOut = resolveWorkspacePath(opts.cwd, rawOut);
+          opts.checkpoints.snapshotBeforeWrite(absOut);
+          mkdirSync(dirname(absOut), { recursive: true });
+          writeFileSync(absOut, imgBuffer);
+
+          const magic = detectImageMagic(imgBuffer);
+          const dimInfo = magic ? `${magic.width}x${magic.height} ${magic.mimeType}` : "image";
+          const kb = Math.max(1, Math.round(imgBuffer.length / 1024));
+          return {
+            output: `Generated image using '${requestedModel}' and saved to ${rawOut} (${dimInfo}, ${kb} KB).`,
+            summary: `${rawOut} (${dimInfo}, ${kb} KB)`,
+            durationMs: Date.now() - startedAt,
           };
         }
 
@@ -1208,6 +1352,8 @@ export function createToolset(opts: ToolsetOptions) {
               windowsHide: true,
               env: {
                 ...process.env,
+                ...(opts.apiKey ? { AIVOKEY_API_KEY: opts.apiKey } : {}),
+                ...(opts.baseUrl ? { AIVOKEY_BASE_URL: opts.baseUrl } : {}),
                 GIT_TERMINAL_PROMPT: "0",
                 GIT_EDITOR: "true",
                 GIT_MERGE_AUTOEDIT: "no",

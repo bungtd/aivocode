@@ -460,11 +460,17 @@ export class AivoAgent {
     let totalCostMicro = 0n;
     let totalCacheSavedMicro = 0n;
 
+    const isPrimaryImageOutputModel =
+      /\bimage\b/i.test(this.config.model) && !/vision/i.test(this.config.model);
+
     const toolset = createToolset({
       cwd: this.config.cwd,
       mode: this.config.mode,
       checkpoints: this.checkpoints,
       todos: this.todos,
+      apiKey: this.config.apiKey,
+      baseUrl: this.config.baseUrl,
+      defaultImageModel: isPrimaryImageOutputModel ? this.config.model : "gemini-2.5-flash-image",
       memory: this.memory,
       skills: this.skills,
       backgroundJobs: this.backgroundJobs,
@@ -573,16 +579,22 @@ export class AivoAgent {
       const hasImagesInConversation = this.session.messages.some(
         (m) => m.images && m.images.length > 0,
       );
-      const effectiveModel = hasImagesInConversation
-        ? pickVisionCapableModel(this.config.model, this.catalog)
+      const baseOrchestratorModel = isPrimaryImageOutputModel
+        ? this.config.fastModel && !/\bimage\b/i.test(this.config.fastModel)
+          ? this.config.fastModel
+          : "deepseek-v4.1-flash"
         : this.config.model;
-      if (effectiveModel !== this.config.model) {
+      const effectiveModel = hasImagesInConversation
+        ? pickVisionCapableModel(baseOrchestratorModel, this.catalog)
+        : baseOrchestratorModel;
+      if (effectiveModel !== this.config.model && !isPrimaryImageOutputModel) {
         this.callbacks.onNotice?.(
           `Vision attachment detected — routing step via vision model '${effectiveModel}'`,
         );
       }
 
-      const stepEffort = resolveStepReasoningEffort({
+      const effectiveModelInfo = this.catalog.find((m) => m.id === effectiveModel) ?? modelInfo;
+      const rawStepEffort = resolveStepReasoningEffort({
         configuredEffort: this.config.reasoningEffort,
         step: steps,
         isReadOnlyQa,
@@ -590,6 +602,8 @@ export class AivoAgent {
         testsJustPassed,
         lastStepHadError,
       });
+      const stepEffort =
+        effectiveModelInfo && !effectiveModelInfo.supportsReasoning ? "off" : rawStepEffort;
       if (initialStepEffort === null) {
         initialStepEffort = stepEffort;
       }

@@ -69,6 +69,8 @@ export class AivoApiError extends Error {
       case "auth_unavailable":
       case "upstream_error":
         return `Temporary gateway/upstream issue (${this.message}).${reqTag}`;
+      case "stream_stalled":
+        return `Upstream stream timed out (${this.message}) — retrying on a fresh route...${reqTag}`;
       case "not_found":
         return `Not found (${this.message}). Verify model ID via /models.${reqTag}`;
       default:

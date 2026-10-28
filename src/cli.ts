@@ -300,10 +300,10 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
   if (parsed.command === "help") {
     writeOut(
       [
-        `${c.cyan(c.bold("◆ AivoCode (`aivo`) v1.0"))} — Native Full-Screen AI Coding Studio for AivoKey`,
+        `${c.cyan(c.bold("◆ AivoCode (`aivo`) v1.0"))} — Native AI Coding Studio for AivoKey`,
         "",
         c.bold("Usage:"),
-        "  aivo                          Launch Full-Screen Alt-Buffer TUI Studio (100% viewport)",
+        "  aivo                          Launch Interactive TUI Studio",
         "  aivo mini                     Launch compact inline terminal mode",
         "  aivo run \"<prompt>\"           Run a coding task non-interactively",
         "  aivo -p \"<prompt>\"            Alias for `aivo run`",
@@ -322,7 +322,7 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         "  --wire <chat|messages|responses> Protocol wire (default: chat)",
         "  --effort <off|minimal..max>   Reasoning effort level (default: off for instant streaming)",
         "  --mode <auto|safe|plan>       Permission mode (default: auto)",
-        "  --mini                        Use inline terminal mode instead of full-screen TUI",
+        "  --mini                        Use inline terminal mode instead of TUI Studio",
         "  --base-url <url>              AivoKey gateway URL (default: https://api.aivokey.dev)",
         "  --api-key <key>               AivoKey API key (or set AIVOKEY_API_KEY)",
         "  -c, --continue                Resume most recent session",
