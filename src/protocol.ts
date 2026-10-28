@@ -1,4 +1,5 @@
 import { endpointUrl, type AivoWire, type ReasoningEffort } from "./config.js";
+import { clientHeaders } from "./client-identity.js";
 import type { TurnUsageMetrics } from "./aivokey-client.js";
 import { AivoApiError, parseAivoErrorResponse } from "./errors.js";
 import { buildMultimodalContentForWire, type ImageAttachment } from "./vision.js";
@@ -169,6 +170,7 @@ async function* iterateSseData(
 
 function stickyHeaders(apiKey: string, sessionId: string, wire: AivoWire): Record<string, string> {
   const base: Record<string, string> = {
+    ...clientHeaders(),
     "content-type": "application/json",
     accept: "text/event-stream",
     "x-opencode-session": sessionId,

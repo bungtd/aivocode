@@ -11,6 +11,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { exec, spawn, spawnSync } from "node:child_process";
 import { endpointUrl, normalizeModelId, type PermissionMode } from "../config.js";
+import { clientHeaders } from "../client-identity.js";
 import type { ToolSpec } from "../protocol.js";
 import type { CheckpointManager } from "../checkpoint.js";
 import { ClientWebSearchRouter, clientWebFetch } from "../web.js";
@@ -841,6 +842,7 @@ export function createToolset(opts: ToolsetOptions) {
           const res = await fetchImpl(url, {
             method: "POST",
             headers: {
+              ...clientHeaders(),
               "content-type": "application/json",
               authorization: `Bearer ${apiKey}`,
             },

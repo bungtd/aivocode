@@ -1,4 +1,5 @@
 import { endpointUrl, DEFAULT_MODEL } from "./config.js";
+import { clientHeaders } from "./client-identity.js";
 
 export interface AivoModelInfo {
   id: string;
@@ -381,7 +382,7 @@ export async function fetchModels(
 ): Promise<AivoModelInfo[]> {
   const res = await fetchFn(endpointUrl(baseUrl, "models"), {
     method: "GET",
-    headers: { accept: "application/json" },
+    headers: { ...clientHeaders(), accept: "application/json" },
   });
   if (!res.ok) {
     throw new Error(`GET /v1/models failed with HTTP ${res.status}`);
@@ -411,6 +412,7 @@ export async function inspectKey(
   const res = await fetchFn(endpointUrl(baseUrl, "key"), {
     method: "GET",
     headers: {
+      ...clientHeaders(),
       authorization: `Bearer ${apiKey}`,
       accept: "application/json",
     },

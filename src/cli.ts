@@ -28,6 +28,7 @@ import { interactiveSelect } from "./ui/select.js";
 import { AivoAgent } from "./agent.js";
 import { formatDetailedStatus, formatModelsTable, startInteractiveRepl } from "./repl.js";
 import { startFullScreenTui } from "./ui/fullscreen.js";
+import { AIVO_CLIENT_VERSION } from "./client-identity.js";
 import { AGENT_TEAMS, type TeamId } from "./teams.js";
 import { SessionStore } from "./session.js";
 import {
@@ -51,6 +52,7 @@ export type CliCommand =
   | "doctor"
   | "login"
   | "sessions"
+  | "version"
   | "help";
 
 export interface ParsedCliArgs {
@@ -118,6 +120,8 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       filterFlag = "--free";
     } else if (arg === "-h" || arg === "--help") {
       positionals.unshift("help");
+    } else if (arg === "-v" || arg === "--version") {
+      positionals.unshift("version");
     } else {
       positionals.push(arg);
     }
@@ -180,6 +184,17 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       mini,
+      json,
+      cliConfig,
+    };
+  }
+  if (first === "version") {
+    return {
+      command: "version",
+      prompt: "",
+      filter: filterFlag,
+      sessionId,
+      continueLast,
       json,
       cliConfig,
     };
@@ -295,6 +310,11 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
   });
   if (parsed.command === "run" && !parsed.cliConfig.team) {
     delete config.team;
+  }
+
+  if (parsed.command === "version") {
+    writeOut(`aivocode ${AIVO_CLIENT_VERSION}`);
+    return 0;
   }
 
   if (parsed.command === "help") {
