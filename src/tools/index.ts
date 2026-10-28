@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { exec, spawn } from "node:child_process";
+import { exec, spawn, spawnSync } from "node:child_process";
 import type { PermissionMode } from "../config.js";
 import type { ToolSpec } from "../protocol.js";
 import type { CheckpointManager } from "../checkpoint.js";
@@ -86,6 +86,128 @@ const DANGEROUS_SHELL_PATTERNS = [
 ];
 
 const MAX_INLINE_OUTPUT_CHARS = 32_000;
+
+let cachedWinPowerShellBin: string | null = null;
+
+function detectWindowsPowerShellBin(): string {
+  if (cachedWinPowerShellBin) return cachedWinPowerShellBin;
+  if (process.platform !== "win32") {
+    cachedWinPowerShellBin = "/bin/sh";
+    return cachedWinPowerShellBin;
+  }
+  try {
+    const check = spawnSync("pwsh.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.Major"], {
+      encoding: "utf8",
+      timeout: 3000,
+      windowsHide: true,
+    });
+    if (check.status === 0 && Number(String(check.stdout).trim()) >= 7) {
+      cachedWinPowerShellBin = "pwsh.exe";
+      return cachedWinPowerShellBin;
+    }
+  } catch {
+    /* fallback to powershell.exe */
+  }
+  cachedWinPowerShellBin = "powershell.exe";
+  return cachedWinPowerShellBin;
+}
+
+/**
+ * Normalizes common POSIX and cmd.exe idioms (`2>/dev/null`, `ls -la`, `del`, `rm -f`,
+ * and `&&` / `||` when running on Windows PowerShell) so LLM shell commands succeed on the first try.
+ */
+export function normalizeWindowsShellCommand(
+  rawCommand: string,
+  hasPwsh7: boolean = detectWindowsPowerShellBin() === "pwsh.exe",
+): string {
+  let cmd = rawCommand.trim();
+  if (!cmd) return cmd;
+
+  if (/^dir\s+\/[a-z0-9]/i.test(cmd)) {
+    return `cmd.exe /c "${cmd.replace(/"/g, '\\"')}"`;
+  }
+
+  // Replace POSIX /dev/null redirections with PowerShell $null
+  cmd = cmd.replace(/2>\s*\/dev\/null\b/g, "2>$null");
+  cmd = cmd.replace(/1>\s*\/dev\/null\b/g, ">$null");
+  cmd = cmd.replace(/(?<![21])>\s*\/dev\/null\b/g, ">$null");
+
+  // Normalize standalone or chained `ls -la`, `del <file>`, `rm -rf <path>` segments
+  const transformSegment = (seg: string): string => {
+    const s = seg.trim();
+    if (/^ls\s+-[a-z0-9]+(\s+.*)?$/i.test(s)) {
+      const tail = s.replace(/^ls\s+-[a-z0-9]+\s*/i, "").trim();
+      return tail ? `Get-ChildItem -Force ${tail}` : "Get-ChildItem -Force";
+    }
+    if (/^del\s+([^\s;&|]+)$/i.test(s)) {
+      const target = s.replace(/^del\s+/i, "").trim();
+      return `Remove-Item -Force -ErrorAction SilentlyContinue ${target}`;
+    }
+    if (/^rm\s+-[rf]{1,2}\s+(.+)$/i.test(s)) {
+      const target = s.replace(/^rm\s+-[rf]{1,2}\s+/i, "").trim();
+      return `Remove-Item -Recurse -Force -ErrorAction SilentlyContinue ${target}`;
+    }
+    return s;
+  };
+
+  // Split top-level `&&` and `||` outside quotes so each segment can be normalized
+  const tokens: Array<{ type: "seg" | "op"; value: string }> = [];
+  let buf = "";
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      buf += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle && cmd[i - 1] !== "\\") {
+      inDouble = !inDouble;
+      buf += ch;
+      continue;
+    }
+    if (!inSingle && !inDouble) {
+      if (ch === "&" && cmd[i + 1] === "&") {
+        tokens.push({ type: "seg", value: transformSegment(buf) });
+        tokens.push({ type: "op", value: "&&" });
+        buf = "";
+        i++;
+        continue;
+      }
+      if (ch === "|" && cmd[i + 1] === "|") {
+        tokens.push({ type: "seg", value: transformSegment(buf) });
+        tokens.push({ type: "op", value: "||" });
+        buf = "";
+        i++;
+        continue;
+      }
+    }
+    buf += ch;
+  }
+  tokens.push({ type: "seg", value: transformSegment(buf) });
+
+  if (hasPwsh7) {
+    return tokens.map((t) => (t.type === "op" ? ` ${t.value} ` : t.value)).join("");
+  }
+
+  // Fallback for Windows PowerShell 5.1 which lacks `&&` and `||`
+  let rebuilt = "";
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]!;
+    if (tok.type === "seg") {
+      rebuilt += tok.value;
+    } else if (tok.value === "&&") {
+      rebuilt += "; ";
+    } else if (tok.value === "||") {
+      const nextSeg = tokens[i + 1]?.value ?? "";
+      i++;
+      rebuilt += `; if (-not $?) { ${nextSeg} }`;
+    }
+  }
+  return rebuilt;
+}
 
 function resolveWorkspacePath(cwd: string, p: string): string {
   const cleaned = p.trim();
@@ -198,7 +320,7 @@ export function createToolset(opts: ToolsetOptions) {
         properties: {
           path: { type: "string", description: "File or directory path" },
           offset: { type: "number", description: "1-based starting line number (default: 1)" },
-          limit: { type: "number", description: "Maximum lines to read (default: 500)" },
+          limit: { type: "number", description: "Maximum lines to read (default: 2000)" },
         },
         required: ["path"],
       },
@@ -576,7 +698,7 @@ export function createToolset(opts: ToolsetOptions) {
           const offset = Math.max(1, typeof args.offset === "number" ? Math.floor(args.offset) : 1);
           const limit = Math.max(
             1,
-            Math.min(2000, typeof args.limit === "number" ? Math.floor(args.limit) : 500),
+            Math.min(2000, typeof args.limit === "number" ? Math.floor(args.limit) : 2000),
           );
           const slice = lines.slice(offset - 1, offset - 1 + limit);
           const numbered = slice.map((line, i) => `${offset + i}: ${line}`).join("\n");
@@ -1034,15 +1156,10 @@ export function createToolset(opts: ToolsetOptions) {
           const guard = await checkMutationAllowed(`run_shell: ${command}`);
           if (guard) return guard;
 
-          // Translate cmd.exe / POSIX directory listing idioms on Windows PowerShell
-          // (fixes `dir /a` -> `Cannot find path 'C:\a'` in PowerShell)
+          // Translate cmd.exe / POSIX idioms on Windows PowerShell
+          const winShellBin = detectWindowsPowerShellBin();
           if (process.platform === "win32") {
-            if (/^dir\s+\/[a-z0-9]/i.test(command)) {
-              command = `cmd.exe /c "${command.replace(/"/g, '\\"')}"`;
-            } else if (/^ls\s+-[a-z]*a[a-z]*(\s+.*)?$/i.test(command)) {
-              const tail = command.replace(/^ls\s+-[a-z]+\s*/i, "").trim();
-              command = tail ? `Get-ChildItem -Force ${tail}` : "Get-ChildItem -Force";
-            }
+            command = normalizeWindowsShellCommand(command, winShellBin === "pwsh.exe");
           }
 
           const workdir = args.workdir
@@ -1058,7 +1175,7 @@ export function createToolset(opts: ToolsetOptions) {
                 durationMs: Date.now() - startedAt,
               };
             }
-            const shellBin = process.platform === "win32" ? "powershell.exe" : "/bin/sh";
+            const shellBin = process.platform === "win32" ? winShellBin : "/bin/sh";
             const shellArgs =
               process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-c", command];
             const child = spawn(shellBin, shellArgs, {
@@ -1080,30 +1197,83 @@ export function createToolset(opts: ToolsetOptions) {
               : 60_000;
 
           const output = await new Promise<{ text: string; code: number }>((resPromise) => {
-            exec(
-              command,
-              {
-                cwd: workdir,
-                timeout: timeoutMs,
-                maxBuffer: 8 * 1024 * 1024,
-                shell: process.platform === "win32" ? "powershell.exe" : "/bin/sh",
+            const shellBin = process.platform === "win32" ? winShellBin : "/bin/sh";
+            const shellArgs =
+              process.platform === "win32"
+                ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+                : ["-c", command];
+            const child = spawn(shellBin, shellArgs, {
+              cwd: workdir,
+              stdio: ["ignore", "pipe", "pipe"],
+              windowsHide: true,
+              env: {
+                ...process.env,
+                GIT_TERMINAL_PROMPT: "0",
+                GIT_EDITOR: "true",
+                GIT_MERGE_AUTOEDIT: "no",
+                GCM_INTERACTIVE: "never",
+                NO_COLOR: "1",
+                TERM: "dumb",
+                CI: "true",
               },
-              (err, stdout, stderr) => {
-                const combined = [stdout, stderr].filter(Boolean).join("\n").trim();
-                const exitCode =
-                  err && typeof (err as { code?: unknown }).code === "number"
-                    ? ((err as { code: number }).code)
-                    : err
-                      ? 1
-                      : 0;
-                resPromise({
-                  text:
-                    combined ||
-                    (exitCode === 0 ? "(no output)" : String(err?.message ?? "Command failed")),
-                  code: exitCode,
-                });
-              },
-            );
+            });
+            let outBuf = "";
+            let errBuf = "";
+            let settled = false;
+
+            const finish = (code: number, timedOut = false) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              try {
+                child.stdout?.destroy();
+                child.stderr?.destroy();
+              } catch {
+                /* ignore */
+              }
+              const rawCombined = [outBuf, errBuf]
+                .filter(Boolean)
+                .join("\n")
+                .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+                .trim();
+              resPromise({
+                text:
+                  rawCombined ||
+                  (code === 0 ? "(no output)" : timedOut ? "Command timed out" : "Command failed"),
+                code,
+              });
+            };
+
+            child.stdout.on("data", (d: Buffer) => {
+              if (outBuf.length < MAX_INLINE_OUTPUT_CHARS * 4) outBuf += d.toString("utf8");
+            });
+            child.stderr.on("data", (d: Buffer) => {
+              if (errBuf.length < MAX_INLINE_OUTPUT_CHARS * 4) errBuf += d.toString("utf8");
+            });
+
+            const timer = setTimeout(() => {
+              if (child.pid && process.platform === "win32") {
+                try {
+                  spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+                    stdio: "ignore",
+                    windowsHide: true,
+                  });
+                } catch {
+                  /* ignore */
+                }
+              } else {
+                child.kill("SIGKILL");
+              }
+              finish(124, true);
+            }, timeoutMs);
+
+            child.on("exit", (code) => {
+              setTimeout(() => finish(code ?? 0), 80);
+            });
+            child.on("error", (err) => {
+              errBuf += `\n${err.message}`;
+              finish(1);
+            });
           });
 
           let formatted = output.text;

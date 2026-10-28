@@ -9,11 +9,14 @@ import { streamTurn, type ChatMessage } from "./protocol.js";
 import { CheckpointManager } from "./checkpoint.js";
 import { createToolset, type TodoItem, type ToolExecutionResult } from "./tools/index.js";
 import {
+  areAllPromptFilesHydrated,
   buildSystemPrompt,
   compactConversation,
   estimateConversationTokens,
   expandFileMentions,
   extractPromptImageAttachments,
+  isReadOnlyQaPrompt,
+  resolveStepReasoningEffort,
 } from "./context.js";
 import { SessionStore, type AivoSession } from "./session.js";
 import { SelfLearningMemory } from "./memory.js";
@@ -84,6 +87,7 @@ export interface AgentOptions {
   maxSteps?: number;
   readOnlyOnly?: boolean;
   allowSubagents?: boolean;
+  chunkIdleTimeoutMs?: number;
 }
 
 /**
@@ -146,6 +150,7 @@ export class AivoAgent {
   private readOnlyOnly: boolean;
   private allowSubagents: boolean;
   private ephemeralSession: boolean;
+  private chunkIdleTimeoutMs?: number;
 
   constructor(opts: AgentOptions) {
     this.config = { ...opts.config };
@@ -171,6 +176,7 @@ export class AivoAgent {
     this.maxSteps = opts.maxSteps ?? 30;
     this.readOnlyOnly = opts.readOnlyOnly ?? false;
     this.allowSubagents = opts.allowSubagents ?? true;
+    this.chunkIdleTimeoutMs = opts.chunkIdleTimeoutMs;
   }
 
   private persistSession(): void {
@@ -415,7 +421,11 @@ export class AivoAgent {
       }
     }
 
+    const isReadOnlyQa = this.readOnlyOnly || isReadOnlyQaPrompt(rawPrompt);
     let expandedPrompt = expandFileMentions(rawPrompt, this.config.cwd);
+    const hasPrehydratedFiles = expandedPrompt.includes('<file path="');
+    const allQaFilesHydrated =
+      isReadOnlyQa && areAllPromptFilesHydrated(rawPrompt, expandedPrompt);
     const promptImages = extractPromptImageAttachments(rawPrompt, this.config.cwd);
 
     const recallBlock = this.memory.formatRecallBlock(rawPrompt, this.config.cwd, 3);
@@ -459,7 +469,7 @@ export class AivoAgent {
       skills: this.skills,
       backgroundJobs: this.backgroundJobs,
       webSearchEnabled: this.config.webSearch,
-      readOnlyOnly: this.readOnlyOnly,
+      readOnlyOnly: isReadOnlyQa,
       confirmAction: this.callbacks.confirmAction,
       fetchFn: this.fetchFn,
       onSubagent: this.allowSubagents
@@ -552,6 +562,9 @@ export class AivoAgent {
     let finalText = "";
     let steps = 0;
     let reviewFixPassDone = false;
+    let testsJustPassed = false;
+    let lastStepHadError = false;
+    let initialStepEffort: string | null = null;
 
     while (steps < this.maxSteps) {
       steps++;
@@ -569,24 +582,40 @@ export class AivoAgent {
         );
       }
 
+      const stepEffort = resolveStepReasoningEffort({
+        configuredEffort: this.config.reasoningEffort,
+        step: steps,
+        isReadOnlyQa,
+        hasPrehydratedFiles,
+        testsJustPassed,
+        lastStepHadError,
+      });
+      if (initialStepEffort === null) {
+        initialStepEffort = stepEffort;
+      }
+
       let stepRes;
       let retryCount = 0;
       while (true) {
         try {
+          const effortSuffix = stepEffort !== initialStepEffort ? `_${stepEffort}` : "";
+          const retrySuffix = retryCount === 0 ? "" : `_r${retryCount}`;
+          const stickySessionId = `${this.session.id}${effortSuffix}${retrySuffix}`;
           stepRes = await streamTurn({
             baseUrl: this.config.baseUrl,
             apiKey: this.config.apiKey,
-            sessionId: this.session.id,
+            sessionId: stickySessionId,
             wire: this.config.wire,
             model: effectiveModel,
             systemPrompt,
             messages: this.session.messages,
-            tools: toolset.specs,
-            reasoningEffort: this.config.reasoningEffort,
+            tools: allQaFilesHydrated ? [] : toolset.specs,
+            reasoningEffort: stepEffort,
             maxTokens:
               this.config.wire === "messages"
                 ? Math.min(16384, modelInfo?.maxOutputTokens ?? 8192)
                 : undefined,
+            chunkIdleTimeoutMs: this.chunkIdleTimeoutMs,
             signal,
             fetchFn: this.fetchFn,
             onReasoningDelta: this.callbacks.onReasoningDelta,
@@ -639,6 +668,7 @@ export class AivoAgent {
         ...(stepRes.reasoning ? { reasoning: stepRes.reasoning } : {}),
         ...(stepRes.toolCalls.length > 0 ? { toolCalls: stepRes.toolCalls } : {}),
       });
+      this.persistSession();
 
       if (stepRes.toolCalls.length === 0) {
         // Separated Iterative Review -> Fix -> Re-Review -> Re-Fix Loop when files were modified
@@ -718,10 +748,13 @@ export class AivoAgent {
           "memory_search",
           "skill_load",
           "anti_slop_audit",
+          "todo_write",
         ].includes(tc.name),
       );
 
       const pendingImages = [];
+      testsJustPassed = false;
+      lastStepHadError = false;
 
       if (allReadOnly && stepRes.toolCalls.length > 1) {
         const results = await Promise.all(
@@ -738,6 +771,7 @@ export class AivoAgent {
           }),
         );
         for (const { tc, execRes } of results) {
+          if (execRes.isError) lastStepHadError = true;
           this.session.messages.push({
             role: "tool",
             toolCallId: tc.id,
@@ -757,6 +791,7 @@ export class AivoAgent {
           this.callbacks.onToolCall?.(tc.name, tc.arguments);
           const execRes = await toolset.execute(tc.name, tc.arguments);
           if (execRes.durationMs === undefined) execRes.durationMs = Date.now() - t0;
+          if (execRes.isError) lastStepHadError = true;
           if (autoAdvanceTodos(this.todos, tc.name, tc.arguments) || tc.name === "todo_write") {
             this.callbacks.onTodoUpdate?.(this.todos);
           }
@@ -768,6 +803,15 @@ export class AivoAgent {
             content: execRes.output,
             isError: execRes.isError,
           });
+          if (
+            tc.name === "run_shell" &&
+            !execRes.isError &&
+            this.checkpoints.listModifiedFiles().length > 0 &&
+            (/\b(test|vitest|jest|pytest|check)\b/i.test(String(tc.arguments.command ?? "")) ||
+              /\bPASS(ED)?\b/.test(execRes.output))
+          ) {
+            testsJustPassed = true;
+          }
           if (execRes.imageAttachments && execRes.imageAttachments.length > 0) {
             pendingImages.push(...execRes.imageAttachments);
           } else if (execRes.imageAttachment) {

@@ -1,6 +1,6 @@
 import { endpointUrl, type AivoWire, type ReasoningEffort } from "./config.js";
 import type { TurnUsageMetrics } from "./aivokey-client.js";
-import { parseAivoErrorResponse } from "./errors.js";
+import { AivoApiError, parseAivoErrorResponse } from "./errors.js";
 import { buildMultimodalContentForWire, type ImageAttachment } from "./vision.js";
 
 export interface ToolCall {
@@ -39,6 +39,7 @@ export interface StreamTurnOptions {
   reasoningEffort?: ReasoningEffort;
   maxTokens?: number;
   webSearch?: boolean;
+  chunkIdleTimeoutMs?: number;
   signal?: AbortSignal;
   fetchFn?: typeof fetch;
   onTextDelta?: (delta: string) => void;
@@ -66,23 +67,84 @@ function safeParseJsonObj(raw: string): Record<string, unknown> {
   }
 }
 
-async function* iterateSseData(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+async function readWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+  onTimeout?: () => void,
+): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>> {
+  if (!timeoutMs || timeoutMs <= 0) {
+    return reader.read();
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          onTimeout?.();
+          reject(
+            new AivoApiError({
+              status: 504,
+              code: "stream_stalled",
+              type: "upstream_error",
+              message: `Upstream SSE stream stalled (${timeoutMs}ms idle timeout)`,
+              requestId: null,
+              resetAt: null,
+              retryAfterS: 1,
+              recoveryAction: "wait_and_retry",
+            }),
+          );
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function* iterateSseData(
+  stream: ReadableStream<Uint8Array>,
+  chunkIdleTimeoutMs: number = 25_000,
+  onTimeoutAbort?: () => void,
+): AsyncGenerator<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let lastDataAt = Date.now();
   try {
     while (true) {
-      const { value, done } = await reader.read();
+      const elapsedSinceData = Date.now() - lastDataAt;
+      const waitBudget =
+        chunkIdleTimeoutMs > 0 ? Math.max(20, chunkIdleTimeoutMs - elapsedSinceData) : 0;
+      const { value, done } = await readWithIdleTimeout(reader, waitBudget, onTimeoutAbort);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let newlineIdx: number;
+      let yieldedData = false;
       while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, newlineIdx).replace(/\r$/, "");
         buffer = buffer.slice(newlineIdx + 1);
         if (line.startsWith("data:")) {
           const payload = line.slice(5).trim();
-          if (payload) yield payload;
+          if (payload) {
+            lastDataAt = Date.now();
+            yieldedData = true;
+            yield payload;
+          }
         }
+      }
+      if (!yieldedData && chunkIdleTimeoutMs > 0 && Date.now() - lastDataAt >= chunkIdleTimeoutMs) {
+        onTimeoutAbort?.();
+        throw new AivoApiError({
+          status: 504,
+          code: "stream_stalled",
+          type: "upstream_error",
+          message: `Upstream SSE stream stalled without data events (${chunkIdleTimeoutMs}ms)`,
+          requestId: null,
+          resetAt: null,
+          retryAfterS: 1,
+          recoveryAction: "wait_and_retry",
+        });
       }
     }
     const remaining = buffer.trim();
@@ -91,7 +153,16 @@ async function* iterateSseData(stream: ReadableStream<Uint8Array>): AsyncGenerat
       if (payload) yield payload;
     }
   } finally {
-    reader.releaseLock();
+    try {
+      void reader.cancel().catch(() => {});
+    } catch {
+      /* ignore cancel error */
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      /* ignore lock error */
+    }
   }
 }
 
@@ -131,7 +202,7 @@ function buildChatCompletionsBody(opts: StreamTurnOptions): Record<string, unkno
     } else if (m.role === "assistant") {
       const msg: Record<string, unknown> = {
         role: "assistant",
-        content: m.content || null,
+        content: m.content || "",
       };
       if (m.reasoning) {
         msg.reasoning_content = m.reasoning;
@@ -181,6 +252,7 @@ function buildChatCompletionsBody(opts: StreamTurnOptions): Record<string, unkno
   }
 
   if (opts.reasoningEffort && opts.reasoningEffort !== "off") {
+    body.reasoning_effort = opts.reasoningEffort;
     body.reasoning = { effort: opts.reasoningEffort };
   }
 
@@ -361,12 +433,45 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
         ? buildResponsesBody(opts)
         : buildChatCompletionsBody(opts);
 
-  const res = await fetchFn(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  });
+  const idleTimeout = opts.chunkIdleTimeoutMs ?? 30_000;
+  const connectAbort = new AbortController();
+  const onParentAbort = () => connectAbort.abort();
+  opts.signal?.addEventListener("abort", onParentAbort, { once: true });
+
+  let connectTimer: ReturnType<typeof setTimeout> | undefined;
+  let res: Response;
+  try {
+    res = await Promise.race([
+      fetchFn(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: opts.signal ?? connectAbort.signal,
+      }),
+      new Promise<never>((_, reject) => {
+        if (idleTimeout > 0) {
+          connectTimer = setTimeout(() => {
+            connectAbort.abort();
+            reject(
+              new AivoApiError({
+                status: 504,
+                code: "stream_stalled",
+                type: "upstream_error",
+                message: `Upstream connection timed out before response headers (${idleTimeout}ms)`,
+                requestId: null,
+                resetAt: null,
+                retryAfterS: 1,
+                recoveryAction: "wait_and_retry",
+              }),
+            );
+          }, idleTimeout);
+        }
+      }),
+    ]);
+  } finally {
+    if (connectTimer) clearTimeout(connectTimer);
+    opts.signal?.removeEventListener("abort", onParentAbort);
+  }
 
   if (!res.ok) {
     throw await parseAivoErrorResponse(res);
@@ -398,7 +503,7 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
   if (opts.wire === "chat") {
     const toolMap = new Map<number, { id: string; name: string; args: string }>();
 
-    for await (const data of iterateSseData(res.body)) {
+    for await (const data of iterateSseData(res.body, idleTimeout, () => connectAbort.abort())) {
       if (data === "[DONE]") break;
       let chunk: Record<string, unknown>;
       try {
@@ -505,7 +610,7 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
   if (opts.wire === "messages") {
     const blockTools = new Map<number, { id: string; name: string; args: string }>();
 
-    for await (const data of iterateSseData(res.body)) {
+    for await (const data of iterateSseData(res.body, idleTimeout, () => connectAbort.abort())) {
       if (data === "[DONE]") break;
       let event: Record<string, unknown>;
       try {
@@ -594,7 +699,7 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
   const toolCalls: ToolCall[] = [];
   const respToolStreams = new Map<number, { name: string; args: string }>();
 
-  for await (const data of iterateSseData(res.body)) {
+  for await (const data of iterateSseData(res.body, idleTimeout, () => connectAbort.abort())) {
     if (data === "[DONE]") break;
     let event: Record<string, unknown>;
     try {

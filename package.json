@@ -1,14 +1,29 @@
 {
-  "name": "@aivokey/cli",
-  "version": "0.1.0",
-  "description": "AivoCode — Native CLI Coding Harness purpose-built for AivoKey",
+  "name": "aivocode",
+  "version": "1.0.0",
+  "description": "AivoCode (aivo) v1.0 — Full-Screen AI Coding Studio & Native CLI Coding Agent for AivoKey",
   "type": "module",
+  "homepage": "https://aivokey.dev/cli",
+  "license": "MIT",
+  "keywords": [
+    "aivo",
+    "aivocode",
+    "aivokey",
+    "coding-agent",
+    "ai-agent",
+    "cli",
+    "tui"
+  ],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "bin": {
-    "aivo": "./dist/bin.js",
-    "aivocode": "./dist/bin.js"
+    "aivo": "dist/bin.js",
+    "aivocode": "dist/bin.js"
   },
   "engines": {
-    "node": ">=24"
+    "node": ">=20"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

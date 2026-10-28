@@ -293,6 +293,9 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     globalConfigPath: opts.globalConfigPath,
     cli: parsed.cliConfig,
   });
+  if (parsed.command === "run" && !parsed.cliConfig.team) {
+    delete config.team;
+  }
 
   if (parsed.command === "help") {
     writeOut(
@@ -466,36 +469,43 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     return 0;
   }
 
-  let catalog: AivoModelInfo[] = [];
+  let catalog: AivoModelInfo[] = DEFAULT_AIVOKEY_CATALOG;
   let keyStatus = null as KeyInspectStatus | null;
   let catalogErr = null as string | null;
   let keyErr = null as string | null;
 
-  const bootSpinner = new TerminalSpinner();
-  if (!opts.writeOut) {
-    bootSpinner.start("Connecting to AivoKey Gateway...");
+  const isFastRun =
+    parsed.command === "run" &&
+    DEFAULT_AIVOKEY_CATALOG.some((m) => m.id === config.model) &&
+    !opts.fetchFn;
+
+  if (!isFastRun) {
+    const bootSpinner = new TerminalSpinner();
+    if (!opts.writeOut) {
+      bootSpinner.start("Connecting to AivoKey Gateway...");
+    }
+
+    await Promise.all([
+      fetchModels(config.baseUrl, fetchFn)
+        .then((m) => {
+          if (m.length > 0) catalog = m;
+        })
+        .catch((e) => {
+          catalogErr = e instanceof Error ? e.message : String(e);
+        }),
+      config.apiKey
+        ? inspectKey(config.baseUrl, config.apiKey, fetchFn)
+            .then((k) => {
+              keyStatus = k;
+            })
+            .catch((e) => {
+              keyErr = e instanceof Error ? e.message : String(e);
+            })
+        : Promise.resolve(),
+    ]);
+
+    bootSpinner.stop();
   }
-
-  await Promise.all([
-    fetchModels(config.baseUrl, fetchFn)
-      .then((m) => {
-        catalog = m;
-      })
-      .catch((e) => {
-        catalogErr = e instanceof Error ? e.message : String(e);
-      }),
-    config.apiKey
-      ? inspectKey(config.baseUrl, config.apiKey, fetchFn)
-          .then((k) => {
-            keyStatus = k;
-          })
-          .catch((e) => {
-            keyErr = e instanceof Error ? e.message : String(e);
-          })
-      : Promise.resolve(),
-  ]);
-
-  bootSpinner.stop();
 
   if (!config.fastModel) {
     config.fastModel = DEFAULT_FAST_MODEL;
@@ -689,7 +699,9 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       );
       return 1;
     }
+    const agentT0 = Date.now();
     const res = await agent.runUserPrompt(parsed.prompt);
+    const agentTimeMs = Math.max(1, Date.now() - agentT0);
     if (parsed.json) {
       writeOut(
         JSON.stringify({
@@ -697,6 +709,7 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
           model: agent.config.model,
           text: res.finalText,
           steps: res.steps,
+          agentTimeMs,
           usage: res.turnUsage,
           costMicro: res.turnCostMicro.toString(),
           cacheSavedMicro: res.turnCacheSavedMicro.toString(),
