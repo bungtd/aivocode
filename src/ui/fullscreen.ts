@@ -4,6 +4,7 @@ import { stdin, stdout } from "node:process";
 import { execSync } from "node:child_process";
 import type { AivoWire, ExecutionStrategy, PermissionMode, ReasoningEffort } from "../config.js";
 import { saveUserConfig } from "../config.js";
+import { AIVO_CLIENT_VERSION } from "../client-identity.js";
 import { AGENT_TEAMS, getAgentTeam, type TeamId } from "../teams.js";
 import { SLASH_COMMANDS } from "./select.js";
 import {
@@ -44,6 +45,7 @@ export async function startFullScreenTui(
   initialKeyStatus: KeyInspectStatus | null,
   fetchFn: typeof fetch = fetch,
   initialPrompt?: string,
+  updateNotice?: string | null,
 ): Promise<void> {
   if (!stdin.isTTY || !stdout.isTTY) {
     return;
@@ -66,6 +68,9 @@ export async function startFullScreenTui(
     `  ${c.slate("• Hotkeys:")} ${c.amber("Shift+Tab")} Mode · ${c.amber("Ctrl+K")} Model · ${c.amber("Ctrl+G")} Subagents · ${c.amber("Ctrl+O")} Config · ${c.amber("Ctrl+B")} Sidebar Drawer`,
     "",
   ];
+  if (updateNotice) {
+    transcriptLines.push(`${c.amber("◆")} ${c.white(updateNotice)}`, "");
+  }
 
   let buffer = "";
   let cursorPos = 0;
@@ -117,7 +122,7 @@ export async function startFullScreenTui(
       cols: stdout.columns || 110,
       rows: stdout.rows || 30,
       showSidebar,
-      version: "0.4.0",
+      version: AIVO_CLIENT_VERSION,
       cwd: agent.config.cwd,
       gitBranch,
       gatewayUrl: agent.config.baseUrl,

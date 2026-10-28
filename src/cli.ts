@@ -29,6 +29,7 @@ import { AivoAgent } from "./agent.js";
 import { formatDetailedStatus, formatModelsTable, startInteractiveRepl } from "./repl.js";
 import { startFullScreenTui } from "./ui/fullscreen.js";
 import { AIVO_CLIENT_VERSION } from "./client-identity.js";
+import { checkForUpdate, formatUpdateNotice, runUpdate } from "./update.js";
 import { AGENT_TEAMS, type TeamId } from "./teams.js";
 import { SessionStore } from "./session.js";
 import {
@@ -52,6 +53,7 @@ export type CliCommand =
   | "doctor"
   | "login"
   | "sessions"
+  | "update"
   | "version"
   | "help";
 
@@ -63,6 +65,8 @@ export interface ParsedCliArgs {
   continueLast?: boolean;
   mini?: boolean;
   json?: boolean;
+  /** `aivo update --check`: report the newest release without installing. */
+  checkUpdate?: boolean;
   cliConfig: Partial<UserConfigFile>;
 }
 
@@ -73,6 +77,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   let continueLast = false;
   let mini = false;
   let json = false;
+  let checkUpdate = false;
   let explicitPrompt: string | undefined;
   let filterFlag = "";
 
@@ -114,6 +119,8 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       cliConfig.webSearch = true;
     } else if (arg === "--json") {
       json = true;
+    } else if (arg === "--check") {
+      checkUpdate = true;
     } else if (arg === "--tools") {
       filterFlag = "--tools";
     } else if (arg === "--free") {
@@ -184,6 +191,18 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       mini,
+      json,
+      cliConfig,
+    };
+  }
+  if (first === "update" || first === "upgrade") {
+    return {
+      command: "update",
+      prompt: "",
+      filter: "",
+      sessionId,
+      continueLast,
+      checkUpdate,
       json,
       cliConfig,
     };
@@ -295,11 +314,42 @@ export interface RunCliOptions {
   globalConfigPath?: string;
   fetchFn?: typeof fetch;
   writeOut?: (text: string) => void;
+  /** Diagnostics channel; the update notice goes here so stdout stays parseable. */
+  writeErr?: (text: string) => void;
+}
+
+/**
+ * The startup version notice.
+ *
+ * Deliberately conservative: only interactive launches ask, only once per day
+ * (the answer is cached next to the user config), never in CI or when the user
+ * opted out, and never on a non-TTY stdout where it would corrupt piped output.
+ */
+async function maybeUpdateNotice(
+  parsed: ParsedCliArgs,
+  options: { env?: Record<string, string | undefined>; fetchFn: typeof fetch; globalConfigPath?: string },
+): Promise<string | null> {
+  if (parsed.json) return null;
+  if (parsed.command !== "repl" && parsed.command !== "mini" && !parsed.mini) return null;
+  const env = options.env ?? process.env;
+  if (env.CI || env.AIVO_NO_UPDATE_CHECK) return null;
+  if (!process.stdout.isTTY) return null;
+  try {
+    const status = await checkForUpdate({
+      currentVersion: AIVO_CLIENT_VERSION,
+      fetchFn: options.fetchFn,
+      globalConfigPath: options.globalConfigPath,
+    });
+    return formatUpdateNotice(status);
+  } catch {
+    return null;
+  }
 }
 
 export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<number> {
   const parsed = parseCliArgs(argv);
   const writeOut = opts.writeOut ?? ((text: string) => process.stdout.write(text + "\n"));
+  const writeErr = opts.writeErr ?? ((text: string) => process.stderr.write(text + "\n"));
   const fetchFn = opts.fetchFn ?? fetch;
 
   const config = resolveConfig({
@@ -334,6 +384,7 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         "  aivo doctor                   Verify AivoKey gateway connectivity, key & model setup",
         "  aivo login <sk-aivo_...>      Save your AivoKey API key to ~/.aivokey/config.json",
         "  aivo sessions                 List recent saved sessions",
+        "  aivo update [--check]         Upgrade to the newest release in place (no reinstall)",
         "",
         c.bold("Flags:"),
         "  -m, --model <id>              Canonical model ID (default: deepseek-v4-flash)",
@@ -350,6 +401,18 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       ].join("\n"),
     );
     return 0;
+  }
+
+  if (parsed.command === "update") {
+    const { code } = await runUpdate({
+      checkOnly: parsed.checkUpdate,
+      json: parsed.json,
+      currentVersion: AIVO_CLIENT_VERSION,
+      fetchFn,
+      globalConfigPath: opts.globalConfigPath,
+      writeOut,
+    });
+    return code;
   }
 
   if (parsed.command === "teams") {
@@ -741,7 +804,14 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     return 0;
   }
 
+  const updateNotice = await maybeUpdateNotice(parsed, {
+    env: opts.env,
+    fetchFn,
+    globalConfigPath: opts.globalConfigPath,
+  });
+
   if (parsed.command === "mini" || parsed.mini) {
+    if (updateNotice) writeErr(c.amber(`◆ ${updateNotice}`));
     await startInteractiveRepl(
       agent,
       keyStatus,
@@ -752,6 +822,6 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     return 0;
   }
 
-  await startFullScreenTui(agent, keyStatus, fetchFn, parsed.prompt);
+  await startFullScreenTui(agent, keyStatus, fetchFn, parsed.prompt, updateNotice);
   return 0;
 }
