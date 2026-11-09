@@ -3,6 +3,100 @@
 All notable changes to AivoCode (`aivocode` / `aivo`) are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.2] — 2026-11-12
+
+Patch release: the TUI now measures terminal cells instead of string length,
+keeps its layout math in one place, and has a testable keyboard.
+
+### Fixed
+
+**Columns were counted in UTF-16 units, not terminal cells**
+- `visibleLength` used `String.length`, so every CJK ideograph or emoji was
+  measured as one cell while the terminal painted two. Borders, the sidebar
+  divider, and the composer caret drifted by one column per wide character.
+- New `src/ui/width.ts` implements East Asian Width (W/F = 2 cells), zero-width
+  combining marks and joiners, and grapheme clustering via `Intl.Segmenter`, so a
+  ZWJ emoji family paints as one two-cell glyph. `padEndVisible`,
+  `truncateVisible`, `fitLineToWidth`, `truncateLineToWidth` and the new
+  `sliceToWidth` / `sliceTailToWidth` all work in cells and cut only on grapheme
+  boundaries.
+
+**Terminal smaller than the viewport emitted more rows than existed**
+- `renderFullScreenViewport` forced `cols >= 60` and `rows >= 16`, so an 80x12
+  terminal still got 16 rows. That scrolls the alternate screen and corrupts
+  every later frame.
+- The real size is now used as-is. Below 40x10 the frame is a single notice plus
+  blank rows, and it always fills exactly `rows` lines so no stale content
+  survives a resize.
+
+**Renderer and mouse hit-testing duplicated the composer layout**
+- The row math for the input box lived twice: once in `renderFullScreenViewport`
+  and once in `getComposerLineLayout` for clicks. They could drift apart.
+- New `src/ui/layout.ts` owns `viewportGeometry`, `computeComposerLayout`,
+  `visibleInputWindow` and `scrollWindow`; both paths call it.
+
+**Composer overflowed and misplaced the caret on wide-character input**
+- The input line was sliced with `slice(rawLine.length - maxChars)`, so a line of
+  Japanese text overflowed the box and the caret sat several columns off.
+- New `src/ui/input-line.ts` windows the line in display cells, budgets one cell
+  for the caret and one per ellipsis, and maps clicks back to cluster
+  boundaries (`charIndexAtCell`).
+
+**Transcript wrap split words**
+- `wrapTranscriptLines` hard-broke at the column, mid-word. It now backtracks to
+  the last space, indents continuation lines, and reopens the active SGR style;
+  only a single word wider than the pane is hard-broken.
+
+**Transcript grew without bound**
+- Every tool card, diff hunk and streamed paragraph appended a line, so a long
+  session reached tens of megabytes.
+- Capped at `MAX_TRANSCRIPT_LINES` (5000), trimmed from the top in `render()`,
+  with the streaming assistant/reasoning/tool-progress indices shifted by the
+  same amount so in-flight blocks keep splicing correctly. `scrollOffset` is
+  clamped after trimming.
+
+**Esc had three different meanings**
+- It cleared the selection, then cleared the buffer, and also reset scroll, so
+  the viewport could jump unexpectedly. It now does one thing per state in a
+  fixed order (close overlay, clear selection, clear buffer) and never scrolls.
+
+**`Ctrl+U` meant two different things**
+- It opened the subagent inspector in the full-screen TUI but cleared the line in
+  the inline composer.
+- `Ctrl+U` now clears the input line in both (readline convention); subagent
+  inspection moved to `Alt+U`. README, footer, welcome banner and `/help` updated.
+
+**Dead and duplicated input decoding**
+- `parseSgrMouseEvent` and the streaming splitter had separate button-bit
+  decoders that could disagree. Both now share `decodeSgrMouse` in
+  `src/ui/keyboard.ts`, which also owns CSI-u / modifyOtherKeys translation and
+  paste normalization. `fullscreen.ts` re-exports the helpers for compatibility.
+
+**Two input editors had two newline rules**
+- `isNewlineKey()` in `src/ui/keymap.ts` is now the single rule for
+  Shift+Enter, Alt+Enter, Ctrl+Enter, Ctrl+J and CSI-u modified Enter; the
+  composer and the full-screen TUI both call it.
+
+### Changed
+
+- The hotkey contract is a pure function: `resolveHotkey(key, ctx)` with an
+  explicit priority of modal, then streaming, then editor. While a turn streams
+  only interrupt (`Esc`, `Ctrl+C`), monitoring (`Alt+U`, `Alt+J`, `Ctrl+B`) and
+  `Ctrl+U` (clear input) are active.
+- Modal filtering, selection wrapping, list windowing and the row builders moved
+  to `src/ui/modal-nav.ts` and `src/ui/modal-options.ts`, so they are testable
+  without a TTY.
+- `fullscreen.ts` keeps only the imperative shell (render loop, agent callbacks,
+  command execution) and documents the module split at the top of the file.
+
+### Tests
+- New `ui-width-layout.test.ts` (26) covers cell widths, padding/truncation,
+  viewport geometry, input windowing, row integrity at 40x10 through 200x50, and
+  word wrap for ASCII, CJK and long words.
+- New `keymap.test.ts` (12) pins every hotkey and the modal/streaming priority.
+- New `modal-nav.test.ts` (6) and `modal-options.test.ts` (7).
+- Suite is 41 files / 281 tests, up from 39 / 268.
+
 ## [1.1.1] — 2026-11-11
 
 Patch release: the TUI now exposes every command and can switch sessions.

@@ -34,7 +34,7 @@ function state(over: Partial<FullScreenTuiState> = {}): FullScreenTuiState {
     cols: 100,
     rows: 24,
     showSidebar: true,
-    version: "1.1.1",
+    version: "1.1.2",
     cwd: "C:/x",
     gitBranch: "main",
     gatewayUrl: "https://api.aivokey.dev",
