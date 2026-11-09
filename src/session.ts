@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
@@ -138,6 +138,18 @@ export class SessionStore {
     forked.messages = source.messages.map((m) => ({ ...m }));
     this.saveSession(forked);
     return forked;
+  }
+
+  /** Removes a saved session file. Returns false when it did not exist. */
+  deleteSession(id: string): boolean {
+    const path = this.filePath(id);
+    if (!existsSync(path)) return false;
+    try {
+      rmSync(path, { force: true });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   listSessions(limit: number = 25): Array<Omit<AivoSession, "messages"> & { messageCount: number }> {

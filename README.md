@@ -45,6 +45,10 @@ Project dapat menimpa sebagian setting melalui `.aivokey.json` di root workspace
 |---|---|
 | **`Shift+Tab`** / **`Ctrl+T`** | Memutar mode izin secara *live*: `AUTO (Build)` → `PLAN (Architect)` → `SAFE (Confirm)` |
 | **`Ctrl+K`** | Membuka **Interactive Model Switcher Modal** (43+ model live AivoKey) |
+| **`Ctrl+G`** | Memilih model untuk subagent & role spesialis |
+| **`Ctrl+R`** | Membuka **Session Switcher** (berpindah & melanjutkan sesi tersimpan) |
+| **`Ctrl+U`** | Inspeksi subagent: daftar run, log, dan output |
+| **`Alt+J`** | Inspeksi background terminal job (log, kill, relaunch) |
 | **`Ctrl+A`** | Membuka **Specialist Agent Team & Workflow Modal** |
 | **`Ctrl+P`** | Membuka **Command Palette Modal** (semua perintah & aksi) |
 | **`Ctrl+E`** | Memutar *Reasoning Effort* secara *live* (`off` → `minimal` → `low` → `medium` → `high` → `xhigh` → `max`) |
@@ -53,6 +57,12 @@ Project dapat menimpa sebagian setting melalui `.aivokey.json` di root workspace
 | **`F2`** | Memutar cepat antar model di katalog |
 | **`PgUp` / `PgDn`** | Menggulir (*scroll*) riwayat percakapan di viewport utama |
 | **`Esc`** | Membatalkan streaming LLM yang sedang berjalan atau menutup modal |
+
+**Session switcher (`Ctrl+R` atau `/sessions`).** Sesi disimpan per-`sessionId` di `~/.aivokey/sessions/*.jsonl`. Modal menampilkan 50 sesi terbaru lengkap dengan model, jumlah pesan, biaya, dan waktu; `Enter` melanjutkan sesi itu **tanpa keluar dari TUI** (transkrip langsung diputar ulang), `Del` menghapus sesi tersimpan (sesi yang sedang aktif tidak bisa dihapus). Dari CLI: `aivo -c` melanjutkan sesi terakhir, `aivo -s <id>` melanjutkan sesi tertentu, `aivo sessions` mendaftar sesi.
+
+Saat berpindah sesi, `switchSession()` juga memindahkan state yang terikat sesi: checkpoint `/undo` dan background job dibaca dari direktori sesi baru, sementara todo, daftar subagent, dan id plugin di-reset — jadi `/undo` tidak pernah memutar file dari sesi lain.
+
+**Palet `/` menampilkan seluruh perintah.** Daftar perintah adalah satu sumber (`src/ui/select.ts`) yang dipakai bersama oleh autocomplete `/`, Command Palette (`Ctrl+P`), dan `/help`; test `slash-command-coverage` gagal bila sebuah perintah ada di handler tetapi tidak terdaftar. Dropdown menampilkan jendela bergulir (bukan memotong daftar) dengan indikator `↑/↓ N more`.
 
 ### 3. 7 Specialist Agent Teams & Multi-Stage Workflows (`src/teams.ts`)
 Pilih tim lewat **`Ctrl+A`**, perintah **`/team <id>`**, atau jalankan workflow penuh lewat **`/workflow <tujuan>`** / **`aivo workflow "<tujuan>"`**:

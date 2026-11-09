@@ -11,8 +11,11 @@ import { parseLspServerConfig } from "../src/config.js";
 const FIXTURE = fileURLToPath(new URL("./fixtures/lsp-server.mjs", import.meta.url));
 const managers: LspManager[] = [];
 
-afterEach(() => {
+afterEach(async () => {
   for (const manager of managers.splice(0)) manager.dispose();
+  // Windows keeps the language-server child's file handles open briefly after
+  // dispose(); yielding here keeps rmSync from racing the OS.
+  await new Promise((resolve) => setTimeout(resolve, 50));
 });
 
 function createManager(cwd: string): LspManager {

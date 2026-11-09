@@ -223,4 +223,49 @@ describe("AivoAgent multi-turn tool loop, subagent routing, and auto-recovery", 
       rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
+
+  it("switches sessions and re-points session-scoped state", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aivo-switch-"));
+    try {
+      const cfg: AivoConfig = {
+        apiKey: "sk-aivo_test",
+        baseUrl: "https://api.aivokey.dev",
+        model: "deepseek-v4-pro",
+        fastModel: null,
+        wire: "chat",
+        reasoningEffort: "medium",
+        mode: "auto",
+        webSearch: false,
+        cwd: dir,
+        globalConfigPath: join(dir, "config.json"),
+      };
+      const agent = new AivoAgent({ config: cfg, fetchFn: async () => new Response("") });
+
+      const first = agent.session;
+      first.messages.push({ role: "user", content: "first session" });
+      agent.todos.push({ id: "t1", content: "old task", status: "pending" });
+
+      const second = agent.sessionStore.createSession({
+        model: "glm-5.3",
+        wire: "messages",
+        cwd: dir,
+      });
+      agent.switchSession(second);
+
+      // The live session, model and wire all follow the new session.
+      expect(agent.session.id).toBe(second.id);
+      expect(agent.config.model).toBe("glm-5.3");
+      expect(agent.config.wire).toBe("messages");
+      expect(agent.session.wire).toBe("messages");
+      // Per-session UI state must not leak across the switch.
+      expect(agent.todos).toEqual([]);
+      expect(agent.subagentRuns).toEqual([]);
+      // The session we left is persisted, and the new one starts empty.
+      const reloaded = agent.sessionStore.loadSession(first.id);
+      expect(reloaded?.messages[0]?.content).toBe("first session");
+      expect(agent.session.messages).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
 });

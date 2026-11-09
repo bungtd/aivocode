@@ -37,9 +37,11 @@ import {
   visibleLength,
 } from "./theme.js";
 import { renderTerminalMarkdown, renderUnifiedDiff } from "./markdown.js";
+import type { ChatMessage } from "../protocol.js";
 import {
   applyComposerHotkeys,
   computeComposerSuggestions,
+  scrollWindow,
   type ComposerSuggestions,
 } from "./composer.js";
 
@@ -72,11 +74,35 @@ export async function startFullScreenTui(
   const transcriptLines: string[] = [
     `${c.cyan("◆")} ${c.bold("Welcome to AivoCode Full-Screen Studio")} ${c.slate("(Native AivoKey Harness)")}`,
     `  ${c.slate("• Type")} ${c.cyan("/")} ${c.slate("for commands,")} ${c.cyan("@")} ${c.slate("to attach files,")} ${c.cyan("!cmd")} ${c.slate("for shell,")} ${c.cyan("/copy")} ${c.slate("or")} ${c.amber("Ctrl+Y")} ${c.slate("to copy response.")}`,
-    `  ${c.slate("• Hotkeys:")} ${c.amber("Shift+Tab")} Mode · ${c.amber("Ctrl+K")} Model · ${c.amber("Ctrl+G")} Subagents · ${c.amber("Ctrl+O")} Config · ${c.amber("Ctrl+B")} Sidebar Drawer`,
+    `  ${c.slate("• Hotkeys:")} ${c.amber("Shift+Tab")} Mode · ${c.amber("Ctrl+K")} Model · ${c.amber("Ctrl+R")} Sessions · ${c.amber("Ctrl+U")} Subagents · ${c.amber("Ctrl+P")} Commands · ${c.amber("Ctrl+B")} Sidebar`,
     "",
   ];
   if (updateNotice) {
     transcriptLines.push(`${c.amber("◆")} ${c.white(updateNotice)}`, "");
+  }
+
+  /**
+   * Replays a session's conversation into the transcript. Used on startup when
+   * `-c`/`-s` resumed an existing session, and again whenever the session
+   * switcher swaps the live session.
+   */
+  const replaySessionMessages = (messages: readonly ChatMessage[]): void => {
+    for (const message of messages) {
+      if (message.role === "user") {
+        transcriptLines.push(`${c.cyan("❯")} ${c.white(sanitizeTerminalText(message.content))}`);
+      } else if (message.role === "assistant" && message.content.trim()) {
+        transcriptLines.push(...renderTerminalMarkdown(message.content).split("\n"));
+      }
+    }
+  };
+
+  if (agent.session.messages.length > 0) {
+    transcriptLines.push(
+      `${c.slate(`Resumed session ${agent.session.id} (${agent.session.messages.length} messages)`)}`,
+      "",
+    );
+    replaySessionMessages(agent.session.messages);
+    transcriptLines.push("");
   }
 
   let buffer = "";
@@ -1077,6 +1103,87 @@ export async function startFullScreenTui(
     render();
   };
 
+  /**
+   * Session switcher. Enter resumes the highlighted session in place, so the
+   * user never has to quit the TUI to get back to earlier work.
+   */
+  const openSessionsModal = () => {
+    // Flush the live session first, otherwise the newest messages are missing
+    // from the row we are about to show.
+    try {
+      agent.sessionStore.saveSession(agent.session);
+    } catch {
+      /* a read-only home must not block the switcher */
+    }
+    const list = agent.sessionStore.listSessions(50);
+    if (list.length === 0) {
+      notice = "No saved sessions yet — this is the first one.";
+      render();
+      return;
+    }
+    const currentIdx = Math.max(
+      0,
+      list.findIndex((s) => s.id === agent.session.id),
+    );
+    modal = {
+      id: "sessions",
+      title: `Sessions (${list.length}) — Enter to resume · Del to delete`,
+      filter: "",
+      selectedIdx: currentIdx,
+      items: list.map((s) => ({
+        value: s.id,
+        label: `${s.id}${s.id === agent.session.id ? "  (current)" : ""}`,
+        badge: `[${s.model}]`,
+        detail: `${s.messageCount} msgs · ${formatMicroUsd(BigInt(s.totalCostMicro || "0"))} · ${s.updatedAt.slice(0, 16).replace("T", " ")}`,
+      })),
+    };
+    render();
+  };
+
+  /** Replaces the live session and repaints the transcript from its history. */
+  const resumeSession = (sessionId: string) => {
+    if (sessionId === agent.session.id) {
+      notice = "That session is already active.";
+      render();
+      return;
+    }
+    const loaded = agent.sessionStore.loadSession(sessionId);
+    if (!loaded) {
+      notice = `Could not load session ${sessionId}.`;
+      render();
+      return;
+    }
+    // switchSession re-points checkpoints and background jobs at the resumed
+    // session id, so /undo and /jobs show that session's history rather than
+    // the one we just left.
+    agent.switchSession(loaded);
+
+    transcriptLines.length = 0;
+    transcriptLines.push(
+      `${c.cyan("◆")} ${c.bold(`Resumed session ${loaded.id}`)} ${c.slate(`(${loaded.messages.length} messages · ${loaded.model})`)}`,
+      "",
+    );
+    replaySessionMessages(loaded.messages);
+    transcriptLines.push("");
+    streamingAssistantLineIdx = null;
+    streamingReasoningLineIdx = null;
+    scrollOffset = 0;
+    notice = `Resumed ${loaded.id}`;
+    render();
+  };
+
+  /** Deletes a saved session from the switcher (never the active one). */
+  const deleteSavedSession = (sessionId: string) => {
+    if (sessionId === agent.session.id) {
+      notice = "Refusing to delete the session you are currently in.";
+      render();
+      return;
+    }
+    const removed = agent.sessionStore.deleteSession(sessionId);
+    notice = removed ? `Deleted session ${sessionId}` : `Session ${sessionId} not found`;
+    openSessionsModal();
+  };
+
   const executePromptOrCommand = async (rawLine: string) => {
     const line = rawLine.trim();
     if (!line) return;
@@ -1168,6 +1275,44 @@ export async function startFullScreenTui(
         openSubagentInspectorListModal();
         return;
       }
+      if (cmdOnly === "/sessions" || cmdOnly === "/resume") {
+        openSessionsModal();
+        return;
+      }
+      if (cmdOnly === "/fork") {
+        agent.sessionStore.saveSession(agent.session);
+        const forked = agent.sessionStore.forkSession(agent.session.id);
+        if (!forked) {
+          notice = "Failed to fork the current session.";
+          render();
+          return;
+        }
+        agent.switchSession(forked);
+        // A fork keeps the same transcript; only the session id changes.
+        transcriptLines.push(
+          `${c.emerald("✓")} Forked into new session ${c.bold(forked.id)} (parent ${agent.session.parentSessionId ?? "?"})`,
+          "",
+        );
+        scrollOffset = 0;
+        render();
+        return;
+      }
+      if (cmdOnly === "/clear" || cmdOnly === "/new") {
+        agent.switchSession(
+          agent.sessionStore.createSession({
+            model: agent.config.model,
+            wire: agent.config.wire,
+            cwd: agent.config.cwd,
+          }),
+        );
+        transcriptLines.length = 0;
+        streamingAssistantLineIdx = null;
+        streamingReasoningLineIdx = null;
+        notice = `Started fresh session ${agent.session.id}`;
+        scrollOffset = 0;
+        render();
+        return;
+      }
       if (cmdOnly.startsWith("/inspect ")) {
         openSubagentDetailModal(line.slice("/inspect ".length).trim());
         return;
@@ -1204,9 +1349,6 @@ export async function startFullScreenTui(
       if (res.prompt !== undefined) {
         runPromptSafely(res.prompt);
         return;
-      }
-      if (cmdOnly === "/clear" || cmdOnly === "/new") {
-        transcriptLines.length = 0;
       }
       transcriptLines.push(...res.output.split("\n"));
       transcriptLines.push("");
@@ -1694,6 +1836,11 @@ export async function startFullScreenTui(
           return;
         }
       }
+      if (m.id === "sessions" && key?.name === "delete") {
+        const current = filtered[m.selectedIdx];
+        if (current) deleteSavedSession(current.value);
+        return;
+      }
       if (key?.name === "return" || key?.name === "enter") {
         const chosen = filtered[m.selectedIdx];
         const modalId = m.id;
@@ -1950,6 +2097,9 @@ export async function startFullScreenTui(
           } else if (modalId === "subagent_inspect_list") {
             openSubagentDetailModal(chosen.value);
             return;
+          } else if (modalId === "sessions") {
+            resumeSession(chosen.value);
+            return;
           } else if (modalId === "jobs_list") {
             openJobDetailModal(chosen.value);
             return;
@@ -2073,6 +2223,12 @@ export async function startFullScreenTui(
     // Ctrl+U -> Open Subagent Work Inspector Modal
     if (key?.ctrl && key.name === "u") {
       openSubagentInspectorListModal();
+      return;
+    }
+
+    // Ctrl+R -> Open Session Switcher (switch / resume saved sessions)
+    if (key?.ctrl && key.name === "r") {
+      openSessionsModal();
       return;
     }
 
@@ -2992,17 +3148,23 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
 
   // Overlay floating `/` or `@` suggestion dropdown at the bottom of `leftRows` if active
   if (!state.modal && state.suggestions.kind !== "none" && state.suggestions.items.length > 0) {
-    const maxItems = Math.min(6, state.suggestions.items.length, Math.max(2, bodyHeight - 2));
+    const maxItems = Math.min(10, Math.max(3, bodyHeight - 3));
+    const total = state.suggestions.items.length;
+    const { start, end } = scrollWindow(total, state.selectedSuggestionIdx, maxItems);
     const popRows: string[] = [];
     const title =
       state.suggestions.kind === "slash"
         ? "Slash Commands (↑/↓ navigate · Enter/Tab select · Esc close)"
         : "Workspace Files (↑/↓ navigate · Enter/Tab attach · Esc close)";
+    const position = total > maxItems ? ` ${start + 1}-${end}/${total}` : "";
     popRows.push(
-      fitLineToWidth(` ${c.cyan("╭─")} ${c.bold(title)} ${c.cyan("─".repeat(20))}`, mainWidth),
+      fitLineToWidth(` ${c.cyan("╭─")} ${c.bold(title)}${c.slate(position)} ${c.cyan("─".repeat(20))}`, mainWidth),
     );
-    const itemsSlice = state.suggestions.items.slice(0, maxItems);
-    itemsSlice.forEach((it, idx) => {
+    if (start > 0) {
+      popRows.push(fitLineToWidth(` ${c.cyan("│")} ${c.slate(`↑ ${start} more`)}`, mainWidth));
+    }
+    for (let idx = start; idx < end; idx++) {
+      const it = state.suggestions.items[idx]!;
       const sel = idx === state.selectedSuggestionIdx;
       const ptr = sel ? c.cyan("❯") : " ";
       const safeLabel = sanitizeTerminalText(it.label);
@@ -3010,7 +3172,10 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
       const lbl = sel ? c.bold(c.cyan(safeLabel.padEnd(24))) : c.white(safeLabel.padEnd(24));
       const desc = sel ? c.white(safeDesc) : c.slate(safeDesc);
       popRows.push(fitLineToWidth(` ${c.cyan("│")} ${ptr} ${lbl} ${desc}`, mainWidth));
-    });
+    }
+    if (end < total) {
+      popRows.push(fitLineToWidth(` ${c.cyan("│")} ${c.slate(`↓ ${total - end} more`)}`, mainWidth));
+    }
     popRows.push(fitLineToWidth(` ${c.cyan("╰" + "─".repeat(Math.max(10, mainWidth - 4)))}`, mainWidth));
 
     const replaceStart = Math.max(0, leftRows.length - popRows.length);
@@ -3196,7 +3361,7 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
   const compBot = borderColor("─".repeat(Math.max(2, cols)));
 
   const footerBar = truncateLineToWidth(
-    ` ${c.bold("Shift+Enter:")} Newline ${c.slate("│")} ${c.bold("Shift+Tab:")} Mode ${c.slate("│")} ${c.bold("Ctrl+K:")} Model ${c.slate("│")} ${c.bold("Ctrl+G:")} Subagents ${c.slate("│")} ${c.bold("Ctrl+O:")} Config ${c.slate("│")} ${c.bold("Ctrl+Y:")} Copy ${c.slate("│")} ${c.bold("Ctrl+B:")} Sidebar`,
+    ` ${c.bold("Shift+Enter:")} Newline ${c.slate("│")} ${c.bold("Shift+Tab:")} Mode ${c.slate("│")} ${c.bold("Ctrl+K:")} Model ${c.slate("│")} ${c.bold("Ctrl+R:")} Sessions ${c.slate("│")} ${c.bold("Ctrl+U:")} Subagents ${c.slate("│")} ${c.bold("Ctrl+P:")} Cmds`,
     cols,
   );
 

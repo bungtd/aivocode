@@ -21,8 +21,11 @@ function track(manager: McpManager): McpManager {
   return manager;
 }
 
-afterEach(() => {
+afterEach(async () => {
   for (const manager of managers.splice(0)) manager.dispose();
+  // Windows keeps the child's file handles open for a moment after dispose();
+  // a short yield here stops rmSync from racing the OS in later tests.
+  await new Promise((resolve) => setTimeout(resolve, 50));
 });
 
 describe("MCP client: stdio, resources, permissions and config", () => {

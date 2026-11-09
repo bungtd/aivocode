@@ -1156,12 +1156,16 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     const list = sessionStore.listSessions(15);
     if (list.length === 0) {
       writeOut("No saved sessions found.");
+    } else if (parsed.json) {
+      writeOut(JSON.stringify({ sessions: list, current: parsed.sessionId ?? null }, null, 2));
     } else {
       for (const s of list) {
         writeOut(
           `${c.cyan(s.id)}  [${c.emerald(s.model)}]  msgs=${s.messageCount}  cost=${formatMicroUsd(BigInt(s.totalCostMicro || "0"))}  ${c.slate(s.updatedAt)}`,
         );
       }
+      writeOut("");
+      writeOut(c.slate("Resume: aivo -c (most recent)  ·  aivo -s <id> (specific)  ·  inside the TUI: Ctrl+R or /sessions"));
     }
     return 0;
   }

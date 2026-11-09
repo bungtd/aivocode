@@ -24,6 +24,23 @@ export interface ComposerSuggestions {
   items: SuggestionItem[];
 }
 
+/**
+ * Keeps the highlighted row inside a fixed-size viewport, so a 50-command list
+ * scrolls instead of being truncated to the first N entries.
+ */
+export function scrollWindow(
+  total: number,
+  selectedIdx: number,
+  maxVisible: number,
+): { start: number; end: number } {
+  if (total <= maxVisible) return { start: 0, end: total };
+  const half = Math.floor(maxVisible / 2);
+  let start = Math.max(0, selectedIdx - half);
+  const end = Math.min(total, start + maxVisible);
+  if (end - start < maxVisible) start = Math.max(0, end - maxVisible);
+  return { start, end };
+}
+
 const MODE_ORDER: PermissionMode[] = ["auto", "plan", "safe"];
 const EFFORT_ORDER: ReasoningEffort[] = [
   "minimal",
@@ -105,10 +122,27 @@ export function computeComposerSuggestions(
         s.cmd.slice(1).includes(q) ||
         s.description.toLowerCase().includes(q),
     );
+    // Rank prefix matches first (and shorter completions before longer ones),
+    // so typing "/mo" surfaces /mode before /model and /memory. An empty query
+    // keeps the curated order below.
+    const ranked =
+      q === ""
+        ? matched
+        : [...matched].sort((a, b) => {
+            const rank = (cmd: string): [number, number] => {
+              const body = cmd.slice(1);
+              if (body === q) return [0, body.length];
+              if (body.startsWith(q)) return [1, body.length];
+              return [2, body.length];
+            };
+            const [aGroup, aLen] = rank(a.cmd);
+            const [bGroup, bLen] = rank(b.cmd);
+            return aGroup - bGroup || aLen - bLen;
+          });
     return {
       kind: "slash",
       query: q,
-      items: matched.slice(0, 8).map((s) => ({
+      items: ranked.map((s) => ({
         value: s.cmd,
         label: s.cmd,
         description: s.description,
@@ -449,13 +483,24 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
       opts.suggestions.kind === "slash"
         ? "Slash Commands (↑/↓ navigate · Tab/Enter select)"
         : "Workspace Files (↑/↓ navigate · Tab/Enter attach)";
+    const total = opts.suggestions.items.length;
+    const maxVisible = 10;
+    const { start, end } = scrollWindow(total, opts.selectedSuggestionIdx, maxVisible);
+    const hiddenAbove = start;
+    const hiddenBelow = total - end;
+    const position =
+      total > maxVisible ? ` ${c.slate(`${start + 1}-${end}/${total}`)}` : "";
     lines.push(
       truncateVisible(
-        `  ${c.cyan("╭─")} ${c.bold(headerLabel)} ${c.cyan("─".repeat(22))}`,
+        `  ${c.cyan("╭─")} ${c.bold(headerLabel)}${position} ${c.cyan("─".repeat(22))}`,
         width,
       ),
     );
-    opts.suggestions.items.forEach((item, idx) => {
+    if (hiddenAbove > 0) {
+      lines.push(truncateVisible(`  ${c.cyan("│")} ${c.slate(`↑ ${hiddenAbove} more`)}`, width));
+    }
+    for (let idx = start; idx < end; idx++) {
+      const item = opts.suggestions.items[idx]!;
       const isSelected = idx === opts.selectedSuggestionIdx;
       const pointer = isSelected ? c.cyan("❯") : " ";
       const labelPadded = sanitizeTerminalText(item.label).padEnd(28).slice(0, 28);
@@ -466,7 +511,10 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
       lines.push(
         truncateVisible(`  ${c.cyan("│")} ${pointer} ${labelStyled} ${descStyled}`, width),
       );
-    });
+    }
+    if (hiddenBelow > 0) {
+      lines.push(truncateVisible(`  ${c.cyan("│")} ${c.slate(`↓ ${hiddenBelow} more`)}`, width));
+    }
     lines.push(truncateVisible(`  ${c.cyan("╰" + "─".repeat(70))}`, width));
   }
 

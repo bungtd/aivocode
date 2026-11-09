@@ -169,12 +169,12 @@ export interface TeamWorkflowResult {
 export class AivoAgent {
   config: AivoConfig;
   catalog: AivoModelInfo[];
-  readonly checkpoints: CheckpointManager;
+  checkpoints: CheckpointManager;
   readonly todos: TodoItem[];
   readonly sessionStore: SessionStore;
   readonly memory: SelfLearningMemory;
   readonly skills: SkillRegistry;
-  readonly backgroundJobs: BackgroundJobManager;
+  backgroundJobs: BackgroundJobManager;
   readonly webSearchRouter: ClientWebSearchRouter;
   readonly mcpManager: McpManager;
   readonly lspManager: LspManager;
@@ -326,6 +326,36 @@ export class AivoAgent {
     this.readOnlyOnly = opts.readOnlyOnly ?? false;
     this.allowSubagents = opts.allowSubagents ?? true;
     this.chunkIdleTimeoutMs = opts.chunkIdleTimeoutMs;
+  }
+
+  /**
+   * Swaps the live session and re-points everything that is session-scoped:
+   * undo checkpoints and background jobs are persisted per session id, so
+   * resuming an older session must read that session's history, not the one we
+   * just left.
+   */
+  switchSession(next: AivoSession): void {
+    if (!this.ephemeralSession) {
+      try {
+        this.sessionStore.saveSession(this.session);
+      } catch {
+        // Losing a save must not block the switch.
+      }
+    }
+    this.session = next;
+    this.config.model = next.model;
+    this.config.wire = next.wire;
+    this.session.wire = next.wire;
+    this.todos.length = 0;
+    this.subagentRuns.length = 0;
+    this.plugins.sessionId = next.id;
+    if (!this.ephemeralSession) {
+      this.checkpoints = new CheckpointManager({ dir: defaultCheckpointDir(next.id) });
+      this.backgroundJobs.dispose();
+      this.backgroundJobs = new BackgroundJobManager(undefined, {
+        dir: defaultBackgroundJobsDir(next.id),
+      });
+    }
   }
 
   /**

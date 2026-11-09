@@ -207,6 +207,12 @@ export async function handleSlashCommand(
           `${c.cyan("│")} ${c.bold("Live Hotkeys (inside Composer):")}`,
           `${c.cyan("│")}  ${c.bold(c.amber("Shift+Tab / Ctrl+T"))} ${c.slate("Cycle Mode live: AUTO (Build) → PLAN (Architect) → SAFE (Confirm)")}`,
           `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+K"))}             ${c.slate("Open Interactive Model Switcher Modal (search & arrow keys)")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+G"))}             ${c.slate("Pick the subagent & specialist-role models")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+R"))}             ${c.slate("Open the Session Switcher (resume any saved session)")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+U"))}             ${c.slate("Inspect subagent runs, logs and outputs")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+P"))}             ${c.slate("Open the full command palette")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Alt+J"))}              ${c.slate("Inspect background terminal jobs")}`,
+          `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+B"))}             ${c.slate("Toggle the telemetry sidebar")}`,
           `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+E"))}             ${c.slate("Cycle Reasoning Effort live: minimal → low → medium → high → xhigh → max")}`,
           `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+W"))}             ${c.slate("Cycle AivoKey Wire live: chat → messages → responses")}`,
           `${c.cyan("│")}  ${c.bold(c.amber("Ctrl+S"))}             ${c.slate("Open Live AivoKey Telemetry & Quota Inspector")}`,
@@ -215,9 +221,9 @@ export async function handleSlashCommand(
           `${c.cyan("│")}  ${c.bold(c.amber("!<command>"))}         ${c.slate("Execute shell command directly without spending LLM tokens")}`,
           `${c.cyan("│")}  ${c.bold(c.amber("Esc (while busy)"))}   ${c.slate("Interrupt active LLM stream or tool execution cleanly")}`,
           `${c.cyan("├" + "─".repeat(74))}`,
-          `${c.cyan("│")} ${c.bold("Slash Commands:")}`,
+          `${c.cyan("│")} ${c.bold(`Slash Commands (${SLASH_COMMANDS.length}):`)}`,
           ...SLASH_COMMANDS.map(
-            (s) => `${c.cyan("│")}  ${c.bold(c.emerald(s.cmd.padEnd(14)))} ${c.slate(s.description)}`,
+            (s) => `${c.cyan("│")}  ${c.bold(c.emerald(s.cmd.padEnd(16)))} ${c.slate(s.description)}`,
           ),
           `${c.cyan("╰" + "─".repeat(74))}`,
         ].join("\n"),
@@ -1264,7 +1270,7 @@ export async function handleSlashCommand(
       if (!forked) {
         return { output: c.rose("Failed to fork session.") };
       }
-      agent.session = forked;
+      agent.switchSession(forked);
       return {
         output: `${c.emerald("✓")} Forked conversation into new sticky session: ${c.bold(c.cyan(forked.id))}`,
       };
@@ -1272,14 +1278,13 @@ export async function handleSlashCommand(
 
     case "/clear":
     case "/new": {
-      agent.session = agent.sessionStore.createSession({
-        model: agent.config.model,
-        wire: agent.config.wire,
-        cwd: agent.config.cwd,
-      });
-      agent.todos.length = 0;
-      agent.subagentRuns.length = 0;
-      agent.checkpoints.reset();
+      agent.switchSession(
+        agent.sessionStore.createSession({
+          model: agent.config.model,
+          wire: agent.config.wire,
+          cwd: agent.config.cwd,
+        }),
+      );
       return { output: `${c.emerald("✓")} Started fresh session: ${c.bold(c.cyan(agent.session.id))}` };
     }
 
@@ -1300,8 +1305,7 @@ export async function handleSlashCommand(
         if (picked) {
           const loaded = agent.sessionStore.loadSession(picked);
           if (loaded) {
-            agent.session = loaded;
-            agent.config.model = loaded.model;
+            agent.switchSession(loaded);
             return { output: `${c.emerald("✓")} Resumed session ${c.bold(c.cyan(loaded.id))} (${loaded.messages.length} messages)` };
           }
         }

@@ -2,50 +2,83 @@ import { emitKeypressEvents } from "node:readline";
 import { stdin, stdout } from "node:process";
 import { c, sanitizeTerminalText } from "./theme.js";
 
+/**
+ * Every slash command the CLI understands, in the order a new user should meet
+ * them. `handleSlashCommand` is the source of truth for behaviour; this list is
+ * the discoverability surface (palette, `/` autocomplete, `/help`). A command
+ * that works but is missing here is effectively invisible, so keep the two in
+ * step — `test/slash-command-coverage.test.ts` fails when they drift.
+ */
 export const SLASH_COMMANDS: Array<{ cmd: string; description: string }> = [
-  { cmd: "/model", description: "Interactive Primary Model Picker or switch model (/model <id>)" },
-  { cmd: "/subagent", description: "Select model for Subagents & Specialist Roles (/subagent [explore|architect|builder|reviewer] <id>)" },
-  { cmd: "/subagents", description: "Inspect subagent runs, logs & outputs (or press Ctrl+U / click sidebar)" },
-  { cmd: "/jobs", description: "View & manage background terminal jobs (or press Ctrl+J / /bg <cmd> / /kill <id>)" },
-  { cmd: "/config", description: "Open Interactive Settings & Configuration Center (/config [key] [value])" },
-  { cmd: "/strategy", description: "Choose execution strategy (auto · subagent-driven · native · ask)" },
-  { cmd: "/team", description: "Switch specialist Agent Team (fullstack · backend · frontend · android · blender3d · gamedev · autopilot)" },
-  { cmd: "/workflow", description: "Run multi-stage specialist team workflow (/workflow <goal>)" },
-  { cmd: "/models", description: "Browse live AivoKey catalog (--tools, --free)" },
-  { cmd: "/effort", description: "Select reasoning effort (off · minimal · low · medium · high · xhigh · max)" },
-  { cmd: "/mode", description: "Switch agent mode (auto · safe · plan)" },
-  { cmd: "/sandbox", description: "Show or set sandbox policy (workspace · read-only · danger-full-access)" },
-  {
-    cmd: "/permissions",
-    description: "Edit allow/ask/deny rules in the permission modal (or show sandbox status)",
-  },
-  { cmd: "/wire", description: "Switch AivoKey wire protocol (chat · messages · responses)" },
-  { cmd: "/btw", description: "Ask a quick side question without polluting session history (/btw <question>)" },
-  { cmd: "/skills", description: "List or load discovered skills (.aivokey, .opencode, .dsh, .claude)" },
-  { cmd: "/memory", description: "View or search self-learning persistent memories" },
-  { cmd: "/audit", description: "Run Anti-AI-Slop code quality audit on modified files" },
-  { cmd: "/screenshot", description: "Capture desktop screenshot and attach to Vision" },
-  { cmd: "/copy", description: "Copy last assistant response (or '/copy code' for last code block) to clipboard (Ctrl+Y)" },
-  { cmd: "/status", description: "Live AivoKey balance, faucet tokens, plan quota & cache stats" },
-  { cmd: "/lsp", description: "Show LSP servers & status, or restart one (/lsp restart [server])" },
-  { cmd: "/hooks", description: "Show configured lifecycle hooks (SessionStart, PreToolUse, PostToolUse, Stop, ...)" },
-  { cmd: "/plugins", description: "Show loaded plugin modules, plugin tools and plugin hooks" },
-  { cmd: "/commands", description: "List custom slash commands from .aivokey/commands and plugins" },
-  { cmd: "/acp", description: "Show how to run AivoCode as an Agent Client Protocol server (aivo acp)" },
-  { cmd: "/telemetry", description: "Show span counts, duration by kind, and metric series for this session" },
-  { cmd: "/browser", description: "Show browser automation status and available browser_* tools" },
-  { cmd: "/mcp", description: "Show configured MCP servers, connection state, tools & resources" },
+  // Models & reasoning
+  { cmd: "/model", description: "Interactive model picker, or switch directly (/model <id>)" },
+  { cmd: "/models", description: "Browse the live AivoKey catalog (--tools, --free)" },
+  { cmd: "/subagent", description: "Model for subagents & specialist roles (/subagent [explore|architect|builder|reviewer] <id>)" },
+  { cmd: "/subagent-model", description: "Alias for /subagent" },
+  { cmd: "/fast-model", description: "Set the fast/explore subagent model" },
+  { cmd: "/effort", description: "Reasoning effort (off · minimal · low · medium · high · xhigh · max)" },
+  { cmd: "/wire", description: "Wire protocol (chat · messages · responses)" },
+  { cmd: "/strategy", description: "Execution strategy (auto · subagent-driven · native · ask)" },
+
+  // Sessions
+  { cmd: "/sessions", description: "Browse, switch and resume saved sessions (Ctrl+R)" },
+  { cmd: "/new", description: "Start a fresh session (same as /clear)" },
+  { cmd: "/clear", description: "Start a fresh session" },
+  { cmd: "/fork", description: "Fork the current conversation into a new session" },
   { cmd: "/compact", description: "Compress conversation history to free context window" },
   { cmd: "/undo", description: "Revert file edits from the last turn (persisted across restarts)" },
   { cmd: "/redo", description: "Restore file edits reverted by /undo" },
   { cmd: "/checkpoints", description: "Show persisted undo/redo checkpoint history for this session" },
   { cmd: "/diff", description: "Show git diff & files modified in this session" },
-  { cmd: "/todo", description: "View active task progress board" },
-  { cmd: "/fork", description: "Fork conversation into a new sticky session" },
-  { cmd: "/sessions", description: "Browse & resume saved sessions" },
+
+  // Agents & orchestration
+  { cmd: "/subagents", description: "Inspect subagent runs, logs & outputs (Ctrl+U)" },
+  { cmd: "/inspect", description: "Show the full log of one subagent (/inspect <id>)" },
+  { cmd: "/team", description: "Switch specialist Agent Team (fullstack · backend · frontend · android · blender3d · gamedev · autopilot)" },
+  { cmd: "/agents", description: "Alias for /team" },
+  { cmd: "/workflow", description: "Run a multi-stage specialist team workflow (/workflow <goal>)" },
+  { cmd: "/todo", description: "View the active task progress board" },
+  { cmd: "/btw", description: "Ask a quick side question without polluting history (/btw <question>)" },
+
+  // Background jobs
+  { cmd: "/jobs", description: "View & manage background terminal jobs (Ctrl+J)" },
+  { cmd: "/ps", description: "Alias for /jobs" },
+  { cmd: "/bg", description: "Start a background shell command (/bg <cmd>)" },
+  { cmd: "/logs", description: "Tail one background job's output (/logs <id>)" },
+  { cmd: "/kill", description: "Stop a background job (/kill <id>)" },
+
+  // Policy & permissions
+  { cmd: "/mode", description: "Agent mode (auto · safe · plan)" },
+  { cmd: "/sandbox", description: "Sandbox policy (workspace · read-only · danger-full-access)" },
+  { cmd: "/permissions", description: "Edit allow/ask/deny rules, or show sandbox status" },
+  { cmd: "/config", description: "Interactive settings & configuration center (/config [key] [value])" },
+  { cmd: "/settings", description: "Alias for /config" },
+
+  // Integrations
+  { cmd: "/mcp", description: "MCP servers: state, tools, resources (/mcp restart [server])" },
+  { cmd: "/lsp", description: "LSP servers & status, or restart one (/lsp restart [server])" },
+  { cmd: "/browser", description: "Browser automation status and browser_* tools" },
+  { cmd: "/web", description: "Web search & fetch configuration and provider status" },
+  { cmd: "/hooks", description: "Configured lifecycle hooks (SessionStart, PreToolUse, PostToolUse, Stop, …)" },
+  { cmd: "/plugins", description: "Loaded plugin modules, plugin tools and plugin hooks" },
+  { cmd: "/commands", description: "Custom slash commands from .aivokey/commands and plugins" },
+  { cmd: "/skills", description: "List or load discovered skills (.aivokey, .opencode, .dsh, .claude)" },
+  { cmd: "/acp", description: "Run AivoCode as an Agent Client Protocol server (aivo acp)" },
+
+  // Account & diagnostics
+  { cmd: "/status", description: "Live balance, faucet tokens, plan quota & cache stats" },
+  { cmd: "/usage", description: "Session token usage and cost breakdown" },
+  { cmd: "/key", description: "Inspect the current API key and plan limits" },
   { cmd: "/login", description: "Configure AivoKey API key & gateway URL" },
-  { cmd: "/clear", description: "Start a fresh session" },
+  { cmd: "/audit", description: "Anti-AI-Slop quality audit on modified files" },
+  { cmd: "/memory", description: "View or search self-learning persistent memories" },
+  { cmd: "/telemetry", description: "Span counts, duration by kind, and metric series for this session" },
+  { cmd: "/screenshot", description: "Capture a desktop screenshot and attach it to Vision" },
+  { cmd: "/copy", description: "Copy the last assistant response (or '/copy code' for the last code block)" },
+
+  // Help & exit
   { cmd: "/help", description: "Show all commands and keyboard shortcuts" },
+  { cmd: "/quit", description: "Exit AivoCode" },
   { cmd: "/exit", description: "Exit AivoCode" },
 ];
 

@@ -151,4 +151,57 @@ describe("Full-Screen Alt-Buffer TUI Viewport Renderer (100% columns × rows)", 
     expect(draftPlain).toContain("Enter save · Esc cancel");
     expect(draftPlain).toContain("Type a glob pattern");
   });
+
+  it("scrolls a long slash palette instead of truncating it", () => {
+    const items = Array.from({ length: 54 }, (_, i) => ({
+      value: `/cmd${i}`,
+      label: `/cmd${i}`,
+      description: `command number ${i}`,
+    }));
+    const state = createSampleState({
+      cols: 110,
+      rows: 30,
+      suggestions: { kind: "slash", query: "", items },
+      selectedSuggestionIdx: 40,
+    });
+    const plain = stripAnsi(renderFullScreenViewport(state));
+    // The highlighted row must be inside the viewport, not clipped away.
+    expect(plain).toContain("/cmd40");
+    // And the remaining entries must be announced rather than silently dropped.
+    expect(plain).toMatch(/↓ \d+ more/);
+    expect(plain).toMatch(/↑ \d+ more/);
+    expect(plain).toContain("/54");
+  });
+
+  it("renders the session switcher modal with the current session marked", () => {
+    const state = createSampleState({
+      cols: 110,
+      rows: 28,
+      modal: {
+        id: "sessions",
+        title: "Sessions (3) — Enter to resume · Del to delete",
+        filter: "",
+        selectedIdx: 0,
+        items: [
+          {
+            value: "ses_a",
+            label: "ses_a  (current)",
+            badge: "[deepseek-v4-flash]",
+            detail: "12 msgs · $0.01 · 2026-11-09 10:00",
+          },
+          {
+            value: "ses_b",
+            label: "ses_b",
+            badge: "[glm-5.3]",
+            detail: "4 msgs · $0.00 · 2026-11-08 18:22",
+          },
+        ],
+      },
+    });
+    const plain = stripAnsi(renderFullScreenViewport(state));
+    expect(plain).toContain("Sessions (3)");
+    expect(plain).toContain("ses_a  (current)");
+    expect(plain).toContain("ses_b");
+    expect(plain).toContain("Enter to resume");
+  });
 });
