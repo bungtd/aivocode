@@ -6,11 +6,22 @@ import {
   renderStatusBar,
   sanitizeTerminalText,
   truncateVisible,
+  visibleLength,
 } from "./theme.js";
 import { SLASH_COMMANDS } from "./select.js";
 
 import { DEFAULT_AIVOKEY_CATALOG } from "../aivokey-client.js";
 import { AGENT_TEAMS } from "../teams.js";
+import {
+  activeInputLineIndex,
+  buildInputLineMeta,
+  scrollWindow,
+  visibleInputWindow,
+} from "./layout.js";
+import { renderInputLine } from "./input-line.js";
+import { isNewlineKey } from "./keymap.js";
+
+export { scrollWindow } from "./layout.js";
 
 export interface SuggestionItem {
   value: string;
@@ -22,23 +33,6 @@ export interface ComposerSuggestions {
   kind: "none" | "slash" | "arg" | "file";
   query: string;
   items: SuggestionItem[];
-}
-
-/**
- * Keeps the highlighted row inside a fixed-size viewport, so a 50-command list
- * scrolls instead of being truncated to the first N entries.
- */
-export function scrollWindow(
-  total: number,
-  selectedIdx: number,
-  maxVisible: number,
-): { start: number; end: number } {
-  if (total <= maxVisible) return { start: 0, end: total };
-  const half = Math.floor(maxVisible / 2);
-  let start = Math.max(0, selectedIdx - half);
-  const end = Math.min(total, start + maxVisible);
-  if (end - start < maxVisible) start = Math.max(0, end - maxVisible);
-  return { start, end };
 }
 
 const MODE_ORDER: PermissionMode[] = ["auto", "plan", "safe"];
@@ -434,7 +428,7 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
         : "AUTO · BUILD AGENT";
 
   const topTitle = truncateVisible(`── ◆ ${modeTitle} `, Math.max(8, width - 2));
-  const topDashCount = Math.max(2, width - topTitle.length);
+  const topDashCount = Math.max(2, width - visibleLength(topTitle));
   const topBorder = borderColor(`${topTitle}${"─".repeat(topDashCount)}`);
 
   const glyph =
@@ -451,24 +445,29 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
       truncateVisible(` ${glyph}${c.white("▏")}${c.dim(placeholder)}`, width),
     );
   } else {
-    const beforeCursor = opts.buffer.slice(0, opts.cursorPos);
-    const afterCursor = opts.buffer.slice(opts.cursorPos);
-    const rawWithCaret = `${beforeCursor}▏${afterCursor}`;
-    const maxChars = Math.max(8, inner - 3);
-    const rawLines = rawWithCaret.split("\n");
-    rawLines.forEach((rawLine, idx) => {
-      const clipped =
-        rawLine.length > maxChars ? "…" + rawLine.slice(rawLine.length - (maxChars - 1)) : rawLine;
-      const prefix = idx === 0 ? glyph : "   ";
-      middleRows.push(truncateVisible(` ${prefix}${c.white(clipped)}`, width));
-    });
+    // Cell-aware: a wide character occupies two columns, so slicing by
+    // `String.length` would overflow the box and drift the caret.
+    const lineMeta = buildInputLineMeta(opts.buffer);
+    const activeLine = activeInputLineIndex(lineMeta, opts.cursorPos);
+    const { lines: visibleLines } = visibleInputWindow(lineMeta, activeLine);
+    const textBudget = Math.max(4, inner - 2);
+
+    for (const meta of visibleLines) {
+      const caretOnThisLine =
+        opts.cursorPos >= meta.startOffset && opts.cursorPos <= meta.endOffset
+          ? opts.cursorPos - meta.startOffset
+          : -1;
+      const rendered = renderInputLine(meta.text, caretOnThisLine, textBudget);
+      const prefix = meta.lineIdx === 0 ? glyph : "   ";
+      middleRows.push(truncateVisible(` ${prefix}${c.white(rendered.text)}`, width));
+    }
   }
 
   const footerHint = truncateVisible(
     "── Shift+Tab: Mode · Ctrl+K: Models · Ctrl+E: Effort · Ctrl+W: Wire · /: Cmds ",
     Math.max(8, width - 2),
   );
-  const bottomDashCount = Math.max(1, width - footerHint.length);
+  const bottomDashCount = Math.max(1, width - visibleLength(footerHint));
   const bottomBorder = borderColor(`${footerHint}${"─".repeat(bottomDashCount)}`);
 
   const lines: string[] = [statusBar, topBorder, ...middleRows, bottomBorder];
@@ -778,11 +777,7 @@ export async function readInteractiveComposerLine(opts: {
       }
 
       // Multi-line newline insertion via Shift+Enter, Alt+Enter, Ctrl+Enter, or Ctrl+J
-      if (
-        (key?.ctrl && key.name === "j") ||
-        key?.name === "enter" ||
-        (key?.name === "return" && Boolean(key.shift || key.meta || key.ctrl))
-      ) {
+      if (isNewlineKey(key, str)) {
         buffer = buffer.slice(0, cursorPos) + "\n" + buffer.slice(cursorPos);
         cursorPos++;
         selectedSuggestionIdx = 0;

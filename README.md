@@ -47,8 +47,9 @@ Project dapat menimpa sebagian setting melalui `.aivokey.json` di root workspace
 | **`Ctrl+K`** | Membuka **Interactive Model Switcher Modal** (43+ model live AivoKey) |
 | **`Ctrl+G`** | Memilih model untuk subagent & role spesialis |
 | **`Ctrl+R`** | Membuka **Session Switcher** (berpindah & melanjutkan sesi tersimpan) |
-| **`Ctrl+U`** | Inspeksi subagent: daftar run, log, dan output |
+| **`Alt+U`** | Inspeksi subagent: daftar run, log, dan output |
 | **`Alt+J`** | Inspeksi background terminal job (log, kill, relaunch) |
+| **`Ctrl+U`** | Menghapus baris input (sama seperti `readline`; tidak membuka panel) |
 | **`Ctrl+A`** | Membuka **Specialist Agent Team & Workflow Modal** |
 | **`Ctrl+P`** | Membuka **Command Palette Modal** (semua perintah & aksi) |
 | **`Ctrl+E`** | Memutar *Reasoning Effort* secara *live* (`off` → `minimal` → `low` → `medium` → `high` → `xhigh` → `max`) |
@@ -63,6 +64,10 @@ Project dapat menimpa sebagian setting melalui `.aivokey.json` di root workspace
 Saat berpindah sesi, `switchSession()` juga memindahkan state yang terikat sesi: checkpoint `/undo` dan background job dibaca dari direktori sesi baru, sementara todo, daftar subagent, dan id plugin di-reset — jadi `/undo` tidak pernah memutar file dari sesi lain.
 
 **Palet `/` menampilkan seluruh perintah.** Daftar perintah adalah satu sumber (`src/ui/select.ts`) yang dipakai bersama oleh autocomplete `/`, Command Palette (`Ctrl+P`), dan `/help`; test `slash-command-coverage` gagal bila sebuah perintah ada di handler tetapi tidak terdaftar. Dropdown menampilkan jendela bergulir (bukan memotong daftar) dengan indikator `↑/↓ N more`.
+
+**Lebar karakter & terminal kecil.** Semua perhitungan kolom memakai lebar sel terminal (`src/ui/width.ts`), bukan `String.length`: karakter CJK dan emoji dihitung 2 sel, combining mark 0 sel, dan ZWJ emoji sebagai satu glyph. Tanpa ini, satu baris berisi teks Jepang menggeser border dan caret sebesar jumlah karakter lebarnya. Geometri viewport dipusatkan di `src/ui/layout.ts` dan dipakai bersama oleh renderer serta hit-testing mouse, sehingga klik selalu mendarat di baris yang sama dengan yang digambar; terminal yang lebih kecil dari 40x10 menampilkan pesan singkat alih-alih memaksa frame yang lebih tinggi dari layar (yang akan menggulir alt-screen dan merusak frame berikutnya).
+
+**Keyboard sebagai kontrak yang diuji.** Pemetaan tombol ada di `src/ui/keymap.ts` sebagai fungsi murni (`resolveHotkey`), sehingga perilakunya bisa diuji tanpa TTY: prioritasnya modal → sedang streaming → editor. Saat streaming hanya `Esc`/`Ctrl+C` (interrupt), `Alt+U`, `Alt+J`, `Ctrl+B`, dan `Ctrl+U` (hapus input) yang aktif. Decoding byte mentah (SGR mouse, CSI-u, modifyOtherKeys) terpisah di `src/ui/keyboard.ts`.
 
 ### 3. 7 Specialist Agent Teams & Multi-Stage Workflows (`src/teams.ts`)
 Pilih tim lewat **`Ctrl+A`**, perintah **`/team <id>`**, atau jalankan workflow penuh lewat **`/workflow <tujuan>`** / **`aivo workflow "<tujuan>"`**:

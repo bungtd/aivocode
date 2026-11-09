@@ -2,6 +2,7 @@ import { execSync } from "node:child_process";
 import type { AivoWire, PermissionMode, ReasoningEffort } from "../config.js";
 import { formatMicroUsd, type KeyInspectStatus } from "../aivokey-client.js";
 import type { TodoItem } from "../tools/index.js";
+import { graphemes, textWidth } from "./width.js";
 
 const ESC = "\x1b[";
 
@@ -97,8 +98,13 @@ export function createTerminalSanitizer(): {
   };
 }
 
+/**
+ * Display width in terminal cells, ignoring SGR styling. Wide characters (CJK,
+ * emoji) count as two and combining marks as zero, matching what the terminal
+ * actually paints — `.length` drifts by one cell per wide character.
+ */
 export function visibleLength(text: string): number {
-  return stripAnsi(text).length;
+  return textWidth(stripAnsi(text));
 }
 
 export function padEndVisible(text: string, width: number): string {
@@ -107,25 +113,87 @@ export function padEndVisible(text: string, width: number): string {
   return text + " ".repeat(width - len);
 }
 
-/** Truncates an ANSI-styled line to `width` visible columns without breaking SGR sequences. */
+/**
+ * Truncates an ANSI-styled line to `width` cells without breaking SGR sequences
+ * or splitting a grapheme cluster (combining mark, emoji ZWJ sequence).
+ */
 export function truncateVisible(text: string, width: number): string {
   if (width <= 0) return "";
   if (visibleLength(text) <= width) return text;
+  const budget = Math.max(0, width - 1); // leave room for the ellipsis
+  const { text: head, truncated } = sliceToWidth(text, budget);
+  return truncated ? `${head}\x1b[0m…` : head;
+}
+
+/**
+ * Slices ANSI-styled text to at most `width` display cells, preserving escape
+ * sequences and never splitting a grapheme cluster.
+ *
+ * Returns `truncated: true` when content was dropped, so callers can decide how
+ * to signal that (ellipsis, ellipsis prefix for horizontal scroll, ...).
+ */
+export function sliceToWidth(
+  text: string,
+  width: number,
+): { text: string; truncated: boolean } {
+  if (width <= 0) return { text: "", truncated: text.length > 0 };
   let result = "";
-  let visible = 0;
-  for (let i = 0; i < text.length && visible < Math.max(0, width - 1); i++) {
+  let used = 0;
+  let truncated = false;
+
+  // Walk ANSI runs and plain runs separately so escape bytes never count.
+  let i = 0;
+  while (i < text.length) {
     if (text[i] === "\x1b" && text[i + 1] === "[") {
       const end = text.indexOf("m", i);
       if (end !== -1) {
         result += text.slice(i, end + 1);
-        i = end;
+        i = end + 1;
         continue;
       }
     }
-    result += text[i];
-    visible++;
+    const nextEsc = text.indexOf("\x1b[", i);
+    const plainEnd = nextEsc === -1 ? text.length : nextEsc;
+    const plain = text.slice(i, plainEnd);
+    for (const cluster of graphemes(plain)) {
+      const w = textWidth(cluster);
+      if (used + w > width) {
+        truncated = true;
+        break;
+      }
+      result += cluster;
+      used += w;
+    }
+    if (truncated) break;
+    i = plainEnd;
   }
-  return `${result}\x1b[0m…`;
+
+  return { text: result, truncated };
+}
+
+/**
+ * Keeps the last `width` display cells of plain text (horizontal scroll for a
+ * long input line). Returns the kept text and how many cells were dropped.
+ */
+export function sliceTailToWidth(
+  text: string,
+  width: number,
+): { text: string; droppedCells: number } {
+  if (width <= 0) return { text: "", droppedCells: textWidth(text) };
+  const clusters = graphemes(text);
+  let total = 0;
+  for (const cluster of clusters) total += textWidth(cluster);
+  if (total <= width) return { text, droppedCells: 0 };
+
+  let start = clusters.length;
+  let kept = 0;
+  while (start > 0) {
+    const w = textWidth(clusters[start - 1]!);
+    if (kept + w > width) break;
+    kept += w;
+    start--;
+  }
+  return { text: clusters.slice(start).join(""), droppedCells: total - kept };
 }
 
 export function formatCompactTokens(tokens: number): string {

@@ -33,10 +33,43 @@ import {
   renderTodoBoard,
   renderToolCallCard,
   sanitizeTerminalText,
+  sliceToWidth,
   stripAnsi,
   visibleLength,
 } from "./theme.js";
+import { graphemes, textWidth } from "./width.js";
 import { renderTerminalMarkdown, renderUnifiedDiff } from "./markdown.js";
+import { charIndexAtCell, windowInputLine } from "./input-line.js";
+import { isNewlineKey, resolveHotkey } from "./keymap.js";
+import {
+  buildJobOptions,
+  buildModelOptions,
+  buildSessionOptions,
+  buildSubagentOptions,
+  buildTeamOptions,
+  modelForRole,
+  teamSummary,
+} from "./modal-options.js";
+import {
+  appendFilterChar,
+  backspaceFilter,
+  chosenItem,
+  clampSelection,
+  filterModalItems,
+  moveSelection,
+  visibleModalRange,
+} from "./modal-nav.js";
+import {
+  parseSgrMouseEvent,
+  splitMouseAndKeyboardBytes,
+  stripMouseEscapeGarbage,
+  type SgrMouseEvent,
+} from "./keyboard.js";
+
+// Raw input decoding lives in keyboard.ts; re-exported so existing importers of
+// this module keep working.
+export { parseSgrMouseEvent, splitMouseAndKeyboardBytes, stripMouseEscapeGarbage };
+export type { SgrMouseEvent };
 import type { ChatMessage } from "../protocol.js";
 import {
   applyComposerHotkeys,
@@ -44,11 +77,48 @@ import {
   scrollWindow,
   type ComposerSuggestions,
 } from "./composer.js";
+import {
+  MAX_INPUT_ROWS,
+  MIN_COLS,
+  MIN_ROWS,
+  computeComposerLayout,
+  inputOffsetFromMouse,
+  viewportGeometry,
+} from "./layout.js";
 
 import { handleSlashCommand } from "../repl.js";
 
 const BRAILLE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/**
+ * Transcript lines retained in memory. A long session appends a line per tool
+ * card, diff hunk, and streamed paragraph, so an unbounded array grows into tens
+ * of megabytes. Trimming keeps the tail (what the user is looking at) and drops
+ * whole turns from the top.
+ */
+export const MAX_TRANSCRIPT_LINES = 5_000;
+
+/**
+ * Full-screen TUI shell.
+ *
+ * This module is the *imperative shell*: it owns the terminal, the mutable
+ * session state, and the wiring to the agent. Everything that can be decided
+ * without side effects lives in a pure module next to it, so it is unit-testable
+ * and cannot drift from the shell:
+ *
+ *   width.ts        display cells for CJK / emoji / combining marks
+ *   layout.ts       viewport geometry + composer row offsets (renderer & mouse)
+ *   input-line.ts   horizontal scrolling of the input line, caret placement
+ *   keymap.ts       which action a keypress means, given the current state
+ *   keyboard.ts     raw stdin decoding (SGR mouse, CSI-u, paste normalization)
+ *   modal-nav.ts    modal filtering, selection movement, list windowing
+ *   modal-options.ts  modal row builders (models, sessions, jobs, teams, ...)
+ *   composer.ts     inline composer + suggestion engine (mini mode)
+ *   select.ts       the single slash-command registry
+ *
+ * The shell keeps only the parts that genuinely need the live terminal: the
+ * render loop, the agent callbacks, and the command execution path.
+ */
 export async function startFullScreenTui(
   agent: AivoAgent,
   initialKeyStatus: KeyInspectStatus | null,
@@ -74,7 +144,7 @@ export async function startFullScreenTui(
   const transcriptLines: string[] = [
     `${c.cyan("◆")} ${c.bold("Welcome to AivoCode Full-Screen Studio")} ${c.slate("(Native AivoKey Harness)")}`,
     `  ${c.slate("• Type")} ${c.cyan("/")} ${c.slate("for commands,")} ${c.cyan("@")} ${c.slate("to attach files,")} ${c.cyan("!cmd")} ${c.slate("for shell,")} ${c.cyan("/copy")} ${c.slate("or")} ${c.amber("Ctrl+Y")} ${c.slate("to copy response.")}`,
-    `  ${c.slate("• Hotkeys:")} ${c.amber("Shift+Tab")} Mode · ${c.amber("Ctrl+K")} Model · ${c.amber("Ctrl+R")} Sessions · ${c.amber("Ctrl+U")} Subagents · ${c.amber("Ctrl+P")} Commands · ${c.amber("Ctrl+B")} Sidebar`,
+    `  ${c.slate("• Hotkeys:")} ${c.amber("Shift+Tab")} Mode · ${c.amber("Ctrl+K")} Model · ${c.amber("Ctrl+R")} Sessions · ${c.amber("Alt+U")} Subagents · ${c.amber("Ctrl+P")} Commands · ${c.amber("Ctrl+B")} Sidebar`,
     "",
   ];
   if (updateNotice) {
@@ -239,11 +309,33 @@ export async function startFullScreenTui(
 
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
   let scheduledRenderTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Trims the transcript to `MAX_TRANSCRIPT_LINES`, keeping the tail.
+   *
+   * Streaming index markers are shifted by the same amount so the in-flight
+   * assistant/reasoning block keeps being spliced at the right offset.
+   */
+  const trimTranscript = () => {
+    const overflow = transcriptLines.length - MAX_TRANSCRIPT_LINES;
+    if (overflow <= 0) return;
+    transcriptLines.splice(0, overflow);
+    const shift = (idx: number | null): number | null =>
+      idx === null ? null : Math.max(0, idx - overflow);
+    streamingAssistantLineIdx = shift(streamingAssistantLineIdx);
+    streamingReasoningLineIdx = shift(streamingReasoningLineIdx);
+    streamingToolProgressLineIdx = shift(streamingToolProgressLineIdx);
+    // Scroll is measured from the bottom, so trimming the top does not move the
+    // viewport — but a large offset can now exceed the content; clamp it.
+    scrollOffset = Math.max(0, Math.min(scrollOffset, transcriptLines.length));
+  };
+
   const render = (clearScreen: boolean = false) => {
     if (scheduledRenderTimer) {
       clearTimeout(scheduledRenderTimer);
       scheduledRenderTimer = null;
     }
+    trimTranscript();
     const ansiBuf = renderFullScreenAnsiBuffer(computeState(), clearScreen);
     stdout.write(ansiBuf);
   };
@@ -473,21 +565,10 @@ export async function startFullScreenTui(
     return filterEligibleModelsForAccount(base, keyStatus);
   };
 
-  const buildModelModalItems = (): ModalOption[] =>
-    getAvailableCatalog().map((m) => {
-      const inUsd = (Number(m.inputMicroPer1M) / 1_000_000).toFixed(2);
-      const outUsd = (Number(m.outputMicroPer1M) / 1_000_000).toFixed(2);
-      const badges: string[] = [];
-      if (m.supportsTools) badges.push("tools");
-      if (m.supportsReasoning) badges.push("reasoning");
-      if (m.supportsPromptCache) badges.push("cache");
-      return {
-        value: m.id,
-        label: sanitizeTerminalText(m.id),
-        badge: `[${badges.join("·")}]`,
-        detail: `${formatCompactTokens(m.contextWindow)} ctx · $${inUsd}/$${outUsd}`,
-      };
-    });
+  const buildModelModalItems = (): ModalOption[] => {
+    const base = agent.catalog.length > 0 ? agent.catalog : DEFAULT_AIVOKEY_CATALOG;
+    return buildModelOptions(base, keyStatus);
+  };
 
   const openModelModal = () => {
     const items = buildModelModalItems();
@@ -510,14 +591,13 @@ export async function startFullScreenTui(
   ) => {
     activeSubagentRoleTarget = role;
     const items = buildModelModalItems();
-    const curModel =
-      role === "architect"
-        ? (agent.config.architectModel ?? agent.config.model)
-        : role === "builder"
-          ? (agent.config.builderModel ?? agent.config.model)
-          : role === "reviewer"
-            ? (agent.config.reviewerModel ?? agent.config.model)
-            : (agent.config.fastModel ?? agent.config.model);
+    const curModel = modelForRole(role, {
+      model: agent.config.model,
+      fastModel: agent.config.fastModel,
+      architectModel: agent.config.architectModel,
+      builderModel: agent.config.builderModel,
+      reviewerModel: agent.config.reviewerModel,
+    });
     const curIdx = Math.max(
       0,
       items.findIndex((i) => i.value === curModel),
@@ -1002,12 +1082,7 @@ export async function startFullScreenTui(
       title: `Inspect Subagent Work (${runs.length} subagents · Enter to view logs)`,
       filter: "",
       selectedIdx: runs.length - 1,
-      items: runs.map((r) => ({
-        value: r.id,
-        label: `${r.id} · ${r.name}`,
-        badge: `[${r.status.toUpperCase()} · ${r.model}]`,
-        detail: r.description,
-      })),
+      items: buildSubagentOptions(runs),
     };
     render();
   };
@@ -1130,12 +1205,7 @@ export async function startFullScreenTui(
       title: `Sessions (${list.length}) — Enter to resume · Del to delete`,
       filter: "",
       selectedIdx: currentIdx,
-      items: list.map((s) => ({
-        value: s.id,
-        label: `${s.id}${s.id === agent.session.id ? "  (current)" : ""}`,
-        badge: `[${s.model}]`,
-        detail: `${s.messageCount} msgs · ${formatMicroUsd(BigInt(s.totalCostMicro || "0"))} · ${s.updatedAt.slice(0, 16).replace("T", " ")}`,
-      })),
+      items: buildSessionOptions(list, agent.session.id, formatMicroUsd),
     };
     render();
   };
@@ -1448,58 +1518,27 @@ export async function startFullScreenTui(
   const keyboardStream = new PassThrough();
   emitKeypressEvents(keyboardStream);
 
+  // Single source of truth for row offsets: the renderer uses the same module,
+  // so a click can never land one row away from where the caret is drawn.
   const getComposerLineLayout = (cols: number, rows: number) => {
-    const rawLines = buffer.length > 0 ? buffer.split("\n") : [""];
-    const lineMeta: Array<{
-      lineIdx: number;
-      text: string;
-      startOffset: number;
-      endOffset: number;
-    }> = [];
-    let offset = 0;
-    for (let i = 0; i < rawLines.length; i++) {
-      const txt = rawLines[i]!;
-      lineMeta.push({
-        lineIdx: i,
-        text: txt,
-        startOffset: offset,
-        endOffset: offset + txt.length,
-      });
-      offset += txt.length + 1; // +1 for "\n"
-    }
-
-    let activeLineIdx = 0;
-    for (let i = 0; i < lineMeta.length; i++) {
-      if (cursorPos >= lineMeta[i]!.startOffset && cursorPos <= lineMeta[i]!.endOffset) {
-        activeLineIdx = i;
-        break;
-      }
-    }
-
-    const maxVisibleInputRows = Math.min(6, Math.max(1, rawLines.length));
-    let startLine = Math.max(0, activeLineIdx - Math.floor(maxVisibleInputRows / 2));
-    const endLine = Math.min(lineMeta.length, startLine + maxVisibleInputRows);
-    if (endLine - startLine < maxVisibleInputRows) {
-      startLine = Math.max(0, endLine - maxVisibleInputRows);
-    }
-    const visibleLines = lineMeta.slice(startLine, endLine);
-    const composerTotalRows = 3 + visibleLines.length;
-    const bodyH = Math.max(4, rows - 2 - composerTotalRows);
-    // 1-based terminal rows where the composer input lines are rendered:
-    // Row 1..2: Header, Row 3..(2+bodyH): Body, Row (3+bodyH): compTop, Row (4+bodyH)..(3+bodyH+visibleLines.length): Input lines
-    const firstInputRowY = 4 + bodyH;
-    const lastInputRowY = firstInputRowY + visibleLines.length - 1;
-
+    const layout = computeComposerLayout(buffer, cursorPos, rows);
+    void cols;
     return {
-      lineMeta,
-      visibleLines,
-      activeLineIdx,
-      bodyH,
-      firstInputRowY,
-      lastInputRowY,
+      lineMeta: layout.lineMeta,
+      visibleLines: layout.visibleLines,
+      activeLineIdx: layout.activeLineIdx,
+      bodyH: layout.bodyHeight,
+      firstInputRowY: layout.firstInputRowY,
+      lastInputRowY: layout.lastInputRowY,
     };
   };
 
+  /**
+   * Maps a click in the composer to a buffer offset.
+   *
+   * Coordinates are cell-based: the prompt glyph and any scroll ellipsis consume
+   * columns, and a wide character under the cursor maps to its cluster start.
+   */
   const mapMouseToInputOffset = (
     x: number,
     y: number,
@@ -1512,18 +1551,23 @@ export async function startFullScreenTui(
     );
     const meta = layout.visibleLines[relRow]!;
     const innerCompW = Math.max(10, cols - 4);
-    const maxInputChars = Math.max(10, innerCompW - 3);
-    const horizShift =
-      meta.text.length + 1 > maxInputChars
-        ? meta.text.length + 1 - (maxInputChars - 1)
-        : 0;
-    // Input text starts at 1-based column 4 (` ❯ ` or `   ` is 3 columns: col 1..3)
-    const clickedVisCol = Math.max(0, x - 4);
-    const localCol =
-      horizShift > 0
-        ? Math.max(0, Math.min(meta.text.length, horizShift + Math.max(0, clickedVisCol - 1)))
-        : Math.max(0, Math.min(meta.text.length, clickedVisCol));
-    return meta.startOffset + localCol;
+    const textBudget = Math.max(1, innerCompW - 2);
+    // Mirror the renderer exactly: the same caret position produces the same
+    // horizontal window, so a click lands on the character under the pointer.
+    const caretOnLine =
+      cursorPos >= meta.startOffset && cursorPos <= meta.endOffset
+        ? cursorPos - meta.startOffset
+        : -1;
+    const windowed = windowInputLine(meta.text, caretOnLine, textBudget);
+
+    // Columns: 1 = leading space, 2..3 = "❯ " or "  ", 4.. = input text.
+    const cellsIntoLine = Math.max(0, x - 4);
+    const cellsIntoWindow = Math.max(0, cellsIntoLine - (windowed.leftEllipsis ? 1 : 0));
+    const charIndex = charIndexAtCell(windowed.text, cellsIntoWindow);
+    return Math.min(
+      meta.endOffset,
+      meta.startOffset + windowed.startChar + charIndex,
+    );
   };
 
   const handleMouseEvent = (ev: SgrMouseEvent) => {
@@ -1732,14 +1776,7 @@ export async function startFullScreenTui(
     // 1. If a centered modal is open, handle modal navigation
     if (modal) {
       const m = modal;
-      const filtered = m.filter.trim()
-        ? m.items.filter(
-            (it) =>
-              it.label.toLowerCase().includes(m.filter.toLowerCase()) ||
-              (it.badge ?? "").toLowerCase().includes(m.filter.toLowerCase()) ||
-              (it.detail ?? "").toLowerCase().includes(m.filter.toLowerCase()),
-          )
-        : m.items;
+      const filtered = filterModalItems(m.items, m.filter);
 
       if (m.id === "permissions" && permissionDraft) {
         if (key?.name === "escape" || (key?.ctrl && key?.name === "c")) {
@@ -1748,7 +1785,7 @@ export async function startFullScreenTui(
           return;
         }
         if (key?.name === "backspace") {
-          m.filter = m.filter.slice(0, -1);
+          m.filter = backspaceFilter(m.filter);
           render();
           return;
         }
@@ -1809,19 +1846,17 @@ export async function startFullScreenTui(
       }
 
       if (key?.name === "up") {
-        m.selectedIdx =
-          filtered.length > 0 ? (m.selectedIdx - 1 + filtered.length) % filtered.length : 0;
+        m.selectedIdx = moveSelection(m.selectedIdx, filtered.length, -1);
         render();
         return;
       }
       if (key?.name === "down") {
-        m.selectedIdx =
-          filtered.length > 0 ? (m.selectedIdx + 1) % filtered.length : 0;
+        m.selectedIdx = moveSelection(m.selectedIdx, filtered.length, 1);
         render();
         return;
       }
       if (key?.name === "backspace") {
-        m.filter = m.filter.slice(0, -1);
+        m.filter = backspaceFilter(m.filter);
         m.selectedIdx = 0;
         render();
         return;
@@ -2125,180 +2160,198 @@ export async function startFullScreenTui(
         return;
       }
       if (str && str.length === 1 && str >= " " && !key?.ctrl && !key?.meta) {
-        m.filter = sanitizeTerminalText(stripMouseEscapeGarbage(m.filter + str));
+        m.filter = sanitizeTerminalText(
+          stripMouseEscapeGarbage(appendFilterChar(m.filter, str)),
+        );
         m.selectedIdx = 0;
         render();
       }
       return;
     }
 
-    // Allow scrolling at ALL times (even while the agent is busy working!)
+    // Arrow scrolling works at all times (even while the agent is busy).
+    // PageUp/PageDown are owned by the keymap so there is a single owner.
     if (
-      key?.name === "pageup" ||
       (key?.shift && key.name === "up") ||
       (key?.meta && key.name === "up") ||
       (activeAbort && key?.name === "up")
     ) {
-      scrollOffset += key?.name === "pageup" ? 8 : 3;
+      scrollOffset += 3;
       render();
       return;
     }
     if (
-      key?.name === "pagedown" ||
       (key?.shift && key.name === "down") ||
       (key?.meta && key.name === "down") ||
       (activeAbort && key?.name === "down")
     ) {
-      scrollOffset = Math.max(0, scrollOffset - (key?.name === "pagedown" ? 8 : 3));
+      scrollOffset = Math.max(0, scrollOffset - 3);
       render();
       return;
     }
 
-    // 2. If agent is busy streaming, Esc or Ctrl+C interrupts the stream, and Ctrl+U/Alt+J inspect subagents/jobs
-    if (activeAbort) {
-      if (key?.name === "escape" || (key?.ctrl && key?.name === "c")) {
-        activeAbort.abort();
-      } else if (key?.ctrl && key?.name === "u") {
-        openSubagentInspectorListModal();
-      } else if (key?.meta && key?.name === "j") {
-        openJobsListModal();
-      }
-      return;
-    }
+    // 2. Global hotkeys. The key→action mapping lives in keymap.ts so it is
+    //    testable and cannot drift from what the footer advertises; this branch
+    //    only performs the action.
+    const action = resolveHotkey(key, {
+      modalOpen: false, // the modal branch returned above
+      busy: activeAbort !== null,
+      hasInput: buffer.length > 0,
+      hasCatalog: agent.catalog.length > 0,
+    });
 
-    // 3. Global Hotkeys in Composer
-    const hotkeyNext = applyComposerHotkeys(
-      {
-        mode: agent.config.mode,
-        effort: agent.config.reasoningEffort,
-        wire: agent.config.wire,
-      },
-      key,
-    );
-    if (hotkeyNext) {
-      agent.config.mode = hotkeyNext.mode;
-      agent.config.reasoningEffort = hotkeyNext.effort;
-      agent.config.wire = hotkeyNext.wire;
-      agent.session.wire = hotkeyNext.wire;
-      saveConfigForWorkspace(agent.config, {
-        mode: hotkeyNext.mode,
-        reasoningEffort: hotkeyNext.effort,
-        wire: hotkeyNext.wire,
-      });
-      notice = `Mode=${hotkeyNext.mode.toUpperCase()} · Effort=${hotkeyNext.effort} · Wire=${hotkeyNext.wire}`;
-      render();
-      return;
-    }
+    if (action) {
+      switch (action.type) {
+        case "interrupt":
+          activeAbort?.abort();
+          return;
 
-    // Ctrl+K -> Open Primary Model Switcher Modal
-    if (key?.ctrl && key.name === "k") {
-      openModelModal();
-      return;
-    }
+        case "scroll":
+          scrollOffset = Math.max(0, scrollOffset + action.delta);
+          render();
+          return;
 
-    // Ctrl+G -> Open Subagent & Role Model Picker Modal
-    if (key?.ctrl && key.name === "g") {
-      openSubagentRoleModal();
-      return;
-    }
+        case "open_modal":
+          switch (action.modal) {
+            case "model":
+              openModelModal();
+              return;
+            case "subagent_roles":
+              openSubagentRoleModal();
+              return;
+            case "config":
+              openConfigModal();
+              return;
+            case "team":
+              openTeamModal();
+              return;
+            case "command":
+              openCommandPaletteModal();
+              return;
+            case "sessions":
+              openSessionsModal();
+              return;
+            case "subagents":
+              openSubagentInspectorListModal();
+              return;
+            case "jobs":
+              openJobsListModal();
+              return;
+            default:
+              return;
+          }
 
-    // Ctrl+O -> Open Settings & Configuration Center Modal
-    if (key?.ctrl && key.name === "o") {
-      openConfigModal();
-      return;
-    }
+        case "cycle_model": {
+          const idx = agent.catalog.findIndex((m) => m.id === agent.config.model);
+          const next = agent.catalog[(idx + 1) % agent.catalog.length]!;
+          agent.config.model = next.id;
+          agent.session.model = next.id;
+          saveConfigForWorkspace(agent.config, { model: next.id });
+          notice = `Cycled model to ${next.id}`;
+          render();
+          return;
+        }
 
-    // Ctrl+A -> Open Specialist Agent Team Modal
-    if (key?.ctrl && key.name === "a") {
-      openTeamModal();
-      return;
-    }
+        case "toggle_sidebar":
+          showSidebar = !showSidebar;
+          notice = showSidebar
+            ? "Sidebar drawer shown (Ctrl+B to hide for clean copy)"
+            : "Sidebar drawer hidden (clean full-width copy)";
+          render();
+          return;
 
-    // Ctrl+P -> Open Command Palette Modal
-    if (key?.ctrl && key.name === "p") {
-      openCommandPaletteModal();
-      return;
-    }
+        case "cycle_mode":
+        case "cycle_effort":
+        case "cycle_wire": {
+          const next = applyComposerHotkeys(
+            {
+              mode: agent.config.mode,
+              effort: agent.config.reasoningEffort,
+              wire: agent.config.wire,
+            },
+            key,
+          );
+          if (!next) return;
+          agent.config.mode = next.mode;
+          agent.config.reasoningEffort = next.effort;
+          agent.config.wire = next.wire;
+          agent.session.wire = next.wire;
+          saveConfigForWorkspace(agent.config, {
+            mode: next.mode,
+            reasoningEffort: next.effort,
+            wire: next.wire,
+          });
+          notice = `Mode=${next.mode.toUpperCase()} · Effort=${next.effort} · Wire=${next.wire}`;
+          render();
+          return;
+        }
 
-    // Ctrl+U -> Open Subagent Work Inspector Modal
-    if (key?.ctrl && key.name === "u") {
-      openSubagentInspectorListModal();
-      return;
-    }
+        case "clear_input": {
+          // Ctrl+C with a selection copies it instead of discarding the text.
+          const selInput = extractSelectedInputText(buffer, inputSelection);
+          if (key?.ctrl && key.name === "c" && selInput.length > 0) {
+            copyTextToSystemClipboard(selInput);
+            stdout.write(`\x1b]52;c;${Buffer.from(selInput, "utf8").toString("base64")}\x07`);
+            inputSelection = null;
+            notice = `Copied selected input (${selInput.length} chars) to clipboard!`;
+            render();
+            return;
+          }
+          buffer = "";
+          cursorPos = 0;
+          inputSelection = null;
+          selectedSuggestionIdx = 0;
+          notice = "Input cleared (Ctrl+C again to exit)";
+          render();
+          return;
+        }
 
-    // Ctrl+R -> Open Session Switcher (switch / resume saved sessions)
-    if (key?.ctrl && key.name === "r") {
-      openSessionsModal();
-      return;
-    }
+        case "exit":
+          cleanupAndExit();
+          return;
 
-    // Alt+J -> Open Background Terminal Jobs Modal (Ctrl+J is reserved for newline / Shift+Enter in terminals!)
-    if (key?.meta && key.name === "j") {
-      openJobsListModal();
-      return;
-    }
+        case "copy": {
+          const selInput = extractSelectedInputText(buffer, inputSelection);
+          if (selInput.length > 0) {
+            const ok = copyTextToSystemClipboard(selInput);
+            stdout.write(`\x1b]52;c;${Buffer.from(selInput, "utf8").toString("base64")}\x07`);
+            notice = ok
+              ? `Copied selected input (${selInput.length} chars) to clipboard!`
+              : "Failed to access system clipboard";
+            render();
+            return;
+          }
+          const lastAssistant = [...agent.session.messages]
+            .reverse()
+            .find((m) => m.role === "assistant" && m.content.trim().length > 0);
+          if (lastAssistant) {
+            const ok = copyTextToSystemClipboard(lastAssistant.content);
+            notice = ok
+              ? `Copied last response (${lastAssistant.content.length} chars) to clipboard!`
+              : "Failed to access system clipboard";
+          } else {
+            notice = "No assistant response to copy yet";
+          }
+          render();
+          return;
+        }
 
-    // F2 -> Cycle through top fast/flagship models
-    if (key?.name === "f2" && agent.catalog.length > 0) {
-      const idx = agent.catalog.findIndex((m) => m.id === agent.config.model);
-      const next = agent.catalog[(idx + 1) % agent.catalog.length]!;
-      agent.config.model = next.id;
-      agent.session.model = next.id;
-      saveConfigForWorkspace(agent.config, { model: next.id });
-      notice = `Cycled model to ${next.id}`;
-      render();
-      return;
-    }
-
-    // Ctrl+B -> Toggle Right Sidebar
-    if (key?.ctrl && key.name === "b") {
-      showSidebar = !showSidebar;
-      notice = showSidebar ? "Sidebar drawer shown (Ctrl+B to hide for clean copy)" : "Sidebar drawer hidden (clean full-width copy)";
-      render();
-      return;
-    }
-
-    // Ctrl+Y -> Copy selected input text (if active), else copy last assistant response to clipboard
-    if (key?.ctrl && key.name === "y") {
-      const selInput = extractSelectedInputText(buffer, inputSelection);
-      if (selInput.length > 0) {
-        const ok = copyTextToSystemClipboard(selInput);
-        stdout.write(`\x1b]52;c;${Buffer.from(selInput, "utf8").toString("base64")}\x07`);
-        notice = ok
-          ? `Copied selected input (${selInput.length} chars) to clipboard!`
-          : "Failed to access system clipboard";
-        render();
-        return;
-      }
-      const lastAssistant = [...agent.session.messages]
-        .reverse()
-        .find((m) => m.role === "assistant" && m.content.trim().length > 0);
-      if (lastAssistant) {
-        const ok = copyTextToSystemClipboard(lastAssistant.content);
-        notice = ok
-          ? `Copied last response (${lastAssistant.content.length} chars) to clipboard!`
-          : "Failed to access system clipboard";
-      } else {
-        notice = "No assistant response to copy yet";
-      }
-      render();
-      return;
-    }
-
-    // Ctrl+X -> Cut selected input text to clipboard
-    if (key?.ctrl && key.name === "x") {
-      const selInput = extractSelectedInputText(buffer, inputSelection);
-      if (selInput.length > 0 && inputSelection) {
-        copyTextToSystemClipboard(selInput);
-        stdout.write(`\x1b]52;c;${Buffer.from(selInput, "utf8").toString("base64")}\x07`);
-        const s = Math.min(inputSelection.anchor, inputSelection.focus);
-        const e = Math.max(inputSelection.anchor, inputSelection.focus);
-        buffer = buffer.slice(0, s) + buffer.slice(e);
-        cursorPos = s;
-        inputSelection = null;
-        notice = `Cut selected input (${selInput.length} chars) to clipboard!`;
-        render();
-        return;
+        case "cut": {
+          const selInput = extractSelectedInputText(buffer, inputSelection);
+          if (selInput.length > 0 && inputSelection) {
+            copyTextToSystemClipboard(selInput);
+            stdout.write(`\x1b]52;c;${Buffer.from(selInput, "utf8").toString("base64")}\x07`);
+            const s = Math.min(inputSelection.anchor, inputSelection.focus);
+            const e = Math.max(inputSelection.anchor, inputSelection.focus);
+            buffer = buffer.slice(0, s) + buffer.slice(e);
+            cursorPos = s;
+            inputSelection = null;
+            notice = `Cut selected input (${selInput.length} chars) to clipboard!`;
+            render();
+            return;
+          }
+          break;
+        }
       }
     }
 
@@ -2314,42 +2367,28 @@ export async function startFullScreenTui(
       return;
     }
 
-    // Ctrl+C / Ctrl+D -> Copy selected input if selection active, else clear buffer or exit
-    if (key?.ctrl && (key.name === "c" || key.name === "d")) {
-      if (key.name === "c") {
-        const selInput = extractSelectedInputText(buffer, inputSelection);
-        if (selInput.length > 0) {
-          copyTextToSystemClipboard(selInput);
-          stdout.write(`\x1b]52;c;${Buffer.from(selInput, "utf8").toString("base64")}\x07`);
-          inputSelection = null;
-          notice = `Copied selected input (${selInput.length} chars) to clipboard!`;
-          render();
-          return;
-        }
+    // Esc has one meaning per state, in this order: close overlay, clear
+    // selection, clear the typed buffer. It never scrolls the transcript — that
+    // is what PgUp/PgDn are for — so the viewport cannot jump unexpectedly.
+    if (key?.name === "escape") {
+      if (modal) {
+        return; // handled by the modal branch above
+      }
+      if (selection || inputSelection) {
+        selection = null;
+        inputSelection = null;
+        notice = "Selection cleared";
+        render();
+        return;
       }
       if (buffer.length > 0) {
         buffer = "";
         cursorPos = 0;
-        inputSelection = null;
-        notice = "Cleared input (press Ctrl+C again to exit)";
+        selectedSuggestionIdx = 0;
+        notice = "Input cleared (Esc again does nothing; Ctrl+C twice exits)";
         render();
         return;
       }
-      cleanupAndExit();
-      return;
-    }
-
-    if (key?.name === "escape") {
-      if (inputSelection || selection) {
-        inputSelection = null;
-        selection = null;
-        notice = null;
-        render();
-        return;
-      }
-      buffer = "";
-      cursorPos = 0;
-      scrollOffset = 0;
       notice = null;
       render();
       return;
@@ -2767,13 +2806,14 @@ export interface FullScreenTuiState {
 }
 
 /**
- * Truncates an ANSI-styled line if it exceeds `width` visible columns, without padding trailing spaces.
+ * Truncates an ANSI-styled line if it exceeds `width` cells, without padding
+ * trailing spaces. Cell-aware, so wide characters never overflow the column.
  */
 export function truncateLineToWidth(line: string, width: number): string {
   if (width <= 0) return "";
-  const vis = visibleLength(line);
-  if (vis <= width) return line;
-  return fitLineToWidth(line, width).trimEnd();
+  if (visibleLength(line) <= width) return line;
+  const { text: head, truncated } = sliceToWidth(line, Math.max(0, width - 1));
+  return truncated ? `${head}\x1b[0m…` : head;
 }
 
 /**
@@ -2822,94 +2862,126 @@ export function copyTextToSystemClipboard(text: string): boolean {
 /**
  * Truncate or pad an ANSI-styled line to an exact visible column width.
  */
+/**
+ * Pads or truncates an ANSI-styled line to exactly `width` display cells.
+ *
+ * Truncation is cell-aware (wide characters count as two) and never splits a
+ * grapheme cluster, so a CJK line cannot overflow into the next column.
+ */
 export function fitLineToWidth(line: string, width: number): string {
   if (width <= 0) return "";
   const vis = visibleLength(line);
   if (vis === width) return line;
   if (vis < width) return line + " ".repeat(width - vis);
 
-  // Truncate while preserving ANSI escape sequences
-  let visibleCount = 0;
-  let result = "";
-  let i = 0;
-  const maxVis = Math.max(0, width - 1);
-  while (i < line.length && visibleCount < maxVis) {
-    if (line[i] === "\x1b" && line[i + 1] === "[") {
-      const endSeq = line.indexOf("m", i);
-      if (endSeq !== -1) {
-        result += line.slice(i, endSeq + 1);
-        i = endSeq + 1;
-        continue;
-      }
-    }
-    result += line[i];
-    visibleCount++;
-    i++;
-  }
-  result += "\x1b[0m" + (width >= 1 ? "…" : "");
-  return padEndVisible(result, width);
+  const budget = Math.max(0, width - 1); // one cell for the ellipsis
+  const { text: head, truncated } = sliceToWidth(line, budget);
+  const withEllipsis = truncated ? `${head}\x1b[0m…` : head;
+  return padEndVisible(withEllipsis, width);
 }
 
 /**
- * Word-wraps plain or ANSI-styled text lines so they fit inside `maxWidth` columns
- * without truncating long styled Markdown sentences.
+ * Cell-aware word wrap: prefers breaking at spaces, hard-breaks only a single
+ * word longer than the pane. Widths are display cells, so CJK/emoji lines break
+ * at the right column, and the active SGR style is reopened on each line.
  */
 export function wrapTranscriptLines(lines: string[], maxWidth: number): string[] {
   if (maxWidth <= 8) return lines;
   const wrapped: string[] = [];
 
   for (const raw of lines) {
-    const subLines = raw.split(/\r?\n/);
-    for (const line of subLines) {
+    for (const line of raw.split(/\r?\n/)) {
       if (visibleLength(line) <= maxWidth) {
         wrapped.push(line);
         continue;
       }
 
-      // Tokenize into ANSI sequences and single visible code units, wrapping at word boundaries
-      const tokens: Array<{ isAnsi: boolean; val: string }> = [];
+      // Split into ANSI runs and grapheme clusters so we can measure cells
+      // without counting escape bytes.
+      type Token = { ansi: string } | { cluster: string };
+      const tokens: Token[] = [];
       let i = 0;
       while (i < line.length) {
         if (line[i] === "\x1b" && line[i + 1] === "[") {
           const endSeq = line.indexOf("m", i);
           if (endSeq !== -1) {
-            tokens.push({ isAnsi: true, val: line.slice(i, endSeq + 1) });
+            tokens.push({ ansi: line.slice(i, endSeq + 1) });
             i = endSeq + 1;
             continue;
           }
         }
-        tokens.push({ isAnsi: false, val: line[i]! });
-        i++;
+        const nextEsc = line.indexOf("\x1b[", i);
+        const plainEnd = nextEsc === -1 ? line.length : nextEsc;
+        for (const cluster of graphemes(line.slice(i, plainEnd))) {
+          tokens.push({ cluster });
+        }
+        i = plainEnd;
       }
 
-      let curLine = "";
-      let curVis = 0;
+      let cur = "";
+      let curCells = 0;
       let activeAnsi = "";
+      // Character index in `cur` just after the most recent *content* space.
+      // Spaces that make up the leading indent are not break candidates.
+      let lastSpace = -1;
+      let indentLen = 0;
 
-      for (let t = 0; t < tokens.length; t++) {
-        const tok = tokens[t]!;
-        if (tok.isAnsi) {
-          curLine += tok.val;
-          if (tok.val === "\x1b[0m" || tok.val === "\x1b[22m" || tok.val === "\x1b[39m") {
+      const emit = (nextIndent: string) => {
+        wrapped.push(cur + (activeAnsi ? "\x1b[0m" : ""));
+        cur = nextIndent + activeAnsi;
+        curCells = nextIndent.length;
+        indentLen = nextIndent.length;
+        lastSpace = -1;
+      };
+
+      for (const token of tokens) {
+        if ("ansi" in token) {
+          cur += token.ansi;
+          if (
+            token.ansi === "\x1b[0m" ||
+            token.ansi === "\x1b[22m" ||
+            token.ansi === "\x1b[39m"
+          ) {
             activeAnsi = "";
           } else {
-            activeAnsi += tok.val;
+            activeAnsi += token.ansi;
           }
           continue;
         }
 
-        curLine += tok.val;
-        curVis++;
+        const cluster = token.cluster;
+        const w = textWidth(cluster);
 
-        if (curVis >= maxWidth) {
-          wrapped.push(curLine + (activeAnsi ? "\x1b[0m" : ""));
-          curLine = "  " + activeAnsi;
-          curVis = 2;
+        // Ensure there is room before adding, and keep breaking until there is:
+        // backtracking to a space can leave the line exactly full, in which case
+        // the current cluster still needs a fresh line.
+        while (curCells + w > maxWidth) {
+          if (cluster === " ") {
+            emit("  ");
+            break;
+          }
+          if (lastSpace > indentLen) {
+            const head = cur.slice(0, lastSpace);
+            const tail = cur.slice(lastSpace + 1);
+            wrapped.push(head + (activeAnsi ? "\x1b[0m" : ""));
+            cur = "  " + activeAnsi + tail;
+            indentLen = 2;
+            curCells = 2 + visibleLength(tail);
+            lastSpace = -1;
+            continue;
+          }
+          // A single word wider than the pane: hard-break it.
+          emit("  ");
+          break;
         }
+
+        cur += cluster;
+        curCells += w;
+        if (cluster === " " && curCells > indentLen) lastSpace = cur.length - 1;
       }
 
-      if (curVis > 0 && stripAnsi(curLine).trim().length > 0) {
-        wrapped.push(curLine + (activeAnsi ? "\x1b[0m" : ""));
+      if (curCells > 0 && stripAnsi(cur).trim().length > 0) {
+        wrapped.push(cur + (activeAnsi ? "\x1b[0m" : ""));
       }
     }
   }
@@ -3001,7 +3073,7 @@ function buildSidebarLines(state: FullScreenTuiState, width: number, height: num
 
   if (state.subagentRuns && state.subagentRuns.length > 0) {
     addDivider();
-    addSection(`Subagents (${state.subagentRuns.length}) [Ctrl+U]`);
+    addSection(`Subagents (${state.subagentRuns.length}) [Alt+U]`);
     for (const sub of state.subagentRuns.slice(-3)) {
       const stIcon =
         sub.status === "completed"
@@ -3036,54 +3108,32 @@ function buildSidebarLines(state: FullScreenTuiState, width: number, height: num
  * Pure function that renders the entire Full-Screen Terminal Viewport (`rows` lines × `cols` columns).
  */
 export function renderFullScreenViewport(state: FullScreenTuiState): string {
-  const cols = Math.max(60, state.cols || 100);
-  const rows = Math.max(16, state.rows || 28);
-
-  const hasSidebar = state.showSidebar && cols >= 95;
-  const sidebarWidth = hasSidebar ? Math.min(36, Math.max(28, Math.floor(cols * 0.28))) : 0;
-  const mainWidth = hasSidebar ? cols - sidebarWidth - 1 : cols;
-
-  // Compute multi-line composer rows first so bodyHeight dynamically adjusts when prompt has multiple lines
-  const rawInputLines = state.buffer.length > 0 ? state.buffer.split("\n") : [""];
-  const lineMeta: Array<{
-    lineIdx: number;
-    text: string;
-    startOffset: number;
-    endOffset: number;
-  }> = [];
-  let runOff = 0;
-  for (let i = 0; i < rawInputLines.length; i++) {
-    const txt = rawInputLines[i]!;
-    lineMeta.push({
-      lineIdx: i,
-      text: txt,
-      startOffset: runOff,
-      endOffset: runOff + txt.length,
-    });
-    runOff += txt.length + 1;
+  // A terminal smaller than the minimum cannot hold a coherent frame. Report it
+  // rather than emitting more rows than exist (which would scroll the alternate
+  // screen and corrupt every later frame), but still fill exactly `rows` lines so
+  // nothing from a previous, larger frame is left behind.
+  const rawCols = state.cols || 100;
+  const rawRows = state.rows || 28;
+  if (rawCols < MIN_COLS || rawRows < MIN_ROWS) {
+    const message =
+      `Terminal too small (${rawCols}x${rawRows}) — need ${MIN_COLS}x${MIN_ROWS}. Resize to continue.`;
+    // Fill exactly `rawRows` lines: the caller writes every row, so leaving rows
+    // out would leave stale content from the previous, larger frame visible.
+    const first = truncateLineToWidth(c.rose(message), Math.max(1, rawCols));
+    const lines = [first];
+    while (lines.length < rawRows) lines.push("");
+    return lines.join("\n");
   }
 
-  let activeInputLineIdx = 0;
-  for (let i = 0; i < lineMeta.length; i++) {
-    if (state.cursorPos >= lineMeta[i]!.startOffset && state.cursorPos <= lineMeta[i]!.endOffset) {
-      activeInputLineIdx = i;
-      break;
-    }
-  }
+  const { cols, rows, hasSidebar, sidebarWidth, mainWidth } = viewportGeometry(
+    rawCols,
+    rawRows,
+    state.showSidebar,
+  );
 
-  const maxVisibleInputRows = Math.min(6, Math.max(1, rawInputLines.length));
-  let startInputLine = Math.max(0, activeInputLineIdx - Math.floor(maxVisibleInputRows / 2));
-  const endInputLine = Math.min(lineMeta.length, startInputLine + maxVisibleInputRows);
-  if (endInputLine - startInputLine < maxVisibleInputRows) {
-    startInputLine = Math.max(0, endInputLine - maxVisibleInputRows);
-  }
-  const visibleInputMeta = lineMeta.slice(startInputLine, endInputLine);
-
-  // Layout row allocation:
-  // Row 0..1: Top Header Bar (2 rows)
-  // Middle Body: bodyHeight = rows - 2 - (3 + visibleInputMeta.length)
-  // Bottom Composer: compTop (1) + visibleInputMeta.length (1..6) + compBot (1) + footerBar (1)
-  const bodyHeight = Math.max(4, rows - 5 - visibleInputMeta.length);
+  const composerLayout = computeComposerLayout(state.buffer, state.cursorPos, rows);
+  const visibleInputMeta = composerLayout.visibleLines;
+  const bodyHeight = composerLayout.bodyHeight;
 
   // ── 1. Top Header Bar (Row 0 & Row 1) ─────────────────────────────────────
   const safeCwd = sanitizeTerminalText(state.cwd);
@@ -3202,14 +3252,7 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
   // Overlay Centered Modal if `state.modal` is open
   if (state.modal) {
     const m = state.modal;
-    const filtered = m.filter.trim()
-      ? m.items.filter(
-          (it) =>
-            it.label.toLowerCase().includes(m.filter.toLowerCase()) ||
-            (it.badge ?? "").toLowerCase().includes(m.filter.toLowerCase()) ||
-            (it.detail ?? "").toLowerCase().includes(m.filter.toLowerCase()),
-        )
-      : m.items;
+    const filtered = filterModalItems(m.items, m.filter);
 
     const modalW = Math.min(cols - 6, 78);
     const maxList = Math.min(10, Math.max(3, bodyHeight - 5));
@@ -3229,13 +3272,12 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
     modalLines.push(`${c.cyan("│")} ${padEndVisible(fitLineToWidth(filterText, innerModalW), innerModalW)} ${c.cyan("│")}`);
     modalLines.push(c.cyan(`├${"─".repeat(modalW - 2)}┤`));
 
-    const selIdx = Math.min(Math.max(0, m.selectedIdx), Math.max(0, filtered.length - 1));
-    const half = Math.floor(maxList / 2);
-    let listStart = Math.max(0, selIdx - half);
-    const listEnd = Math.min(filtered.length, listStart + maxList);
-    if (listEnd - listStart < maxList) {
-      listStart = Math.max(0, listEnd - maxList);
-    }
+    const selIdx = clampSelection(m.selectedIdx, filtered.length);
+    const { start: listStart, end: listEnd } = visibleModalRange(
+      filtered.length,
+      selIdx,
+      maxList,
+    );
 
     if (filtered.length === 0) {
       const emptyText = sanitizeTerminalText(m.emptyText ?? "No matching items.");
@@ -3313,55 +3355,54 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
       const meta = visibleInputMeta[vIdx]!;
       const linePrefix = meta.lineIdx === 0 ? glyph : "  ";
       const rawLine = meta.text;
+
+      // The prompt glyph occupies two cells on the first line; the text budget
+      // must be measured in cells, not characters.
+      const textBudget = Math.max(1, innerCompW - 2);
+      const caretOnThisLine =
+        state.cursorPos >= meta.startOffset && state.cursorPos <= meta.endOffset
+          ? state.cursorPos - meta.startOffset
+          : null;
+
+      const windowed = windowInputLine(rawLine, caretOnThisLine ?? -1, textBudget);
+      const prefix = `${windowed.leftEllipsis ? "…" : ""}`;
       let formattedLine: string;
 
-      const maxInputChars = Math.max(10, innerCompW - 3);
-      const horizShift =
-        rawLine.length + 1 > maxInputChars
-          ? rawLine.length + 1 - (maxInputChars - 1)
-          : 0;
-      const visibleRaw = horizShift > 0 ? rawLine.slice(horizShift) : rawLine;
-      const prefixEllipsis = horizShift > 0 ? "…" : "";
-
       if (hasInputSel) {
-        const localSelStart = Math.max(0, selStart - meta.startOffset - horizShift);
+        // Selection is expressed in line-relative character offsets; shift them
+        // into the windowed slice before styling.
+        const localSelStart = Math.max(0, selStart - meta.startOffset - windowed.startChar);
         const localSelEnd = Math.min(
-          visibleRaw.length,
-          selEnd - meta.startOffset - horizShift,
+          windowed.text.length,
+          selEnd - meta.startOffset - windowed.startChar,
         );
-        if (localSelEnd > localSelStart && localSelStart < visibleRaw.length) {
-          const beforeSel = visibleRaw.slice(0, localSelStart);
-          const selectedPart = visibleRaw.slice(localSelStart, localSelEnd);
-          const afterSel = visibleRaw.slice(localSelEnd);
-          formattedLine = `${c.white(prefixEllipsis + beforeSel)}\x1b[7m${selectedPart}\x1b[27m${c.white(afterSel)}`;
+        if (localSelEnd > localSelStart && localSelStart < windowed.text.length) {
+          const beforeSel = windowed.text.slice(0, localSelStart);
+          const selectedPart = windowed.text.slice(localSelStart, localSelEnd);
+          const afterSel = windowed.text.slice(localSelEnd);
+          formattedLine = `${c.white(prefix + beforeSel)}\x1b[7m${selectedPart}\x1b[27m${c.white(afterSel)}`;
         } else {
-          formattedLine = c.white(prefixEllipsis + visibleRaw);
+          formattedLine = c.white(prefix + windowed.text);
         }
-      } else if (
-        state.cursorPos >= meta.startOffset &&
-        state.cursorPos <= meta.endOffset
-      ) {
-        const localCur = state.cursorPos - meta.startOffset;
-        const before = rawLine.slice(0, localCur);
-        const after = rawLine.slice(localCur);
-        const withCaret = `${before}▏${after}`;
-        const clipped =
-          withCaret.length > maxInputChars
-            ? "…" + withCaret.slice(withCaret.length - (maxInputChars - 1))
-            : withCaret;
-        formattedLine = c.white(clipped);
+      } else if (windowed.caret >= 0) {
+        const before = windowed.text.slice(0, windowed.caret);
+        const after = windowed.text.slice(windowed.caret);
+        formattedLine = c.white(`${prefix}${before}▏${after}`);
       } else {
-        formattedLine = c.white(prefixEllipsis + visibleRaw);
+        formattedLine = c.white(prefix + windowed.text);
       }
 
-      compMidRows.push(` ${truncateLineToWidth(`${linePrefix}${formattedLine}`, innerCompW)}`);
+      const suffix = windowed.rightEllipsis ? "…" : "";
+      // No trailing padding: the row is cleared with `\x1b[2K` before writing,
+      // and padded rows would carry invisible spaces into a copy/paste.
+      compMidRows.push(` ${truncateLineToWidth(`${linePrefix}${formattedLine}${suffix}`, innerCompW)}`);
     }
   }
 
   const compBot = borderColor("─".repeat(Math.max(2, cols)));
 
   const footerBar = truncateLineToWidth(
-    ` ${c.bold("Shift+Enter:")} Newline ${c.slate("│")} ${c.bold("Shift+Tab:")} Mode ${c.slate("│")} ${c.bold("Ctrl+K:")} Model ${c.slate("│")} ${c.bold("Ctrl+R:")} Sessions ${c.slate("│")} ${c.bold("Ctrl+U:")} Subagents ${c.slate("│")} ${c.bold("Ctrl+P:")} Cmds`,
+    ` ${c.bold("Shift+Enter:")} Newline ${c.slate("│")} ${c.bold("Shift+Tab:")} Mode ${c.slate("│")} ${c.bold("Ctrl+K:")} Model ${c.slate("│")} ${c.bold("Ctrl+R:")} Sessions ${c.slate("│")} ${c.bold("Alt+U:")} Subagents ${c.slate("│")} ${c.bold("Ctrl+P:")} Cmds`,
     cols,
   );
 
@@ -3384,12 +3425,6 @@ export function renderFullScreenAnsiBuffer(
     .join("");
   const clearSeq = clearFirst ? "\x1b[2J" : "";
   return `\x1b[?2026h\x1b[?7l${clearSeq}${positioned}\x1b[?2026l`;
-}
-
-export interface SgrMouseEvent {
-  type: "down" | "drag" | "up" | "wheel_up" | "wheel_down" | "click";
-  x: number;
-  y: number;
 }
 
 function normalizeSelection(sel: PaneSelectionRange): PaneSelectionRange {
@@ -3451,11 +3486,9 @@ export function extractSelectedInputText(
 }
 
 /**
- * Determines whether a keypress event should insert a newline (`\n`) into the multi-line input buffer
- * instead of submitting the prompt:
- * - `Shift+Enter`, `Alt+Enter`, `Ctrl+Enter`
- * - `Ctrl+J` (`\n` / Line Feed, which emits `key.name === "enter"` in Node `readline` whereas plain Enter `\r` emits `key.name === "return"`)
- * - CSI-u / xterm `modifyOtherKeys` modified Enter (`\x1b[13;2u`, `\x1b[27;2;13~`, etc.)
+ * Determines whether a keypress should insert a newline (`\n`) instead of
+ * submitting. Kept as a thin alias so the rule lives in exactly one place
+ * (`keymap.ts`); see `isNewlineKey` for the terminal-specific details.
  */
 export function isNewlineKeyEvent(
   str: string | undefined,
@@ -3469,149 +3502,10 @@ export function isNewlineKeyEvent(
       }
     | undefined,
 ): boolean {
-  const rawSeq = str ?? key?.sequence ?? "";
-  // eslint-disable-next-line no-control-regex
-  if (/\x1b\[(?:13;[2-8]u|27;[2-8];13~)/.test(rawSeq)) {
-    return true;
-  }
-  if (key?.ctrl && key.name === "j") {
-    return true;
-  }
-  if (key?.name === "enter") {
-    // In Node readline, `\n` (0x0A from Ctrl+Enter / Ctrl+J / translated CSI-u Shift+Enter) emits `name: "enter"`,
-    // whereas plain Enter (`\r`, 0x0D) emits `name: "return"`.
-    return true;
-  }
-  if (key?.name === "return" && Boolean(key.shift || key.meta || key.ctrl)) {
-    return true;
-  }
-  return false;
+  return isNewlineKey(key, str);
 }
 
-function translateCsiKeyCode(code: number, mod: number): string {
-  const modBits = Math.max(0, mod - 1);
-  const shift = (modBits & 1) !== 0;
-  const alt = (modBits & 2) !== 0;
-  const ctrl = (modBits & 4) !== 0;
-
-  if (code === 13) {
-    return mod > 1 ? "\n" : "\r";
-  }
-  if (code === 27) {
-    return "\x1b";
-  }
-  if (code === 9) {
-    return shift ? "\x1b[Z" : "\t";
-  }
-  if (code === 32) {
-    return " ";
-  }
-  if (code === 127 || code === 8) {
-    return "\x7f";
-  }
-  if (code >= 97 && code <= 122) {
-    if (ctrl) return String.fromCharCode(code - 96);
-    const ch = shift ? String.fromCharCode(code - 32) : String.fromCharCode(code);
-    return alt ? `\x1b${ch}` : ch;
-  }
-  if (code >= 65 && code <= 90) {
-    if (ctrl) return String.fromCharCode(code - 64);
-    const ch = String.fromCharCode(code);
-    return alt ? `\x1b${ch}` : ch;
-  }
-  if (code >= 33 && code <= 126) {
-    const ch = String.fromCharCode(code);
-    return alt ? `\x1b${ch}` : ch;
-  }
-  return "";
-}
-
-/**
- * Splits a raw `stdin` chunk into parsed SGR mouse events (`down`, `drag`, `up`, `wheel_up`, `wheel_down`)
- * and pure keyboard text BEFORE `readline.emitKeypressEvents` ever sees the bytes.
- * Also translates CSI-u (`\x1b[code;modu`) and xterm modifyOtherKeys (`\x1b[27;mod;code~`) sequences
- * into standard VT sequences so `Shift+Enter`, `Esc`, `Ctrl+C`, `Ctrl+K`, `Shift+Tab`, and `Shift+Space`
- * work across all modern terminals, and normalizes multi-line paste chunks to `\n` so pasting never submits early.
- */
-export function splitMouseAndKeyboardBytes(chunk: Buffer | string): {
-  keyboardText: string;
-  mouseEvents: SgrMouseEvent[];
-} {
-  const raw = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-  const mouseEvents: SgrMouseEvent[] = [];
-  // eslint-disable-next-line no-control-regex
-  const sgrRegex = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
-
-  let match: RegExpExecArray | null;
-  while ((match = sgrRegex.exec(raw)) !== null) {
-    const btn = Number(match[1]);
-    const x = Number(match[2]);
-    const y = Number(match[3]);
-    const isRelease = match[4] === "m";
-
-    if (btn === 64) {
-      mouseEvents.push({ type: "wheel_up", x, y });
-    } else if (btn === 65) {
-      mouseEvents.push({ type: "wheel_down", x, y });
-    } else if ((btn & 32) !== 0 && !isRelease) {
-      mouseEvents.push({ type: "drag", x, y });
-    } else if ((btn & 3) === 0) {
-      mouseEvents.push({ type: isRelease ? "up" : "down", x, y });
-    }
-  }
-
-  let withoutMouse = raw
-    .replace(sgrRegex, "")
-    // Translate Kitty CSI-u (\x1b[code;modu or \x1b[codeu)
-    // eslint-disable-next-line no-control-regex
-    .replace(/\x1b\[(\d+)(?:;(\d+)(?::\d+)?)?u/g, (_m, cStr, mStr) =>
-      translateCsiKeyCode(Number(cStr), mStr ? Number(mStr) : 1),
-    )
-    // Translate xterm modifyOtherKeys (\x1b[27;mod;code~)
-    // eslint-disable-next-line no-control-regex
-    .replace(/\x1b\[27;(\d+);(\d+)~/g, (_m, mStr, cStr) =>
-      translateCsiKeyCode(Number(cStr), Number(mStr)),
-    );
-
-  // Normalize CRLF and multi-character CR paste chunks to LF (\n) so multi-line paste inserts newlines instead of submitting
-  withoutMouse = withoutMouse.replace(/\r\n/g, "\n");
-  if (withoutMouse.length > 1 && withoutMouse.includes("\r")) {
-    withoutMouse = withoutMouse.replace(/\r/g, "\n");
-  }
-
-  const keyboardText = stripMouseEscapeGarbage(withoutMouse);
-  return { keyboardText, mouseEvents };
-}
-
-/**
- * Strips both complete and partial SGR / X10 mouse coordinate fragments
- * (e.g. `<35;84;19M`, `<35;84;`, `\x1b[<64;80;20M`) even when emitted character-by-character
- * by Node's `readline.emitKeypressEvents`, so mouse movement or wheel sequences can NEVER
- * pollute the text input buffer, while preserving normal text like `1;2;3m`.
- */
-export function stripMouseEscapeGarbage(text: string): string {
-  return text
-    // eslint-disable-next-line no-control-regex
-    .replace(/(?:(?:\x1b\[<?|<)\d{1,3}|(?<!\d)(?:0|2|3[2-5]|6[45]));\d{1,4};\d{1,4}[Mm]/g, "")
-    // eslint-disable-next-line no-control-regex
-    .replace(/\x1b?\[?<\d+;\d+;?\d*$/g, "");
-}
-
-/**
- * Parses a single SGR mouse escape sequence (`\x1b[<btn;x;yM`).
- */
-export function parseSgrMouseEvent(raw: string): SgrMouseEvent | null {
-  const m = raw.match(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
-  if (!m) return null;
-  const btn = Number(m[1]);
-  const x = Number(m[2]);
-  const y = Number(m[3]);
-  const release = m[4] === "m";
-  if (btn === 64) return { type: "wheel_up", x, y };
-  if (btn === 65) return { type: "wheel_down", x, y };
-  if (btn === 0 && !release) return { type: "click", x, y };
-  return null;
-}
+// One newline rule for both composers: `isNewlineKey` in keymap.ts.
 
 export interface SessionExitBannerOptions {
   sessionId: string;

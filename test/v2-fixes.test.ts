@@ -14,10 +14,8 @@ import {
 import {
   parseSgrMouseEvent,
   stripMouseEscapeGarbage,
-  formatSessionExitBanner,
-  renderFullScreenAnsiBuffer,
-  type FullScreenTuiState,
-} from "../src/ui/fullscreen.js";
+} from "../src/ui/keyboard.js";
+import { formatSessionExitBanner, renderFullScreenAnsiBuffer, type FullScreenTuiState } from "../src/ui/fullscreen.js";
 import { VIEWPORT_PRESETS } from "../src/computer-use.js";
 
 describe("AivoCode v1.1 Fixes: Background Jobs, Plan-Aware Model Filtering, Iterative Review->Fix Loop, SGR Mouse/Scroll, Multi-Viewport & Exit Summary", () => {
