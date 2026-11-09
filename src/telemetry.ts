@@ -14,6 +14,7 @@
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomBytes } from "node:crypto";
+import { AIVO_CLIENT_VERSION } from "./client-identity.js";
 
 export type SpanKind = "agent" | "model" | "tool" | "subagent" | "workflow" | "mcp" | "lsp" | "other";
 export type SpanStatus = "ok" | "error" | "cancelled";
@@ -234,7 +235,7 @@ export class Tracer {
           },
           scopeSpans: [
             {
-              scope: { name: "aivo.agent", version: "1.0.0" },
+              scope: { name: "aivo.agent", version: AIVO_CLIENT_VERSION },
               spans: this.spans.map((span) => ({
                 traceId: span.traceId,
                 spanId: span.spanId,

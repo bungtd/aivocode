@@ -1,7 +1,7 @@
 {
   "name": "aivocode",
-  "version": "1.0.2",
-  "description": "AivoCode (aivo) v1.0 — AI Coding Studio & Native CLI Coding Agent for AivoKey",
+  "version": "1.1.0",
+  "description": "AivoCode (aivo) v1.1 — AI Coding Studio & Native CLI Coding Agent for AivoKey",
   "type": "module",
   "homepage": "https://aivokey.dev/cli",
   "license": "MIT",
@@ -17,6 +17,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "bin": {

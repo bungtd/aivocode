@@ -1,4 +1,4 @@
-# AivoCode (`aivocode` / `aivo`) v1.0.2
+# AivoCode (`aivocode` / `aivo`) v1.1.0
 
 **AivoCode (`aivo`)** adalah Full-Screen AI Coding Studio & Agent Harness di terminal yang dirancang khusus untuk ekosistem **AivoKey** (`https://api.aivokey.dev`).
 
@@ -20,7 +20,7 @@ aivo doctor
 Atau dari tarball rilis:
 
 ```bash
-npm install -g --force https://aivokey.dev/cli/download/aivocode-1.0.2.tgz
+npm install -g --force https://aivokey.dev/cli/download/aivocode-1.1.0.tgz
 ```
 
 Konfigurasi disimpan di `~/.aivokey/config.json` (permission `0600`). Key juga dapat diberikan lewat `AIVOKEY_API_KEY`.
@@ -28,7 +28,7 @@ Project dapat menimpa sebagian setting melalui `.aivokey.json` di root workspace
 
 ---
 
-## Fitur Utama AivoCode v1.0
+## Fitur Utama AivoCode v1.1
 ### 1. Full-Screen Alt-Buffer TUI Studio (100% Viewport Terminal)
 - Menggunakan **Alternate Screen Buffer (`\x1b[?1049h`)** yang mengisi **100% lebar × tinggi (`columns × rows`)** terminal Anda dan otomatis menyesuaikan ukuran saat window di-resize.
 - **Split-Pane Studio Layout:**

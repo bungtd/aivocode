@@ -15,6 +15,7 @@ import { createServer } from "node:http";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { AIVO_CLIENT_VERSION } from "./client-identity.js";
 import { writeFileAtomic } from "./fs-util.js";
 
 export interface OAuthTokens {
@@ -205,7 +206,7 @@ export async function registerOAuthClient(
         token_endpoint_auth_method: "none",
         ...(options.scope ? { scope: options.scope } : {}),
         software_id: "aivocode",
-        software_version: "1.0.0",
+        software_version: AIVO_CLIENT_VERSION,
       }),
     },
     options.fetchFn,
