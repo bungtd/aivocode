@@ -3,6 +3,53 @@
 All notable changes to AivoCode (`aivocode` / `aivo`) are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] — 2026-11-11
+
+Patch release: the TUI now exposes every command and can switch sessions.
+
+### Fixed
+
+**Slash palette was incomplete and truncated**
+- `SLASH_COMMANDS` listed 41 of the 55 commands `handleSlashCommand` handles, so
+  `/sessions`, `/new`, `/agents`, `/bg`, `/ps`, `/logs`, `/kill`, `/inspect`,
+  `/key`, `/usage`, `/web`, `/settings`, `/quit`, `/subagent-model` and
+  `/fast-model` never appeared in the `/` dropdown, the `Ctrl+P` palette, or
+  `/help`.
+- `computeComposerSuggestions` sliced matches to 8, hiding the rest of the list.
+  It now returns every match, and the dropdown scrolls with `↑/↓ N more` and a
+  `26-35/54` position indicator instead of clipping.
+- Prefix matches rank first, so `/mo` surfaces `/mode` before `/model` and
+  `/memory`.
+
+**Sessions could not be switched or resumed from the TUI**
+- The `sessions` modal id existed in the type union but nothing ever opened it,
+  and the TUI called `handleSlashCommand` with `interactive: false`, so
+  `/sessions` only printed a list.
+- New Session Switcher on `Ctrl+R` or `/sessions`: 50 recent sessions with
+  model, message count, cost and timestamp. `Enter` resumes in place and the
+  transcript replays from history; `Del` deletes a saved session (the active one
+  is protected). `/new`, `/clear` and `/fork` use the same path.
+- Starting with `-c` / `-s <id>` now replays the conversation into the
+  transcript instead of opening an empty screen.
+
+**Resuming leaked session-scoped state**
+- Only `agent.session` was swapped, so `/undo` kept reading the previous
+  session's checkpoint directory and `/jobs` the previous job directory.
+- New `AivoAgent.switchSession()` rebuilds the `CheckpointManager` and
+  `BackgroundJobManager` for the new session id, resets todos and subagent runs,
+  and syncs model and wire.
+
+**CLI**
+- `aivo sessions` prints the resume hint (`-c`, `-s <id>`, `Ctrl+R`) and
+  supports `--json`.
+
+### Tests
+- New `slash-command-coverage.test.ts` fails when a command is handled but
+  unlisted, or listed but unhandled, and pins the untruncated palette.
+- Added TUI render tests for a 54-item dropdown and the session modal, plus a
+  `switchSession` isolation test.
+- Fixed two Windows teardown races in the LSP and MCP suites.
+
 ## [1.1.0] — 2026-11-10
 
 Feature release: closes the remaining capability gaps against other coding-agent

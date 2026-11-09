@@ -1,6 +1,6 @@
 {
   "name": "aivocode",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "AivoCode (aivo) v1.1 — AI Coding Studio & Native CLI Coding Agent for AivoKey",
   "type": "module",
   "homepage": "https://aivokey.dev/cli",

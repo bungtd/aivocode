@@ -1,4 +1,4 @@
-# AivoCode (`aivocode` / `aivo`) v1.1.0
+# AivoCode (`aivocode` / `aivo`) v1.1.1
 
 **AivoCode (`aivo`)** adalah Full-Screen AI Coding Studio & Agent Harness di terminal yang dirancang khusus untuk ekosistem **AivoKey** (`https://api.aivokey.dev`).
 
@@ -20,7 +20,7 @@ aivo doctor
 Atau dari tarball rilis:
 
 ```bash
-npm install -g --force https://aivokey.dev/cli/download/aivocode-1.1.0.tgz
+npm install -g --force https://aivokey.dev/cli/download/aivocode-1.1.1.tgz
 ```
 
 Konfigurasi disimpan di `~/.aivokey/config.json` (permission `0600`). Key juga dapat diberikan lewat `AIVOKEY_API_KEY`.
