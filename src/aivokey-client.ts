@@ -376,23 +376,48 @@ export const DEFAULT_AIVOKEY_CATALOG: AivoModelInfo[] = [
   },
 ];
 
+function createTimeoutSignal(timeoutMs: number): {
+  signal: AbortSignal;
+  clear: () => void;
+} {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  (timer as unknown as { unref?: () => void }).unref?.();
+  return {
+    signal: controller.signal,
+    clear: () => clearTimeout(timer),
+  };
+}
+
 export async function fetchModels(
   baseUrl: string,
   fetchFn: typeof fetch = fetch,
+  timeoutMs: number = 15_000,
 ): Promise<AivoModelInfo[]> {
-  const res = await fetchFn(endpointUrl(baseUrl, "models"), {
-    method: "GET",
-    headers: { ...clientHeaders(), accept: "application/json" },
-  });
-  if (!res.ok) {
-    throw new Error(`GET /v1/models failed with HTTP ${res.status}`);
+  const timeout = createTimeoutSignal(timeoutMs);
+  try {
+    const res = await fetchFn(endpointUrl(baseUrl, "models"), {
+      method: "GET",
+      headers: { ...clientHeaders(), accept: "application/json" },
+      signal: timeout.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`GET /v1/models failed with HTTP ${res.status}`);
+    }
+    const body = (await res.json()) as { data?: unknown[] };
+    if (!Array.isArray(body.data)) return [];
+    return body.data
+      .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+      .map(parseModelRow)
+      .filter((m) => m.id.length > 0);
+  } catch (err) {
+    if (timeout.signal.aborted) {
+      throw new Error(`GET /v1/models timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    timeout.clear();
   }
-  const body = (await res.json()) as { data?: unknown[] };
-  if (!Array.isArray(body.data)) return [];
-  return body.data
-    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
-    .map(parseModelRow)
-    .filter((m) => m.id.length > 0);
 }
 
 function parseWindow(raw: unknown): AllowanceWindowStatus {
@@ -408,20 +433,42 @@ export async function inspectKey(
   baseUrl: string,
   apiKey: string,
   fetchFn: typeof fetch = fetch,
+  timeoutMs: number = 15_000,
 ): Promise<KeyInspectStatus> {
-  const res = await fetchFn(endpointUrl(baseUrl, "key"), {
-    method: "GET",
-    headers: {
-      ...clientHeaders(),
-      authorization: `Bearer ${apiKey}`,
-      accept: "application/json",
-    },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`GET /v1/key failed (${res.status}): ${text || res.statusText}`);
+  const timeout = createTimeoutSignal(timeoutMs);
+  let res: Response;
+  try {
+    res = await fetchFn(endpointUrl(baseUrl, "key"), {
+      method: "GET",
+      headers: {
+        ...clientHeaders(),
+        authorization: `Bearer ${apiKey}`,
+        accept: "application/json",
+      },
+      signal: timeout.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`GET /v1/key failed (${res.status}): ${text || res.statusText}`);
+    }
+  } catch (err) {
+    timeout.clear();
+    if (timeout.signal.aborted) {
+      throw new Error(`GET /v1/key timed out after ${timeoutMs}ms`);
+    }
+    throw err;
   }
-  const raw = (await res.json()) as Record<string, unknown>;
+  let raw: Record<string, unknown>;
+  try {
+    raw = (await res.json()) as Record<string, unknown>;
+  } catch (err) {
+    if (timeout.signal.aborted) {
+      throw new Error(`GET /v1/key timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    timeout.clear();
+  }
   const mode = raw.mode === "plan" ? "plan" : "payg";
   const balanceMicro = safeBigInt(raw.balance_micro);
   const fallbackEnabled = raw.fallback_enabled === true;
@@ -539,8 +586,9 @@ export function isModelUsableByKey(modelId: string, keyStatus: KeyInspectStatus 
     if (keyStatus.global) {
       const g = keyStatus.global;
       const w5hOk = g.w5h.limitMicro === 0n || g.w5h.usedMicro < g.w5h.limitMicro;
+      const w7dOk = g.w7d.limitMicro === 0n || g.w7d.usedMicro < g.w7d.limitMicro;
       const monthOk = g.month.limitMicro === 0n || g.month.usedMicro < g.month.limitMicro;
-      if (w5hOk && monthOk) return true;
+      if (w5hOk && w7dOk && monthOk) return true;
     }
     return keyStatus.fallbackEnabled && keyStatus.balanceMicro > 0n;
   }

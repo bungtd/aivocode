@@ -1,4 +1,4 @@
-import { c } from "./theme.js";
+import { c, sanitizeTerminalText } from "./theme.js";
 
 /**
  * Generates a colored, line-numbered unified diff block (Claude Code / OpenCode style)
@@ -10,8 +10,8 @@ export function renderUnifiedDiff(
   after: string,
   contextLines: number = 3,
 ): string {
-  const oldLines = before.replace(/\r\n/g, "\n").split("\n");
-  const newLines = after.replace(/\r\n/g, "\n").split("\n");
+  const oldLines = sanitizeTerminalText(before.replace(/\r\n/g, "\n")).split("\n");
+  const newLines = sanitizeTerminalText(after.replace(/\r\n/g, "\n")).split("\n");
 
   // Compute simple LCS / prefix-suffix + line diff
   let prefix = 0;
@@ -102,7 +102,7 @@ function formatInlineMarkdown(line: string): string {
 }
 
 export function renderTerminalMarkdown(markdown: string): string {
-  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const lines = sanitizeTerminalText(markdown.replace(/\r\n/g, "\n")).split("\n");
   const out: string[] = [];
   let inCodeBlock = false;
   let codeLang = "";

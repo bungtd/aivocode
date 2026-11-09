@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { AIVO_CLIENT_VERSION } from "./client-identity.js";
 import { defaultGlobalConfigPath } from "./config.js";
+import { writeFileAtomic } from "./fs-util.js";
 
 /**
  * In-place update support for AivoCode.
@@ -80,7 +81,28 @@ export function compareVersions(a: string, b: string): number {
   // A release outranks any prerelease of the same core version.
   if (left.pre === "") return 1;
   if (right.pre === "") return -1;
-  return left.pre > right.pre ? 1 : -1;
+
+  // Semver prerelease identifiers compare numerically when both are numeric.
+  const leftIds = left.pre.split(".");
+  const rightIds = right.pre.split(".");
+  for (let i = 0; i < Math.max(leftIds.length, rightIds.length); i++) {
+    const l = leftIds[i];
+    const r = rightIds[i];
+    if (l === undefined) return -1;
+    if (r === undefined) return 1;
+    const lNum = /^\d+$/.test(l) ? Number(l) : null;
+    const rNum = /^\d+$/.test(r) ? Number(r) : null;
+    if (lNum !== null && rNum !== null) {
+      if (lNum !== rNum) return lNum > rNum ? 1 : -1;
+    } else if (lNum !== null) {
+      return -1;
+    } else if (rNum !== null) {
+      return 1;
+    } else if (l !== r) {
+      return l > r ? 1 : -1;
+    }
+  }
+  return 0;
 }
 
 /** Validate a manifest payload; anything malformed is ignored, never trusted. */
@@ -146,8 +168,7 @@ export function readUpdateCache(path: string): UpdateCache | null {
 /** Best-effort cache write: an unwritable HOME must not break the CLI. */
 export function writeUpdateCache(path: string, cache: UpdateCache): void {
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(cache, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+    writeFileAtomic(path, JSON.stringify(cache, null, 2) + "\n", 0o600);
   } catch {
     /* ignore */
   }

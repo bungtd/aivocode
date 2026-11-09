@@ -6,6 +6,50 @@ import { CheckpointManager } from "../src/checkpoint.js";
 import { createToolset, type TodoItem } from "../src/tools/index.js";
 
 describe("File Checkpoints (/undo) & Coding Tools", () => {
+  it("scrubs secrets from run_shell and honors permissions.env allowlists", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "aivo-tools-env-"));
+    const previousKey = process.env.AIVOKEY_API_KEY;
+    const previousGithub = process.env.GITHUB_TOKEN;
+    process.env.AIVOKEY_API_KEY = "sk-aivo-env-test";
+    process.env.GITHUB_TOKEN = "ghp-env-test";
+    try {
+      const command =
+        process.platform === "win32"
+          ? 'Write-Output ("KEY=" + $env:AIVOKEY_API_KEY); Write-Output ("GITHUB=" + $env:GITHUB_TOKEN)'
+          : 'printf "KEY=%s\\nGITHUB=%s\\n" "$AIVOKEY_API_KEY" "$GITHUB_TOKEN"';
+      const scrubbed = createToolset({
+        cwd: dir,
+        mode: "auto",
+        checkpoints: new CheckpointManager(),
+        todos: [],
+      });
+      const scrubbedRes = await scrubbed.execute("run_shell", { command });
+      expect(scrubbedRes.isError).toBeFalsy();
+      expect(scrubbedRes.output).not.toContain("sk-aivo-env-test");
+      expect(scrubbedRes.output).not.toContain("ghp-env-test");
+      expect(scrubbedRes.output).toContain("KEY=");
+      expect(scrubbedRes.output).toContain("GITHUB=");
+
+      const allowed = createToolset({
+        cwd: dir,
+        mode: "auto",
+        checkpoints: new CheckpointManager(),
+        todos: [],
+        envAllow: ["GITHUB_TOKEN"],
+      });
+      const allowedRes = await allowed.execute("run_shell", { command });
+      expect(allowedRes.isError).toBeFalsy();
+      expect(allowedRes.output).not.toContain("sk-aivo-env-test");
+      expect(allowedRes.output).toContain("GITHUB=ghp-env-test");
+    } finally {
+      if (previousKey === undefined) delete process.env.AIVOKEY_API_KEY;
+      else process.env.AIVOKEY_API_KEY = previousKey;
+      if (previousGithub === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = previousGithub;
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 20_000);
+
   it("reads files with 1-based line numbers, edits preserving CRLF and stripping accidental line prefixes, and undoes turn changes via CheckpointManager", async () => {
     const dir = mkdtempSync(join(tmpdir(), "aivo-tools-"));
     try {
@@ -67,7 +111,7 @@ describe("File Checkpoints (/undo) & Coding Tools", () => {
       );
       expect(existsSync(join(dir, "nested/newfile.ts"))).toBe(true);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -104,7 +148,7 @@ describe("File Checkpoints (/undo) & Coding Tools", () => {
       expect(todoRes.output).toContain("[x] Inspect codebase");
       expect(todoRes.output).toContain("[~] Implement fix");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -140,7 +184,7 @@ describe("File Checkpoints (/undo) & Coding Tools", () => {
         break constDenied;
       }
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -179,7 +223,7 @@ describe("File Checkpoints (/undo) & Coding Tools", () => {
       expect(searchRes.isError).toBeFalsy();
       expect(searchRes.output).toContain("Blender Python API");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });

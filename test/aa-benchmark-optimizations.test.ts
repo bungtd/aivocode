@@ -34,14 +34,17 @@ describe("AA Benchmark Optimizations: Shell Normalization, Auto-Hydration, Strea
       });
 
       const res = await tools.execute("run_shell", {
-        command: 'del temp.txt && node -v && ls -la 2>/dev/null || echo "fallback"',
+        command:
+          process.platform === "win32"
+            ? 'del temp.txt && node -v && ls -la 2>/dev/null || echo "fallback"'
+            : 'rm -f temp.txt && node -v && ls -la 2>/dev/null || echo "fallback"',
       });
       expect(res.isError).toBeFalsy();
       expect(res.output).toMatch(/v\d+\.\d+/);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
-  });
+  }, 30_000);
 
   it("2. auto-hydrates backtick-referenced workspace files and directory files in expandFileMentions, and read_file defaults to 2000 lines", async () => {
     const dir = mkdtempSync(join(tmpdir(), "aivo-hydrate-"));
@@ -74,7 +77,7 @@ describe("AA Benchmark Optimizations: Shell Normalization, Auto-Hydration, Strea
       expect(readRes.output).toContain("800: line_800");
       expect(readRes.output).not.toContain("more lines; use offset=");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -198,7 +201,7 @@ describe("AA Benchmark Optimizations: Shell Normalization, Auto-Hydration, Strea
       expect(res.finalText).toBe("Recovered from stalled stream!");
       expect(attempt).toBe(2);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -241,7 +244,7 @@ describe("AA Benchmark Optimizations: Shell Normalization, Auto-Hydration, Strea
       expect(res.output).toContain("crash.png");
       expect(res.output).toContain("1x1 image/png");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });

@@ -34,7 +34,7 @@ describe("Self-Learning Memory, Self-Evolving Skills & Anti-AI-Slop Guard", () =
       const block = mem.formatRecallBlock("postgres test", "aivokey");
       expect(block).toContain("Kill embedded-postgres on port 54329");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -72,7 +72,7 @@ describe("Self-Learning Memory, Self-Evolving Skills & Anti-AI-Slop Guard", () =
       expect(evolved.id).toBe("blender-procedural-rig");
       expect(registry.loadSkill("blender-procedural-rig")?.body).toContain("Create armature in bpy");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 

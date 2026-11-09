@@ -220,10 +220,11 @@ export function pickVisionCapableModel(
     return anyVision ? anyVision.id : currentModel;
   }
   const preferredOrder = [
+    "deepseek-v4.1-flash",
     "deepseek-v4-flash",
     "gemini-3.8-flash",
     "claude-sonnet-5-5",
-    "gpt-5.6-luna",
+    "gpt-6-luna",
     "glm-5.3-flash",
   ];
   for (const pref of preferredOrder) {

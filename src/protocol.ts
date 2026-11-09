@@ -26,6 +26,8 @@ export interface ToolSpec {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+  /** Optional hints (also used by plugin tools to allow plan/read-only execution). */
+  annotations?: { readOnlyHint?: boolean };
 }
 
 export interface StreamTurnOptions {
@@ -67,6 +69,52 @@ function safeParseJsonObj(raw: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+/**
+ * Builds a retryable error for failures that arrive inside an already-open HTTP 200 stream.
+ * Upstreams commonly report overload/rate-limit conditions as SSE error events instead of
+ * a non-2xx status, so ignoring them used to look like a successful empty answer.
+ */
+function createStreamError(
+  message: string,
+  code: string = "upstream_stream_error",
+  retryable: boolean = true,
+): AivoApiError {
+  return new AivoApiError({
+    status: 502,
+    code,
+    type: "upstream_error",
+    message,
+    requestId: null,
+    resetAt: null,
+    retryAfterS: retryable ? 2 : null,
+    recoveryAction: retryable ? "wait_and_retry" : "fail_fast",
+  });
+}
+
+function extractStreamErrorMessage(payload: unknown, fallback: string): { message: string; code: string } {
+  if (typeof payload !== "object" || payload === null) {
+    return { message: fallback, code: "upstream_stream_error" };
+  }
+  const obj = payload as Record<string, unknown>;
+  const nested =
+    typeof obj.error === "object" && obj.error !== null
+      ? (obj.error as Record<string, unknown>)
+      : obj;
+  const message =
+    typeof nested.message === "string" && nested.message.trim()
+      ? nested.message
+      : typeof obj.message === "string" && obj.message.trim()
+        ? obj.message
+        : fallback;
+  const code =
+    typeof nested.code === "string" && nested.code.trim()
+      ? nested.code
+      : typeof nested.type === "string" && nested.type.trim()
+        ? nested.type
+        : "upstream_stream_error";
+  return { message, code };
 }
 
 async function readWithIdleTimeout(
@@ -485,14 +533,10 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
   const resolvedModel = res.headers.get("x-air-model");
 
   if (!res.body) {
-    return {
-      text: "",
-      reasoning: "",
-      toolCalls: [],
-      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
-      requestId,
-      resolvedModel,
-    };
+    throw createStreamError(
+      "Upstream returned HTTP 200 but no response body for the streaming request",
+      "empty_stream",
+    );
   }
 
   let text = "";
@@ -516,12 +560,21 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
         continue;
       }
 
+      if (chunk.error !== undefined || chunk.type === "error") {
+        const { message, code } = extractStreamErrorMessage(
+          chunk.error ?? chunk,
+          "Upstream chat stream returned an error event",
+        );
+        throw createStreamError(message, code);
+      }
+
       const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
       for (const ch of choices) {
-        const delta =
-          typeof ch === "object" && ch !== null
-            ? ((ch as Record<string, unknown>).delta as Record<string, unknown> | undefined)
-            : undefined;
+        const choice = typeof ch === "object" && ch !== null ? (ch as Record<string, unknown>) : {};
+        if (choice.finish_reason === "error") {
+          throw createStreamError("Upstream chat completion finished with finish_reason=error");
+        }
+        const delta = choice.delta as Record<string, unknown> | undefined;
         if (!delta) continue;
 
         const rDelta =
@@ -624,6 +677,13 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
       }
 
       const type = event.type;
+      if (type === "error") {
+        const { message, code } = extractStreamErrorMessage(
+          event,
+          "Upstream messages stream returned an error event",
+        );
+        throw createStreamError(message, code);
+      }
       if (type === "message_start" && typeof event.message === "object" && event.message !== null) {
         const msg = event.message as Record<string, unknown>;
         const u =
@@ -713,6 +773,13 @@ export async function streamTurn(opts: StreamTurnOptions): Promise<StreamTurnRes
     }
 
     const type = event.type;
+    if (type === "error" || type === "response.failed") {
+      const { message, code } = extractStreamErrorMessage(
+        event.error ?? (typeof event.response === "object" ? event.response : event),
+        "Upstream responses stream returned an error event",
+      );
+      throw createStreamError(message, code);
+    }
     if (
       (type === "response.reasoning_summary_text.delta" || type === "response.reasoning.delta") &&
       typeof event.delta === "string"

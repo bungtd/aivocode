@@ -1,12 +1,13 @@
 import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { stdin, stdout } from "node:process";
-import { execSync } from "node:child_process";
+import { execShellCapture } from "./shell-util.js";
+import { AIVO_CLIENT_VERSION } from "./client-identity.js";
 import {
   maskApiKey,
   matchCatalogModelId,
   normalizeGatewayOrigin,
-  saveUserConfig,
+  saveConfigForWorkspace,
   VALID_EFFORTS,
   VALID_MODES,
   VALID_STRATEGIES,
@@ -19,7 +20,8 @@ import {
 } from "./config.js";
 import { AGENT_TEAMS, getAgentTeam, type TeamId } from "./teams.js";
 import { auditCodeForSlop } from "./anti-slop.js";
-import { executeComputerUse } from "./computer-use.js";
+import { executeComputerUse, findHeadlessBrowserBinary } from "./computer-use.js";
+import { defaultCheckpointDir } from "./checkpoint.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { relative } from "node:path";
 import {
@@ -43,6 +45,7 @@ import {
   getGitBranchLabel,
   renderHeaderBanner,
   renderTodoBoard,
+  sanitizeTerminalText,
   TerminalSpinner,
 } from "./ui/theme.js";
 import { interactiveSelect, SLASH_COMMANDS } from "./ui/select.js";
@@ -52,6 +55,8 @@ export interface SlashCommandResult {
   output: string;
   shouldExit?: boolean;
   updatedKeyStatus?: KeyInspectStatus | null;
+  /** When set, the caller should run this expanded prompt as a normal agent turn. */
+  prompt?: string;
 }
 
 export function formatModelsTable(
@@ -71,7 +76,7 @@ export function formatModelsTable(
   });
 
   if (filtered.length === 0) {
-    return c.amber(`No models matched '${filter ?? ""}'.`);
+    return c.amber(`No models matched '${sanitizeTerminalText(filter ?? "")}'.`);
   }
 
   const lines: string[] = [
@@ -83,7 +88,7 @@ export function formatModelsTable(
   for (const m of filtered) {
     const isCurrent = m.id === activeModel;
     const marker = isCurrent ? c.emerald("❯ ") : "  ";
-    const idPadded = m.id.padEnd(23).slice(0, 23);
+    const idPadded = sanitizeTerminalText(m.id).padEnd(23).slice(0, 23);
     const idCol = isCurrent ? c.bold(c.emerald(idPadded)) : c.white(idPadded);
     const ctxCol = formatCompactTokens(m.contextWindow).padEnd(8);
     const inUsd = (Number(m.inputMicroPer1M) / 1_000_000).toFixed(2);
@@ -132,23 +137,25 @@ export function formatDetailedStatus(
 
   const lines: string[] = [
     `${c.cyan("╭─")} ${c.bold("AivoCode Telemetry & Quota Inspector")} ${c.cyan("─".repeat(36))}`,
-    `${c.cyan("│")} ${c.slate("Gateway     :")} ${c.white(agent.config.baseUrl)}`,
-    `${c.cyan("│")} ${c.slate("Session ID  :")} ${c.white(s.id)} ${c.teal("(sticky prompt-cache affinity)")}`,
-    `${c.cyan("│")} ${c.slate("Active Model:")} ${c.emerald(c.bold(agent.config.model))}${agent.config.fastModel ? c.slate(` (subagent explorer: ${c.teal(agent.config.fastModel)})`) : ""}`,
+    `${c.cyan("│")} ${c.slate("Gateway     :")} ${c.white(sanitizeTerminalText(agent.config.baseUrl))}`,
+    `${c.cyan("│")} ${c.slate("Session ID  :")} ${c.white(sanitizeTerminalText(s.id))} ${c.teal("(sticky prompt-cache affinity)")}`,
+    `${c.cyan("│")} ${c.slate("Active Model:")} ${c.emerald(c.bold(sanitizeTerminalText(agent.config.model)))}${agent.config.fastModel ? c.slate(` (subagent explorer: ${c.teal(sanitizeTerminalText(agent.config.fastModel))})`) : ""}`,
     `${c.cyan("│")} ${c.slate("Config      :")} wire=${c.cyan(agent.config.wire)} · mode=${c.amber(agent.config.mode)} · effort=${c.violet(agent.config.reasoningEffort)} · webSearch=${agent.config.webSearch ? c.emerald("on") : c.slate("off")}`,
     `${c.cyan("│")} ${c.slate("Session Use :")} in=${s.totalInputTokens.toLocaleString("en-US")} · cache_read=${s.totalCacheReadTokens.toLocaleString("en-US")} (${c.teal(`${cacheHitPct}% hit`)}) · out=${s.totalOutputTokens.toLocaleString("en-US")} · cost=${c.emerald(formatMicroUsd(BigInt(s.totalCostMicro || "0")))}`,
   ];
 
   if (keyStatus) {
     lines.push(`${c.cyan("├" + "─".repeat(74))}`);
-    lines.push(`${c.cyan("│")} ${c.slate("Account     :")} ${formatKeyStatusSummary(keyStatus)}`);
+    lines.push(
+      `${c.cyan("│")} ${c.slate("Account     :")} ${sanitizeTerminalText(formatKeyStatusSummary(keyStatus))}`,
+    );
     if (keyStatus.mode === "plan" && keyStatus.models.length > 0) {
       lines.push(`${c.cyan("│")} ${c.bold("Per-Model Plan Windows:")}`);
       for (const m of keyStatus.models) {
         const bar5h = renderProgressBar(m.w5h.usedMicro, m.w5h.limitMicro, 12);
         const barMo = renderProgressBar(m.month.usedMicro, m.month.limitMicro, 12);
         lines.push(
-          `${c.cyan("│")}   • ${c.bold(m.model.padEnd(20))} 5h [${bar5h}] ${formatMicroUsd(m.w5h.usedMicro)}/${formatMicroUsd(m.w5h.limitMicro)} · 30d [${barMo}] ${formatMicroUsd(m.month.usedMicro)}/${formatMicroUsd(m.month.limitMicro)}`,
+          `${c.cyan("│")}   • ${c.bold(sanitizeTerminalText(m.model).padEnd(20))} 5h [${bar5h}] ${formatMicroUsd(m.w5h.usedMicro)}/${formatMicroUsd(m.w5h.limitMicro)} · 30d [${barMo}] ${formatMicroUsd(m.month.usedMicro)}/${formatMicroUsd(m.month.limitMicro)}`,
         );
       }
     }
@@ -180,6 +187,17 @@ export async function handleSlashCommand(
   const parts = line.trim().split(/\s+/);
   const cmd = parts[0]!.toLowerCase();
   const arg = parts.slice(1).join(" ").trim();
+
+  // User-defined commands from .aivokey/commands/*.md and plugins resolve to a prompt.
+  if (agent.customCommands.length > 0) {
+    const expanded = agent.resolveCustomCommand(line);
+    if (expanded !== null) {
+      if (!interactive) {
+        return { output: expanded };
+      }
+      return { output: "", prompt: expanded };
+    }
+  }
 
   switch (cmd) {
     case "/help":
@@ -236,7 +254,7 @@ export async function handleSlashCommand(
             if (free) badges.push(`FREE:${formatCompactTokens(Number(free.remainingTokens))}`);
             return {
               value: m.id,
-              label: m.id,
+              label: sanitizeTerminalText(m.id),
               badge: `[${badges.join("·")}]`,
               detail: `${formatCompactTokens(m.contextWindow)} ctx · $${inUsd}/$${outUsd}`,
             };
@@ -270,7 +288,7 @@ export async function handleSlashCommand(
       }
       agent.config.model = chosenId;
       agent.session.model = chosenId;
-      saveUserConfig({ model: chosenId }, agent.config.globalConfigPath);
+      saveConfigForWorkspace(agent.config, { model: chosenId });
       return {
         output: [
           `${c.emerald("✓")} Switched active primary model to ${c.bold(c.emerald(chosenId))}`,
@@ -359,7 +377,7 @@ export async function handleSlashCommand(
             const outUsd = (Number(m.outputMicroPer1M) / 1_000_000).toFixed(2);
             return {
               value: m.id,
-              label: m.id,
+              label: sanitizeTerminalText(m.id),
               badge: `[${formatCompactTokens(m.contextWindow)} ctx]`,
               detail: `$${inUsd}/$${outUsd} per 1M`,
             };
@@ -387,30 +405,27 @@ export async function handleSlashCommand(
       const resolvedModel = matchCatalogModelId(rawModelArg, catalogIds);
       if (roleTarget === "explore") {
         agent.config.fastModel = resolvedModel;
-        saveUserConfig({ fastModel: resolvedModel }, agent.config.globalConfigPath);
+        saveConfigForWorkspace(agent.config, { fastModel: resolvedModel });
       } else if (roleTarget === "architect") {
         agent.config.architectModel = resolvedModel;
-        saveUserConfig({ architectModel: resolvedModel }, agent.config.globalConfigPath);
+        saveConfigForWorkspace(agent.config, { architectModel: resolvedModel });
       } else if (roleTarget === "builder") {
         agent.config.builderModel = resolvedModel;
-        saveUserConfig({ builderModel: resolvedModel }, agent.config.globalConfigPath);
+        saveConfigForWorkspace(agent.config, { builderModel: resolvedModel });
       } else if (roleTarget === "reviewer") {
         agent.config.reviewerModel = resolvedModel;
-        saveUserConfig({ reviewerModel: resolvedModel }, agent.config.globalConfigPath);
+        saveConfigForWorkspace(agent.config, { reviewerModel: resolvedModel });
       } else if (roleTarget === "all") {
         agent.config.fastModel = resolvedModel;
         agent.config.architectModel = resolvedModel;
         agent.config.builderModel = resolvedModel;
         agent.config.reviewerModel = resolvedModel;
-        saveUserConfig(
-          {
-            fastModel: resolvedModel,
-            architectModel: resolvedModel,
-            builderModel: resolvedModel,
-            reviewerModel: resolvedModel,
-          },
-          agent.config.globalConfigPath,
-        );
+        saveConfigForWorkspace(agent.config, {
+          fastModel: resolvedModel,
+          architectModel: resolvedModel,
+          builderModel: resolvedModel,
+          reviewerModel: resolvedModel,
+        });
       }
 
       return {
@@ -456,7 +471,7 @@ export async function handleSlashCommand(
         };
       }
       agent.config.strategy = strat;
-      saveUserConfig({ strategy: strat }, agent.config.globalConfigPath);
+      saveConfigForWorkspace(agent.config, { strategy: strat });
       return {
         output: `${c.emerald("✓")} Execution strategy set to: ${c.bold(c.cyan(strat))}`,
       };
@@ -477,32 +492,32 @@ export async function handleSlashCommand(
             const m = matchCatalogModelId(val, availableIds);
             agent.config.model = m;
             agent.session.model = m;
-            saveUserConfig({ model: m }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { model: m });
             return { output: `${c.emerald("✓")} Set config.model = ${c.bold(c.emerald(m))}` };
           }
           case "fastModel":
           case "subagentModel": {
             const m = matchCatalogModelId(val, availableIds);
             agent.config.fastModel = m;
-            saveUserConfig({ fastModel: m }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { fastModel: m });
             return { output: `${c.emerald("✓")} Set config.fastModel = ${c.bold(c.emerald(m))}` };
           }
           case "architectModel": {
             const m = matchCatalogModelId(val, availableIds);
             agent.config.architectModel = m;
-            saveUserConfig({ architectModel: m }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { architectModel: m });
             return { output: `${c.emerald("✓")} Set config.architectModel = ${c.bold(c.emerald(m))}` };
           }
           case "builderModel": {
             const m = matchCatalogModelId(val, availableIds);
             agent.config.builderModel = m;
-            saveUserConfig({ builderModel: m }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { builderModel: m });
             return { output: `${c.emerald("✓")} Set config.builderModel = ${c.bold(c.emerald(m))}` };
           }
           case "reviewerModel": {
             const m = matchCatalogModelId(val, availableIds);
             agent.config.reviewerModel = m;
-            saveUserConfig({ reviewerModel: m }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { reviewerModel: m });
             return { output: `${c.emerald("✓")} Set config.reviewerModel = ${c.bold(c.emerald(m))}` };
           }
           case "reasoningEffort":
@@ -511,7 +526,7 @@ export async function handleSlashCommand(
               return { output: c.rose(`Invalid effort '${val}'. Valid: ${[...VALID_EFFORTS].join(", ")}`) };
             }
             agent.config.reasoningEffort = val as ReasoningEffort;
-            saveUserConfig({ reasoningEffort: val as ReasoningEffort }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { reasoningEffort: val as ReasoningEffort });
             return { output: `${c.emerald("✓")} Set config.reasoningEffort = ${c.bold(c.violet(val))}` };
           }
           case "subagentEffort": {
@@ -519,7 +534,7 @@ export async function handleSlashCommand(
               return { output: c.rose(`Invalid effort '${val}'. Valid: ${[...VALID_EFFORTS].join(", ")}`) };
             }
             agent.config.subagentEffort = val as ReasoningEffort;
-            saveUserConfig({ subagentEffort: val as ReasoningEffort }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { subagentEffort: val as ReasoningEffort });
             return { output: `${c.emerald("✓")} Set config.subagentEffort = ${c.bold(c.violet(val))}` };
           }
           case "strategy": {
@@ -527,7 +542,7 @@ export async function handleSlashCommand(
               return { output: c.rose(`Invalid strategy '${val}'. Valid: auto, subagent-driven, native, ask`) };
             }
             agent.config.strategy = val as ExecutionStrategy;
-            saveUserConfig({ strategy: val as ExecutionStrategy }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { strategy: val as ExecutionStrategy });
             return { output: `${c.emerald("✓")} Set config.strategy = ${c.bold(c.cyan(val))}` };
           }
           case "team": {
@@ -535,7 +550,7 @@ export async function handleSlashCommand(
               return { output: c.rose(`Invalid team '${val}'. Valid: ${[...VALID_TEAMS].join(", ")}`) };
             }
             agent.config.team = val as TeamId;
-            saveUserConfig({ team: val as TeamId }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { team: val as TeamId });
             return { output: `${c.emerald("✓")} Set config.team = ${c.bold(c.amber(val))}` };
           }
           case "mode": {
@@ -543,8 +558,22 @@ export async function handleSlashCommand(
               return { output: c.rose(`Invalid mode '${val}'. Valid: auto, plan, safe`) };
             }
             agent.config.mode = val as PermissionMode;
-            saveUserConfig({ mode: val as PermissionMode }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { mode: val as PermissionMode });
             return { output: `${c.emerald("✓")} Set config.mode = ${c.bold(c.amber(val))}` };
+          }
+          case "sandbox": {
+            if (!["workspace", "read-only", "danger-full-access"].includes(val)) {
+              return {
+                output: c.rose(
+                  `Invalid sandbox '${val}'. Valid: workspace, read-only, danger-full-access`,
+                ),
+              };
+            }
+            agent.config.sandbox = val as "workspace" | "read-only" | "danger-full-access";
+            saveConfigForWorkspace(agent.config, {
+              sandbox: val as "workspace" | "read-only" | "danger-full-access",
+            });
+            return { output: `${c.emerald("✓")} Set config.sandbox = ${c.bold(c.amber(val))}` };
           }
           case "wire": {
             if (!VALID_WIRES.has(val as AivoWire)) {
@@ -552,24 +581,24 @@ export async function handleSlashCommand(
             }
             agent.config.wire = val as AivoWire;
             agent.session.wire = val as AivoWire;
-            saveUserConfig({ wire: val as AivoWire }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { wire: val as AivoWire });
             return { output: `${c.emerald("✓")} Set config.wire = ${c.bold(c.cyan(val))}` };
           }
           case "autoReviewFix": {
             const b = val === "true" || val === "on" || val === "1";
             agent.config.autoReviewFix = b;
-            saveUserConfig({ autoReviewFix: b }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { autoReviewFix: b });
             return { output: `${c.emerald("✓")} Set config.autoReviewFix = ${b}` };
           }
           case "baseUrl": {
             const norm = normalizeGatewayOrigin(val);
             agent.config.baseUrl = norm;
-            saveUserConfig({ baseUrl: norm }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { baseUrl: norm });
             return { output: `${c.emerald("✓")} Set config.baseUrl = ${norm}` };
           }
           case "apiKey": {
             agent.config.apiKey = val;
-            saveUserConfig({ apiKey: val }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { apiKey: val });
             return { output: `${c.emerald("✓")} Set config.apiKey = ${maskApiKey(val)}` };
           }
           default:
@@ -595,6 +624,9 @@ export async function handleSlashCommand(
           `${c.cyan("│")}   • ${c.bold("strategy       ")} (Workflow Mode)   : ${c.cyan(cfg.strategy ?? "auto")} ${c.slate("(auto | subagent-driven | native | ask)")}`,
           `${c.cyan("│")}   • ${c.bold("team           ")} (Specialist Team) : ${c.amber(cfg.team ?? "fullstack")}`,
           `${c.cyan("│")}   • ${c.bold("mode           ")} (Permissions)     : ${c.amber(cfg.mode)} ${c.slate("(auto | plan | safe)")}`,
+          `${c.cyan("│")}   • ${c.bold("sandbox        ")} (FS/Shell)        : ${c.cyan(cfg.sandbox ?? "workspace")} ${c.slate("(workspace | read-only | danger-full-access)")}`,
+          `${c.cyan("│")}   • ${c.bold("network        ")} (Web/Shell)       : ${c.cyan(cfg.permissions?.network ?? "allow")}`,
+          `${c.cyan("│")}   • ${c.bold("outsideWorkspace")}               : ${cfg.permissions?.allowOutsideWorkspace ? c.amber("allow") : c.slate("ask")}`,
           `${c.cyan("│")}   • ${c.bold("wire           ")} (Protocol Wire)   : ${c.cyan(cfg.wire)} ${c.slate("(chat | messages | responses)")}`,
           `${c.cyan("│")}   • ${c.bold("reasoningEffort")} (Primary Effort)  : ${c.violet(cfg.reasoningEffort)}`,
           `${c.cyan("│")}   • ${c.bold("subagentEffort ")} (Subagent Effort) : ${c.violet(cfg.subagentEffort ?? "low")}`,
@@ -633,7 +665,7 @@ export async function handleSlashCommand(
         };
       }
       agent.config.reasoningEffort = level;
-      saveUserConfig({ reasoningEffort: level }, agent.config.globalConfigPath);
+      saveConfigForWorkspace(agent.config, { reasoningEffort: level });
       return { output: `${c.emerald("✓")} Reasoning effort set to: ${c.bold(c.violet(level))}` };
     }
 
@@ -659,7 +691,7 @@ export async function handleSlashCommand(
       }
       agent.config.wire = w;
       agent.session.wire = w;
-      saveUserConfig({ wire: w }, agent.config.globalConfigPath);
+      saveConfigForWorkspace(agent.config, { wire: w });
       return { output: `${c.emerald("✓")} Switched AivoKey wire protocol to: ${c.bold(c.cyan(w))}` };
     }
 
@@ -684,8 +716,60 @@ export async function handleSlashCommand(
         };
       }
       agent.config.mode = m;
-      saveUserConfig({ mode: m }, agent.config.globalConfigPath);
+      saveConfigForWorkspace(agent.config, { mode: m });
       return { output: `${c.emerald("✓")} Permission mode set to: ${c.bold(c.amber(m))}` };
+    }
+
+    case "/sandbox": {
+      const mode = arg.toLowerCase() as "workspace" | "read-only" | "danger-full-access";
+      if (arg && !["workspace", "read-only", "danger-full-access"].includes(mode)) {
+        return {
+          output: `Current sandbox: ${c.cyan(agent.config.sandbox ?? "workspace")}. Valid: workspace, read-only, danger-full-access`,
+        };
+      }
+      if (!arg) {
+        return { output: `${c.cyan("◆")} Sandbox policy: ${c.bold(c.amber(agent.config.sandbox ?? "workspace"))}\n${agent.describePermissions()}` };
+      }
+      agent.config.sandbox = mode;
+      saveConfigForWorkspace(agent.config, { sandbox: mode });
+      return { output: `${c.emerald("✓")} Sandbox set to ${c.bold(c.cyan(mode))}` };
+    }
+
+    case "/permissions": {
+      const tokens = arg.split(/\s+/).filter(Boolean);
+      const action = tokens[0]?.toLowerCase();
+      const kind = tokens[1]?.toLowerCase();
+      const validKinds = new Set(["read", "write", "shell", "webfetch"]);
+      if (
+        (action === "allow" || action === "ask" || action === "deny") &&
+        kind &&
+        validKinds.has(kind) &&
+        tokens.length >= 3
+      ) {
+        const pattern = tokens.slice(2).join(" ");
+        const current = agent.config.permissions ?? {};
+        const rules = [...(current[kind as "read" | "write" | "shell" | "webfetch"] ?? [])];
+        rules.push({ pattern, action });
+        agent.config.permissions = { ...current, [kind]: rules };
+        saveConfigForWorkspace(agent.config, { permissions: agent.config.permissions });
+        return {
+          output: `${c.emerald("✓")} Added ${kind} rule: ${c.cyan(pattern)} → ${c.bold(action)}`,
+        };
+      }
+      if (action === "clear") {
+        agent.config.permissions = {};
+        saveConfigForWorkspace(agent.config, { permissions: {} });
+        return { output: `${c.emerald("✓")} Cleared custom permission rules.` };
+      }
+      return {
+        output: [
+          `${c.cyan("◆")} ${c.bold("Permission & Sandbox Policy")}`,
+          agent.describePermissions(),
+          "",
+          `Tambahkan rule: ${c.cyan("/permissions <allow|ask|deny> <read|write|shell|webfetch> <pattern>")}`,
+          `Hapus rule  : ${c.cyan("/permissions clear")} · Sandbox: ${c.cyan("/sandbox <mode>")}`,
+        ].join("\n"),
+      };
     }
 
     case "/web": {
@@ -696,7 +780,7 @@ export async function handleSlashCommand(
           : toggle === "off" || toggle === "false" || toggle === "0"
             ? false
             : !agent.config.webSearch;
-      saveUserConfig({ webSearch: agent.config.webSearch }, agent.config.globalConfigPath);
+      saveConfigForWorkspace(agent.config, { webSearch: agent.config.webSearch });
       return {
         output: `${c.emerald("✓")} AivoKey server web search: ${agent.config.webSearch ? c.emerald("ON") : c.slate("OFF")}`,
       };
@@ -727,27 +811,24 @@ export async function handleSlashCommand(
 
         agent.config.model = defaultModelId;
         agent.config.fastModel = defaultModelId;
-        saveUserConfig(
-          {
-            apiKey: cleanKey,
-            model: agent.config.model,
-            fastModel: agent.config.fastModel,
-            setupCompleted: true,
-          },
-          agent.config.globalConfigPath,
-        );
+        saveConfigForWorkspace(agent.config, {
+          apiKey: cleanKey,
+          model: agent.config.model,
+          fastModel: agent.config.fastModel,
+          setupCompleted: true,
+        });
         return {
           output: [
-            `${c.emerald("✓")} API key verified: ${formatKeyStatusSummary(verified)}`,
+            `${c.emerald("✓")} API key verified: ${sanitizeTerminalText(formatKeyStatusSummary(verified))}`,
             `${c.emerald("✓")} Eligible models for your account: ${c.bold(String(eligible.length))} models (${verified.mode === "plan" && !verified.fallbackEnabled ? "filtered to active plan & free tokens" : "all active catalog models"})`,
             `${c.emerald("✓")} Primary & Subagent default model set to: ${c.bold(c.emerald(defaultModelId))} (use /model, /subagent, or Ctrl+O to customize)`,
           ].join("\n"),
           updatedKeyStatus: verified,
         };
       } catch (err) {
-        saveUserConfig({ apiKey: cleanKey }, agent.config.globalConfigPath);
+        saveConfigForWorkspace(agent.config, { apiKey: cleanKey });
         return {
-          output: `${c.amber("⚠")} Saved key (${maskApiKey(cleanKey)}), but verification failed: ${err instanceof Error ? err.message : String(err)}`,
+          output: `${c.amber("⚠")} Saved key (${maskApiKey(cleanKey)}), but verification failed: ${sanitizeTerminalText(err instanceof Error ? err.message : String(err))}`,
         };
       }
     }
@@ -766,7 +847,7 @@ export async function handleSlashCommand(
         return {
           output: [
             `${c.cyan("╭─")} ${c.bold(`Subagent ${target.id}: ${target.name} (${target.model} · ${target.status})`)}`,
-            ...target.logs.map((l) => `${c.cyan("│")} ${l}`),
+            ...target.logs.map((l) => `${c.cyan("│")} ${sanitizeTerminalText(l)}`),
             `${c.cyan("╰" + "─".repeat(72))}`,
           ].join("\n"),
         };
@@ -788,13 +869,25 @@ export async function handleSlashCommand(
       if (jobs.length === 0) {
         return { output: c.slate("No background terminal jobs. Start one with '/bg <command>' or run_shell(background:true).") };
       }
+      const restartArg = arg.match(/^restart\s+(\S+)$/i);
+      if (restartArg) {
+        const restarted = agent.backgroundJobs.restartJob(restartArg[1]!);
+        if (!restarted) {
+          return { output: c.amber(`Background job '${restartArg[1]}' not found.`) };
+        }
+        return {
+          output: `${c.emerald("✓")} Relaunched ${c.bold(restarted.id)} (PID ${restarted.pid ?? "-"}): ${sanitizeTerminalText(restarted.command)}`,
+        };
+      }
       return {
         output: [
           `${c.cyan("◆")} ${c.bold(`Background Terminal Jobs (${jobs.length}):`)}`,
           ...jobs.map(
             (j) =>
-              `  • ${c.bold(c.cyan(j.id.padEnd(7)))} [PID ${j.pid ?? "-"} · ${j.status}] ${c.white(j.command)}${j.detectedUrl ? ` → ${c.emerald(j.detectedUrl)}` : ""}`,
+              `  • ${c.bold(c.cyan(j.id.padEnd(7)))} [PID ${j.pid ?? "-"} · ${j.status}] ${c.white(sanitizeTerminalText(j.command))}${j.detectedUrl ? ` → ${c.emerald(sanitizeTerminalText(j.detectedUrl))}` : ""}`,
           ),
+          "",
+          c.slate("Use /jobs restart <id> to relaunch a job that was lost after a restart."),
         ].join("\n"),
       };
     }
@@ -803,7 +896,7 @@ export async function handleSlashCommand(
       if (!arg) {
         return { output: `Usage: ${c.cyan("/bg <command>")} — starts a background terminal job.` };
       }
-      const job = agent.backgroundJobs.startJob({ command: arg, cwd: agent.config.cwd });
+      const job = agent.startBackgroundJob(arg);
       return {
         output: `${c.emerald("✓")} Started background terminal ${c.bold(c.cyan(job.id))} (PID ${job.pid ?? "-"}): ${arg}`,
       };
@@ -819,8 +912,10 @@ export async function handleSlashCommand(
       }
       return {
         output: [
-          `${c.cyan("╭─")} ${c.bold(`Logs for ${job.id} (${job.status}) — ${job.command}`)}`,
-          ...(job.logs.length > 0 ? job.logs.slice(-40).map((l) => `${c.cyan("│")} ${l}`) : [`${c.cyan("│")} (no output yet)`]),
+          `${c.cyan("╭─")} ${c.bold(`Logs for ${sanitizeTerminalText(job.id)} (${job.status}) — ${sanitizeTerminalText(job.command)}`)}`,
+          ...(job.logs.length > 0
+            ? job.logs.slice(-40).map((l) => `${c.cyan("│")} ${sanitizeTerminalText(l)}`)
+            : [`${c.cyan("│")} (no output yet)`]),
           `${c.cyan("╰" + "─".repeat(72))}`,
         ].join("\n"),
       };
@@ -836,6 +931,119 @@ export async function handleSlashCommand(
           ? `${c.emerald("✓")} Stopped background job ${c.bold(arg.trim())}.`
           : c.amber(`Background job '${arg}' not found.`),
       };
+    }
+
+    case "/hooks": {
+      return { output: agent.hookRunner.formatStatus() };
+    }
+
+    case "/browser": {
+      const binary = findHeadlessBrowserBinary();
+      return {
+        output: [
+          `${c.bold("Browser automation")}`,
+          binary ? `  Binary: ${c.emerald(binary)}` : `  Binary: ${c.rose("not found (install Chrome or Edge)")}`,
+          `  Network: ${agent.config.permissions?.network ?? "allow"}`,
+          "",
+          "Tools: browser_navigate · browser_snapshot · browser_interact · browser_screenshot",
+          "Actions (browser_interact): click · fill · press · wait · eval",
+          "",
+          "Notebook tools: notebook_read · notebook_edit (edit/insert/delete cells)",
+        ].join("\n"),
+      };
+    }
+
+    case "/acp": {
+      return {
+        output: [
+          `${c.bold("Agent Client Protocol (ACP)")}`,
+          "",
+          "Start the ACP server (stdio, JSON-RPC v1) and let your editor spawn it:",
+          `  ${c.cyan("aivo acp")}`,
+          "",
+          "Editor configuration (example):",
+          '  command: "aivo", args: ["acp"],',
+          "",
+          "Headless integrations can use the JSONL event stream instead:",
+          `  ${c.cyan('aivo run "<prompt>" --events-json')}`,
+        ].join("\n"),
+      };
+    }
+
+    case "/telemetry": {
+      const spans = agent.tracer.listSpans();
+      const summary = agent.tracer.summary();
+      return {
+        output: [
+          `${c.cyan("◆")} ${c.bold("Telemetry")}`,
+          `  Tracing   : ${agent.tracer.enabled ? c.emerald("ON") : c.slate("off (use --trace <file>)")}`,
+          `  Spans     : ${c.white(String(spans.length))}`,
+          ...summary.map(
+            (row) =>
+              `    • ${row.kind.padEnd(9)} ${String(row.count).padStart(3)} spans · ${row.totalMs}ms${row.errors > 0 ? ` · ${c.rose(`${row.errors} error(s)`)}` : ""}`,
+          ),
+          `  Metrics   : ${c.white(`${Object.keys(agent.metrics.toJSON()).length} series`)}`,
+          "",
+          c.slate("CLI: aivo run ... --trace trace.jsonl --metrics-prom"),
+          c.slate("     aivo trace trace.jsonl · aivo metrics [--json]"),
+        ].join("\n"),
+      };
+    }
+
+    case "/plugins": {
+      await agent.plugins.ensureLoaded();
+      return { output: agent.plugins.formatStatus() };
+    }
+
+    case "/commands": {
+      if (agent.customCommands.length === 0) {
+        return {
+          output: [
+            "No custom commands found.",
+            "",
+            "Create Markdown files in .aivokey/commands/<name>.md (or ~/.aivokey/commands):",
+            "  ---",
+            "  description: Review the current diff",
+            "  ---",
+            "  Review the staged diff and list concrete risks. $ARGUMENTS",
+          ].join("\n"),
+        };
+      }
+      return {
+        output: [
+          `${c.bold("Custom commands:")}`,
+          ...agent.customCommands.map(
+            (command) =>
+              `  ${c.cyan(`/${command.name}`)}${command.argumentHint ? ` ${c.slate(command.argumentHint)}` : ""} — ${command.description} ${c.slate(`[${command.scope}]`)}`,
+          ),
+        ].join("\n"),
+      };
+    }
+
+    case "/lsp": {
+      const restartMatch = arg.match(/^restart(?:\s+(.+))?$/i);
+      if (restartMatch) {
+        await agent.lspManager.restart(restartMatch[1]?.trim());
+        return { output: c.emerald("LSP server(s) restarted.") };
+      }
+      return { output: agent.lspManager.formatStatus() };
+    }
+    case "/mcp": {
+      const restartMatch = arg.match(/^restart(?:\s+(.+))?$/i);
+      if (restartMatch) {
+        try {
+          await agent.mcpManager.restart(restartMatch[1]?.trim());
+        } catch (err) {
+          return {
+            output: c.rose(
+              `MCP restart failed: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          };
+        }
+      } else {
+        await agent.mcpManager.ensureStarted();
+      }
+      return { output: agent.mcpManager.formatStatus() };
     }
 
     case "/status":
@@ -882,6 +1090,19 @@ export async function handleSlashCommand(
       };
     }
 
+    case "/checkpoints": {
+      return {
+        output: [
+          `${c.cyan("◆")} ${c.bold("Checkpoint history")}`,
+          `  Undoable turns : ${c.white(String(agent.checkpoints.undoCount()))}`,
+          `  Redoable turns : ${c.white(String(agent.checkpoints.redoCount()))}`,
+          `  Session dir    : ${c.slate(defaultCheckpointDir(agent.session.id))}`,
+          "",
+          c.slate("History survives a restart. /undo and /redo operate on persisted snapshots."),
+        ].join("\n"),
+      };
+    }
+
     case "/team":
     case "/agents": {
       let chosenTeam = arg.toLowerCase() as TeamId;
@@ -909,7 +1130,7 @@ export async function handleSlashCommand(
         };
       }
       agent.config.team = chosenTeam;
-      saveUserConfig({ team: chosenTeam }, agent.config.globalConfigPath);
+      saveConfigForWorkspace(agent.config, { team: chosenTeam });
       const t = getAgentTeam(chosenTeam)!;
       return {
         output: [
@@ -927,7 +1148,7 @@ export async function handleSlashCommand(
         };
       }
       const summary = await agent.executeTeamWorkflow(arg, agent.config.team);
-      return { output: summary };
+      return { output: sanitizeTerminalText(summary) };
     }
 
     case "/btw": {
@@ -938,7 +1159,7 @@ export async function handleSlashCommand(
       }
       const answer = await agent.askSideQuestion(arg);
       return {
-        output: `${c.cyan("╭─ /btw Side Answer ───────────────────────────────────────────────────────")}\n${answer}\n${c.cyan("╰──────────────────────────────────────────────────────────────────────────")}`,
+        output: `${c.cyan("╭─ /btw Side Answer ───────────────────────────────────────────────────────")}\n${sanitizeTerminalText(answer)}\n${c.cyan("╰──────────────────────────────────────────────────────────────────────────")}`,
       };
     }
 
@@ -952,7 +1173,8 @@ export async function handleSlashCommand(
         output: [
           `${c.cyan("◆")} ${c.bold(`Discovered Skills (${list.length}):`)}`,
           ...list.map(
-            (s) => `  • ${c.bold(c.emerald(s.id.padEnd(28)))} ${c.slate(s.description.slice(0, 72))}`,
+            (s) =>
+              `  • ${c.bold(c.emerald(sanitizeTerminalText(s.id).padEnd(28)))} ${c.slate(sanitizeTerminalText(s.description.slice(0, 72)))}`,
           ),
         ].join("\n"),
       };
@@ -969,7 +1191,7 @@ export async function handleSlashCommand(
         output: [
           `${c.cyan("◆")} ${c.bold(`Self-Learning Memory (${entries.length}):`)}`,
           ...entries.map(
-            (m) => `  • [${c.violet(m.category)}] ${c.bold(c.white(m.title))}: ${c.slate(m.content)}`,
+            (m) => `  • [${c.violet(m.category)}] ${c.bold(c.white(sanitizeTerminalText(m.title)))}: ${c.slate(sanitizeTerminalText(m.content))}`,
           ),
         ].join("\n"),
       };
@@ -984,7 +1206,10 @@ export async function handleSlashCommand(
         .filter((f) => existsSync(f) && statSync(f).isFile())
         .flatMap((f) => {
           const rep = auditCodeForSlop(relative(agent.config.cwd, f), readFileSync(f, "utf8"));
-          return rep.issues.map((i) => `  • ${rep.filePath}:${i.line} [${i.severity}] ${i.message}`);
+          return rep.issues.map(
+            (i) =>
+              `  • ${sanitizeTerminalText(rep.filePath)}:${i.line} [${i.severity}] ${i.message}`,
+          );
         });
       if (issues.length === 0) {
         return { output: c.emerald(`✓ Anti-AI-Slop Audit passed (${files.length} file(s) clean).`) };
@@ -1008,12 +1233,18 @@ export async function handleSlashCommand(
 
     case "/diff": {
       try {
-        const diff = execSync("git status -s", { cwd: agent.config.cwd, encoding: "utf8" }).trim();
+        const { stdout: diffOut } = await execShellCapture("git status -s", {
+          cwd: agent.config.cwd,
+          timeoutMs: 15_000,
+        });
+        const diff = sanitizeTerminalText(diffOut).trim();
         const touched = agent.checkpoints.listModifiedFiles();
         return {
           output: [
             `${c.cyan("◆")} ${c.bold(`Session Checkpointed Files (${touched.length}):`)}`,
-            ...(touched.length > 0 ? touched.map((f) => `  • ${c.white(f)}`) : [`  ${c.slate("(none)")}`]),
+            ...(touched.length > 0
+              ? touched.map((f) => `  • ${c.white(sanitizeTerminalText(f))}`)
+              : [`  ${c.slate("(none)")}`]),
             "",
             `${c.cyan("◆")} ${c.bold("Git Working Tree:")}`,
             diff ? diff.split("\n").map((l) => `  ${l}`).join("\n") : `  ${c.slate("(clean)")}`,
@@ -1047,6 +1278,8 @@ export async function handleSlashCommand(
         cwd: agent.config.cwd,
       });
       agent.todos.length = 0;
+      agent.subagentRuns.length = 0;
+      agent.checkpoints.reset();
       return { output: `${c.emerald("✓")} Started fresh session: ${c.bold(c.cyan(agent.session.id))}` };
     }
 
@@ -1060,7 +1293,7 @@ export async function handleSlashCommand(
           items: list.map((s) => ({
             value: s.id,
             label: s.id,
-            badge: `[${s.model}]`,
+            badge: `[${sanitizeTerminalText(s.model)}]`,
             detail: `${s.messageCount} msgs · ${formatMicroUsd(BigInt(s.totalCostMicro || "0"))} · ${s.updatedAt.slice(0, 19).replace("T", " ")}`,
           })),
         });
@@ -1078,7 +1311,7 @@ export async function handleSlashCommand(
         output: list
           .map(
             (s) =>
-              `${c.cyan(s.id)}  [${c.emerald(s.model)}]  msgs=${s.messageCount}  cost=${formatMicroUsd(BigInt(s.totalCostMicro || "0"))}  ${c.slate(s.updatedAt)}`,
+              `${c.cyan(sanitizeTerminalText(s.id))}  [${c.emerald(sanitizeTerminalText(s.model))}]  msgs=${s.messageCount}  cost=${formatMicroUsd(BigInt(s.totalCostMicro || "0"))}  ${c.slate(s.updatedAt)}`,
           )
           .join("\n"),
       };
@@ -1130,7 +1363,7 @@ export async function startInteractiveRepl(
   stdout.write(
     "\n" +
       renderHeaderBanner({
-        version: "0.3.0",
+        version: AIVO_CLIENT_VERSION,
         cwd: agent.config.cwd,
         gitBranch,
         gatewayUrl: agent.config.baseUrl,
@@ -1161,7 +1394,7 @@ export async function startInteractiveRepl(
       rl.close();
       if (enteredKey) {
         agent.config.apiKey = enteredKey;
-        saveUserConfig({ apiKey: enteredKey }, agent.config.globalConfigPath);
+        saveConfigForWorkspace(agent.config, { apiKey: enteredKey });
         const spinner = new TerminalSpinner();
         spinner.start("Verifying API key & syncing AivoKey catalog...");
         try {
@@ -1175,12 +1408,12 @@ export async function startInteractiveRepl(
           const rec = recommendCodingModels(agent.catalog, keyStatus, agent.config.model);
           agent.config.model = rec.primaryModel;
           agent.config.fastModel = rec.fastModel;
-          saveUserConfig(
-            { model: rec.primaryModel, fastModel: rec.fastModel },
-            agent.config.globalConfigPath,
-          );
+          saveConfigForWorkspace(agent.config, {
+            model: rec.primaryModel,
+            fastModel: rec.fastModel,
+          });
           stdout.write(
-            `  ${c.emerald("✓")} Connected! ${formatKeyStatusSummary(ks)}\n` +
+            `  ${c.emerald("✓")} Connected! ${sanitizeTerminalText(formatKeyStatusSummary(ks))}\n` +
               `  ${c.emerald("✓")} Selected model: ${c.bold(c.emerald(agent.config.model))} ${c.slate(`(fast explorer: ${agent.config.fastModel})`)}\n`,
           );
         } catch (err) {
@@ -1226,14 +1459,11 @@ export async function startInteractiveRepl(
         agent.config.reasoningEffort = next.effort;
         agent.config.wire = next.wire;
         agent.session.wire = next.wire;
-        saveUserConfig(
-          {
-            mode: next.mode,
-            reasoningEffort: next.effort,
-            wire: next.wire,
-          },
-          agent.config.globalConfigPath,
-        );
+        saveConfigForWorkspace(agent.config, {
+          mode: next.mode,
+          reasoningEffort: next.effort,
+          wire: next.wire,
+        });
       },
       history,
     });
@@ -1256,7 +1486,7 @@ export async function startInteractiveRepl(
       continue;
     }
 
-    const line = action.line.trim();
+    let line = action.line.trim();
     if (!line) continue;
     if (history[history.length - 1] !== line) {
       history.push(line);
@@ -1265,18 +1495,45 @@ export async function startInteractiveRepl(
     if (line.startsWith("!")) {
       const shellCmd = line.slice(1).trim();
       if (shellCmd) {
-        stdout.write(`${c.slate(`$ ${shellCmd}`)}\n`);
+        stdout.write(`${c.slate(`$ ${sanitizeTerminalText(shellCmd)}`)}\n`);
+        const abort = new AbortController();
+        const onShellKey = (
+          _str: string | undefined,
+          key: { name?: string; ctrl?: boolean } | undefined,
+        ) => {
+          if (key?.name === "escape" || (key?.ctrl && key?.name === "c")) abort.abort();
+        };
+        emitKeypressEvents(stdin);
+        const wasRaw = stdin.isRaw;
+        if (stdin.isTTY) stdin.setRawMode(true);
+        stdin.on("keypress", onShellKey);
         try {
-          const out = execSync(shellCmd, {
+          const { stdout: out, stderr } = await execShellCapture(shellCmd, {
             cwd: agent.config.cwd,
-            encoding: "utf8",
-            stdio: "pipe",
+            signal: abort.signal,
           });
-          if (out) stdout.write(out.trimEnd() + "\n");
+          const combined = sanitizeTerminalText(
+            [out, stderr].filter(Boolean).join("\n").trimEnd(),
+          );
+          if (combined) {
+            const allLines = combined.split(/\r?\n/);
+            const shown = allLines.slice(0, 500);
+            stdout.write(shown.join("\n") + "\n");
+            if (allLines.length > shown.length) {
+              stdout.write(`... (${allLines.length - shown.length} more lines)\n`);
+            }
+          }
         } catch (err) {
           stdout.write(
-            `${c.rose(`Command failed: ${err instanceof Error ? err.message : String(err)}`)}\n`,
+            `${c.rose(
+              abort.signal.aborted
+                ? "Command interrupted by user."
+                : `Command failed: ${sanitizeTerminalText(err instanceof Error ? err.message : String(err))}`,
+            )}\n`,
           );
+        } finally {
+          stdin.off("keypress", onShellKey);
+          if (stdin.isTTY) stdin.setRawMode(Boolean(wasRaw));
         }
         gitBranch = getGitBranchLabel(agent.config.cwd);
       }
@@ -1284,13 +1541,26 @@ export async function startInteractiveRepl(
     }
 
     if (line.startsWith("/")) {
-      const res = await handleSlashCommand(line, agent, keyStatus, fetchFn, true);
-      if (res.updatedKeyStatus !== undefined) {
-        keyStatus = res.updatedKeyStatus;
+      try {
+        const res = await handleSlashCommand(line, agent, keyStatus, fetchFn, true);
+        if (res.updatedKeyStatus !== undefined) {
+          keyStatus = res.updatedKeyStatus;
+        }
+        if (res.prompt !== undefined) {
+          // Custom /command expanded to a prompt: run it as a normal turn.
+          line = res.prompt;
+        } else {
+          stdout.write(res.output + "\n");
+          if (res.shouldExit) break;
+          continue;
+        }
+      } catch (err) {
+        onStopTurnSpinner?.();
+        stdout.write(
+          `${c.rose("✗")} ${sanitizeTerminalText(err instanceof Error ? err.message : String(err))}\n`,
+        );
+        continue;
       }
-      stdout.write(res.output + "\n");
-      if (res.shouldExit) break;
-      continue;
     }
 
     // Run agent turn with Esc / Ctrl+C stream interruption listener

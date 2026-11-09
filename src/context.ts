@@ -6,6 +6,7 @@ import type { ChatMessage } from "./protocol.js";
 import type { TodoItem } from "./tools/index.js";
 import { getAgentTeam, type TeamId } from "./teams.js";
 import { isImageFilePath, loadImageAttachment, type ImageAttachment } from "./vision.js";
+import { isPathInside } from "./path-utils.js";
 
 const INSTRUCTION_CANDIDATES = [
   "AGENTS.md",
@@ -49,6 +50,20 @@ export function isReadOnlyQaPrompt(prompt: string): boolean {
     return true;
   }
   if (/\bread-only\s+(q&a|qa|question|task)\b/i.test(p)) {
+    return true;
+  }
+  // Indonesian phrasings (the product UI and README are Indonesian-first).
+  if (
+    /\b(jangan|tanpa)\s+(meng)?(ubah|edit|modifikasi|sentuh|tulis|buat|membuat)\s+(file|kode|apa\s*pun)\b/i.test(
+      p,
+    )
+  ) {
+    return true;
+  }
+  if (/\b(hanya|hanya\s+perlu)\s+(baca|membaca|analisa|menganalisa|jelaskan|menjelaskan)\b/i.test(p)) {
+    return true;
+  }
+  if (/\b(jangan|tanpa)\s+(meng)?ubah\s+apa\s*pun\b/i.test(p)) {
     return true;
   }
   return false;
@@ -105,11 +120,12 @@ export function buildSystemPrompt(
   cwd: string,
   mode: PermissionMode,
   teamId?: TeamId,
+  lspAvailable = false,
 ): string {
   const sections: string[] = [
     `You are AivoCode, a fast, disciplined CLI coding agent purpose-built for AivoKey.`,
     `Workspace directory: ${cwd}`,
-    `Platform: ${process.platform}${process.platform === "win32" ? " (Shell: PowerShell 7 pwsh; Node.js and git are installed; python is not installed — use node for scripts)" : ""}`,
+    `Platform: ${process.platform}${process.platform === "win32" ? " (Shell: PowerShell/pwsh; verify python/other tool availability with a command before assuming it is installed)" : ""}`,
     `Permission mode: ${mode}`,
     [
       "## Core Engineering & Execution Rules",
@@ -120,6 +136,11 @@ export function buildSystemPrompt(
       "- Anti-AI-Slop Mandate: NEVER leave `// TODO: implement`, `// ... rest of code`, fake mocked data, or unverified claims. Write complete, clean code.",
       "- Efficiency Rule: When an existing test command (e.g. `node test/*.mjs`) or output generation script succeeds (`exit 0`), finish immediately with a concise summary — do NOT create extra throwaway verification scripts (`verify.mjs`, `scratch.mjs`) or call `anti_slop_audit` manually.",
       "- Only use `todo_write` on large multi-file tasks (5+ files).",
+      ...(lspAvailable
+        ? [
+            "- LSP code intelligence is available: use `lsp_diagnostics` after risky edits, `lsp_definition`/`lsp_references` to trace symbols, `lsp_hover` for types, and `lsp_document_symbols`/`lsp_workspace_symbols` to navigate large files instead of guessing.",
+          ]
+        : []),
       mode === "plan"
         ? "- You are currently in PLAN mode (read-only). Do NOT call `write_file`, `edit_file`, `apply_patch`, or `run_shell`. Analyze the codebase and present a clear implementation plan."
         : "- Verify code changes by running the relevant test command via `run_shell`.",
@@ -176,6 +197,8 @@ export function expandFileMentions(prompt: string, cwd: string): string {
     if (isImageFilePath(relPath)) return false;
 
     const absPath = resolve(cwd, relPath);
+    // Prompt hydration must never bypass the workspace sandbox by reading ../../secrets.
+    if (!isPathInside(cwd, absPath)) return false;
     if (!existsSync(absPath)) return false;
     try {
       const st = statSync(absPath);
@@ -330,6 +353,7 @@ export function extractPromptImageAttachments(prompt: string, cwd: string): Imag
     seen.add(relPath);
 
     const absPath = resolve(cwd, relPath);
+    if (!isPathInside(cwd, absPath)) continue;
     if (!existsSync(absPath)) continue;
     try {
       images.push(loadImageAttachment(absPath));

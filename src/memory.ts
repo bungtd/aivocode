@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { homedir } from "node:os";
+import { writeFileAtomic } from "./fs-util.js";
 
 export type MemoryCategory =
   | "preference"
@@ -57,16 +58,30 @@ export class SelfLearningMemory {
       const lines = readFileSync(this.filePath, "utf8")
         .split(/\r?\n/)
         .filter((l) => l.trim().length > 0);
-      this.entries = lines.map((l) => JSON.parse(l) as MemoryEntry);
+      this.entries = [];
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line) as MemoryEntry;
+          if (
+            entry &&
+            typeof entry.id === "string" &&
+            typeof entry.title === "string" &&
+            typeof entry.content === "string"
+          ) {
+            this.entries.push(entry);
+          }
+        } catch {
+          // Keep the healthy entries even if one line was truncated by an interrupted write.
+        }
+      }
     } catch {
       this.entries = [];
     }
   }
 
   private save(): void {
-    mkdirSync(dirname(this.filePath), { recursive: true });
     const payload = this.entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
-    writeFileSync(this.filePath, payload, "utf8");
+    writeFileAtomic(this.filePath, payload, 0o600);
   }
 
   remember(input: {

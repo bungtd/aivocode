@@ -1,12 +1,7 @@
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { homedir } from "node:os";
+import { writeFileAtomic } from "./fs-util.js";
 
 export interface SkillSummary {
   id: string;
@@ -191,18 +186,17 @@ export class SkillRegistry {
     const skillDir = join(targetRoot, cleanId);
     const skillFile = join(skillDir, "SKILL.md");
 
-    mkdirSync( dirname(skillFile), { recursive: true });
     const markdown = [
       "---",
       `name: ${input.name.trim() || cleanId}`,
-      `description: ${input.description.trim()}`,
+      `description: ${input.description.trim().replace(/\r?\n/g, " ")}`,
       "---",
       "",
       input.body.trim(),
       "",
     ].join("\n");
 
-    writeFileSync(skillFile, markdown, "utf8");
+    writeFileAtomic(skillFile, markdown, 0o600);
     this.refresh();
     return this.loadSkill(cleanId)!;
   }

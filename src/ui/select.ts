@@ -1,6 +1,6 @@
 import { emitKeypressEvents } from "node:readline";
 import { stdin, stdout } from "node:process";
-import { c } from "./theme.js";
+import { c, sanitizeTerminalText } from "./theme.js";
 
 export const SLASH_COMMANDS: Array<{ cmd: string; description: string }> = [
   { cmd: "/model", description: "Interactive Primary Model Picker or switch model (/model <id>)" },
@@ -14,6 +14,11 @@ export const SLASH_COMMANDS: Array<{ cmd: string; description: string }> = [
   { cmd: "/models", description: "Browse live AivoKey catalog (--tools, --free)" },
   { cmd: "/effort", description: "Select reasoning effort (off · minimal · low · medium · high · xhigh · max)" },
   { cmd: "/mode", description: "Switch agent mode (auto · safe · plan)" },
+  { cmd: "/sandbox", description: "Show or set sandbox policy (workspace · read-only · danger-full-access)" },
+  {
+    cmd: "/permissions",
+    description: "Edit allow/ask/deny rules in the permission modal (or show sandbox status)",
+  },
   { cmd: "/wire", description: "Switch AivoKey wire protocol (chat · messages · responses)" },
   { cmd: "/btw", description: "Ask a quick side question without polluting session history (/btw <question>)" },
   { cmd: "/skills", description: "List or load discovered skills (.aivokey, .opencode, .dsh, .claude)" },
@@ -22,9 +27,18 @@ export const SLASH_COMMANDS: Array<{ cmd: string; description: string }> = [
   { cmd: "/screenshot", description: "Capture desktop screenshot and attach to Vision" },
   { cmd: "/copy", description: "Copy last assistant response (or '/copy code' for last code block) to clipboard (Ctrl+Y)" },
   { cmd: "/status", description: "Live AivoKey balance, faucet tokens, plan quota & cache stats" },
+  { cmd: "/lsp", description: "Show LSP servers & status, or restart one (/lsp restart [server])" },
+  { cmd: "/hooks", description: "Show configured lifecycle hooks (SessionStart, PreToolUse, PostToolUse, Stop, ...)" },
+  { cmd: "/plugins", description: "Show loaded plugin modules, plugin tools and plugin hooks" },
+  { cmd: "/commands", description: "List custom slash commands from .aivokey/commands and plugins" },
+  { cmd: "/acp", description: "Show how to run AivoCode as an Agent Client Protocol server (aivo acp)" },
+  { cmd: "/telemetry", description: "Show span counts, duration by kind, and metric series for this session" },
+  { cmd: "/browser", description: "Show browser automation status and available browser_* tools" },
+  { cmd: "/mcp", description: "Show configured MCP servers, connection state, tools & resources" },
   { cmd: "/compact", description: "Compress conversation history to free context window" },
-  { cmd: "/undo", description: "Revert file edits from the last turn via checkpoints" },
+  { cmd: "/undo", description: "Revert file edits from the last turn (persisted across restarts)" },
   { cmd: "/redo", description: "Restore file edits reverted by /undo" },
+  { cmd: "/checkpoints", description: "Show persisted undo/redo checkpoint history for this session" },
   { cmd: "/diff", description: "Show git diff & files modified in this session" },
   { cmd: "/todo", description: "View active task progress board" },
   { cmd: "/fork", description: "Fork conversation into a new sticky session" },
@@ -143,10 +157,10 @@ export async function interactiveSelect<T>(opts: {
 
     const lines: string[] = [];
     lines.push(
-      `${c.cyan("◆")} ${c.bold(opts.title)} ${c.slate("(↑/↓ navigate · type to filter · Enter select · Esc cancel)")}`,
+      `${c.cyan("◆")} ${c.bold(sanitizeTerminalText(opts.title))} ${c.slate("(↑/↓ navigate · type to filter · Enter select · Esc cancel)")}`,
     );
     lines.push(
-      `  ${c.slate("Filter:")} ${filter ? c.white(filter) : c.dim("all")} ${c.slate(`(${filtered.length} items)`)}`,
+      `  ${c.slate("Filter:")} ${filter ? c.white(sanitizeTerminalText(filter)) : c.dim("all")} ${c.slate(`(${filtered.length} items)`)}`,
     );
 
     if (filtered.length === 0) {
@@ -163,9 +177,10 @@ export async function interactiveSelect<T>(opts: {
         const item = filtered[i]!;
         const isCurrent = i === selectedIdx;
         const cursor = isCurrent ? c.cyan("❯") : " ";
-        const label = isCurrent ? c.bold(c.cyan(item.label)) : c.white(item.label);
-        const badge = item.badge ? ` ${item.badge}` : "";
-        const detail = item.detail ? ` ${c.slate(item.detail)}` : "";
+        const safeLabel = sanitizeTerminalText(item.label);
+        const label = isCurrent ? c.bold(c.cyan(safeLabel)) : c.white(safeLabel);
+        const badge = item.badge ? ` ${sanitizeTerminalText(item.badge)}` : "";
+        const detail = item.detail ? ` ${c.slate(sanitizeTerminalText(item.detail))}` : "";
         lines.push(`  ${cursor} ${label}${badge}${detail}`);
       }
     }

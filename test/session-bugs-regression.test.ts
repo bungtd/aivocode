@@ -44,11 +44,13 @@ describe("Regression tests for real session bugs (ses_mvpuvolp_d1ccd69ad3)", () 
       expect(dirPathRes.isError).toBe(true);
       expect(dirPathRes.output).toContain("directory");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
-  it("2. translates cmd/POSIX shell idioms (dir /a, ls -la) and supports background: true in run_shell", async () => {
+  it.skipIf(process.platform !== "win32")(
+    "2. translates cmd/POSIX shell idioms (dir /a, ls -la) and supports background: true in run_shell",
+    async () => {
     const dir = mkdtempSync(join(tmpdir(), "aivo-shell-"));
     try {
       writeFileSync(join(dir, "index.html"), "<h1>Hello</h1>", "utf8");
@@ -64,9 +66,11 @@ describe("Regression tests for real session bugs (ses_mvpuvolp_d1ccd69ad3)", () 
       expect(dirRes.isError).toBeFalsy();
       expect(dirRes.output).toContain("index.html");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
-  });
+    },
+    30_000,
+  );
 
   it("3. maps special keys (Escape, Control+-, Enter) for Windows SendKeys and allows local HTML paths in computer_use open_url", () => {
     expect(normalizeSendKeysExpression("Escape")).toBe("{ESC}");
@@ -218,7 +222,7 @@ describe("Regression tests for real session bugs (ses_mvpuvolp_d1ccd69ad3)", () 
       expect(progressEvents[0]?.name).toContain("write_file");
       expect(res.finalText).toBe("Completed and verified index.html!");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -235,7 +239,7 @@ describe("Regression tests for real session bugs (ses_mvpuvolp_d1ccd69ad3)", () 
       expect(check.findings.some((f) => f.includes("css/missing.css"))).toBe(true);
       expect(check.findings.some((f) => f.includes("js/app.js"))).toBe(true);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });

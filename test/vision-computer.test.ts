@@ -47,7 +47,7 @@ describe("Multimodal Vision & Computer Use", () => {
       expect(respBlocks).toHaveLength(2);
       expect(respBlocks[1]?.type).toBe("input_image");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 

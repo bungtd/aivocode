@@ -49,7 +49,7 @@ describe("Interactive Config Center, Subagent/Role Model Selection & Argument Au
       expect(resolved.subagentEffort).toBe("low");
       expect(resolved.strategy).toBe("subagent-driven");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -118,7 +118,7 @@ describe("Interactive Config Center, Subagent/Role Model Selection & Argument Au
       expect(resCfgList.output).toContain("claude-opus-5-5");
       expect(resCfgList.output).toContain("subagent-driven");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });

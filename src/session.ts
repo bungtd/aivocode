@@ -1,15 +1,10 @@
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
 import type { AivoWire } from "./config.js";
 import type { ChatMessage } from "./protocol.js";
+import { writeFileAtomic } from "./fs-util.js";
 
 export interface AivoSession {
   id: string;
@@ -74,14 +69,13 @@ export class SessionStore {
   }
 
   saveSession(session: AivoSession): void {
-    mkdirSync(this.dir, { recursive: true });
     session.updatedAt = new Date().toISOString();
     const { messages, ...meta } = session;
     const lines = [
       JSON.stringify({ type: "meta", ...meta }),
       ...messages.map((m) => JSON.stringify({ type: "message", message: m })),
     ];
-    writeFileSync(this.filePath(session.id), lines.join("\n") + "\n", "utf8");
+    writeFileAtomic(this.filePath(session.id), lines.join("\n") + "\n", 0o600);
   }
 
   loadSession(id: string): AivoSession | null {
@@ -92,19 +86,31 @@ export class SessionStore {
         .split(/\r?\n/)
         .filter((l) => l.trim().length > 0);
       if (lines.length === 0) return null;
-      const meta = JSON.parse(lines[0]!) as Record<string, unknown>;
+
+      // Tolerate a truncated/corrupt metadata line instead of discarding the whole session.
+      let meta: Record<string, unknown> = {};
+      try {
+        meta = JSON.parse(lines[0]!) as Record<string, unknown>;
+      } catch {
+        meta = {};
+      }
+
       const messages: ChatMessage[] = [];
       for (let i = 1; i < lines.length; i++) {
-        const row = JSON.parse(lines[i]!) as { type?: string; message?: ChatMessage };
-        if (row.type === "message" && row.message) {
-          messages.push(row.message);
+        try {
+          const row = JSON.parse(lines[i]!) as { type?: string; message?: ChatMessage };
+          if (row.type === "message" && row.message) {
+            messages.push(row.message);
+          }
+        } catch {
+          // Skip a single corrupt message line; keep the rest of the session usable.
         }
       }
       return {
         id: String(meta.id ?? id),
         createdAt: String(meta.createdAt ?? new Date().toISOString()),
         updatedAt: String(meta.updatedAt ?? new Date().toISOString()),
-        model: String(meta.model ?? "deepseek-v4-pro"),
+        model: String(meta.model ?? "deepseek-v4.1-flash"),
         wire: (meta.wire === "messages" || meta.wire === "responses" ? meta.wire : "chat") as AivoWire,
         cwd: String(meta.cwd ?? process.cwd()),
         parentSessionId: typeof meta.parentSessionId === "string" ? meta.parentSessionId : null,
@@ -140,10 +146,37 @@ export class SessionStore {
     const items: Array<Omit<AivoSession, "messages"> & { messageCount: number }> = [];
     for (const f of files) {
       const id = f.replace(/\.jsonl$/, "");
-      const s = this.loadSession(id);
-      if (s) {
-        const { messages, ...meta } = s;
-        items.push({ ...meta, messageCount: messages.length });
+      try {
+        const lines = readFileSync(join(this.dir, f), "utf8")
+          .split(/\r?\n/)
+          .filter((l) => l.trim().length > 0);
+        if (lines.length === 0) continue;
+        let meta: Record<string, unknown> = {};
+        try {
+          meta = JSON.parse(lines[0]!) as Record<string, unknown>;
+        } catch {
+          meta = {};
+        }
+        items.push({
+          id: String(meta.id ?? id),
+          createdAt: String(meta.createdAt ?? ""),
+          updatedAt: String(meta.updatedAt ?? ""),
+          model: String(meta.model ?? "deepseek-v4.1-flash"),
+          wire: (meta.wire === "messages" || meta.wire === "responses"
+            ? meta.wire
+            : "chat") as AivoWire,
+          cwd: String(meta.cwd ?? process.cwd()),
+          parentSessionId:
+            typeof meta.parentSessionId === "string" ? meta.parentSessionId : null,
+          totalInputTokens: Number(meta.totalInputTokens ?? 0),
+          totalOutputTokens: Number(meta.totalOutputTokens ?? 0),
+          totalCacheReadTokens: Number(meta.totalCacheReadTokens ?? 0),
+          totalCacheWriteTokens: Number(meta.totalCacheWriteTokens ?? 0),
+          totalCostMicro: String(meta.totalCostMicro ?? "0"),
+          messageCount: Math.max(0, lines.length - 1),
+        });
+      } catch {
+        // Skip unreadable/corrupt session files.
       }
     }
     return items

@@ -2,8 +2,14 @@ import { emitKeypressEvents } from "node:readline";
 import { PassThrough } from "node:stream";
 import { stdin, stdout } from "node:process";
 import { execSync } from "node:child_process";
+import { execShellCapture } from "../shell-util.js";
 import type { AivoWire, ExecutionStrategy, PermissionMode, ReasoningEffort } from "../config.js";
-import { saveUserConfig } from "../config.js";
+import { saveConfigForWorkspace } from "../config.js";
+import type {
+  PermissionAction,
+  PermissionKind,
+  PermissionsConfig,
+} from "../permissions.js";
 import { AIVO_CLIENT_VERSION } from "../client-identity.js";
 import { AGENT_TEAMS, getAgentTeam, type TeamId } from "../teams.js";
 import { SLASH_COMMANDS } from "./select.js";
@@ -26,6 +32,7 @@ import {
   padEndVisible,
   renderTodoBoard,
   renderToolCallCard,
+  sanitizeTerminalText,
   stripAnsi,
   visibleLength,
 } from "./theme.js";
@@ -83,7 +90,10 @@ export async function startFullScreenTui(
   let spinnerTimer: ReturnType<typeof setInterval> | null = null;
   let activeAbort: AbortController | null = null;
   let modal: FullScreenModalState | null = null;
-  let pendingConfirmResolve: ((allowed: boolean) => void) | null = null;
+  let permissionDraft: { kind: PermissionKind; action: PermissionAction } | null = null;
+  let pendingPermissionKind: PermissionKind | null = null;
+  let permissionRuleTarget: { kind: PermissionKind; index: number } | null = null;
+  let pendingConfirmResolve: ((choice: "yes" | "always" | "no") => void) | null = null;
   const history: string[] = [];
   let historyIdx = 0;
 
@@ -96,13 +106,47 @@ export async function startFullScreenTui(
   let lastProgressRenderAt = 0;
   let pendingStrategyResolve: ((choice: "subagent-driven" | "native") => void) | null = null;
 
+  let cachedSystemPrompt = "";
+  let cachedSystemPromptKey = "";
+  let cachedSystemPromptAt = 0;
+  const getSystemPromptForState = (): string => {
+    const key = `${agent.config.cwd}|${agent.config.mode}|${agent.config.team ?? ""}`;
+    const now = Date.now();
+    if (key !== cachedSystemPromptKey || now - cachedSystemPromptAt > 5_000) {
+      cachedSystemPrompt = buildSystemPrompt(
+        agent.config.cwd,
+        agent.config.mode,
+        agent.config.team,
+        agent.lspManager.hasServers(),
+      );
+      cachedSystemPromptKey = key;
+      cachedSystemPromptAt = now;
+    }
+    return cachedSystemPrompt;
+  };
+
+  let ctxCacheKey = "";
+  let ctxCacheValue = 0;
+  const estimateCachedTokens = (sysPrompt: string): number => {
+    const messages = agent.session.messages;
+    const last = messages[messages.length - 1];
+    const key = [
+      sysPrompt.length,
+      messages.length,
+      last?.content.length ?? 0,
+      last?.toolCalls?.length ?? 0,
+      last?.images?.length ?? 0,
+    ].join("|");
+    if (key !== ctxCacheKey) {
+      ctxCacheValue = estimateConversationTokens(sysPrompt, messages);
+      ctxCacheKey = key;
+    }
+    return ctxCacheValue;
+  };
+
   const computeState = (): FullScreenTuiState => {
-    const sysPrompt = buildSystemPrompt(
-      agent.config.cwd,
-      agent.config.mode,
-      agent.config.team,
-    );
-    const usedCtx = estimateConversationTokens(sysPrompt, agent.session.messages);
+    const sysPrompt = getSystemPromptForState();
+    const usedCtx = estimateCachedTokens(sysPrompt);
     const modelInfo = agent.getActiveModelInfo();
     const maxCtx = modelInfo?.contextWindow ?? 1_000_000;
     const totalPrompt = agent.session.totalInputTokens + agent.session.totalCacheReadTokens;
@@ -154,6 +198,10 @@ export async function startFullScreenTui(
             buffer,
             workspaceFiles,
             (agent.catalog.length > 0 ? agent.catalog : DEFAULT_AIVOKEY_CATALOG).map((m) => m.id),
+            agent.customCommands.map((command) => ({
+              cmd: `/${command.name}`,
+              description: command.description,
+            })),
           ),
       selectedSuggestionIdx,
       modal,
@@ -164,9 +212,23 @@ export async function startFullScreenTui(
   };
 
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  let scheduledRenderTimer: ReturnType<typeof setTimeout> | null = null;
   const render = (clearScreen: boolean = false) => {
+    if (scheduledRenderTimer) {
+      clearTimeout(scheduledRenderTimer);
+      scheduledRenderTimer = null;
+    }
     const ansiBuf = renderFullScreenAnsiBuffer(computeState(), clearScreen);
     stdout.write(ansiBuf);
+  };
+  /** Coalesces streaming deltas into at most ~30 fps instead of rendering per token. */
+  const scheduleRender = () => {
+    if (scheduledRenderTimer) return;
+    scheduledRenderTimer = setTimeout(() => {
+      scheduledRenderTimer = null;
+      render();
+    }, 33);
+    (scheduledRenderTimer as unknown as { unref?: () => void }).unref?.();
   };
 
   const startBusy = (label: string) => {
@@ -192,6 +254,31 @@ export async function startFullScreenTui(
   };
 
   // Wire agent callbacks into the full-screen transcript pane
+  const showConfirmModal = async (
+    description: string,
+  ): Promise<"yes" | "always" | "no"> => {
+    stopBusy();
+    modal = {
+      id: "confirm",
+      title: `Allow ${description}?`,
+      filter: "",
+      selectedIdx: 0,
+      items: [
+        { value: "yes", label: "Yes, allow once", detail: "Execute this operation now" },
+        {
+          value: "always",
+          label: "Always allow in session",
+          detail: "Remember this exact operation for the current session",
+        },
+        { value: "no", label: "No, decline", detail: "Skip this operation" },
+      ],
+    };
+    render();
+    return new Promise<"yes" | "always" | "no">((resolveChoice) => {
+      pendingConfirmResolve = resolveChoice;
+    });
+  };
+
   (agent as unknown as { callbacks: Record<string, unknown> }).callbacks = {
     onReasoningDelta: (delta: string) => {
       busyBaseLabel = `Thinking with ${agent.config.model}`;
@@ -202,7 +289,7 @@ export async function startFullScreenTui(
         transcriptLines.push("");
       }
       streamingReasoningBuffer += delta;
-      const previewLines = streamingReasoningBuffer
+      const previewLines = sanitizeTerminalText(streamingReasoningBuffer)
         .split(/\r?\n/)
         .slice(-6)
         .map((l) => `    ${c.dim(l)}`);
@@ -211,7 +298,7 @@ export async function startFullScreenTui(
         transcriptLines.length - streamingReasoningLineIdx,
         ...previewLines,
       );
-      render();
+      scheduleRender();
     },
     onTextDelta: (delta: string) => {
       busyBaseLabel = `Streaming from ${agent.config.model}`;
@@ -234,7 +321,7 @@ export async function startFullScreenTui(
         transcriptLines.length - streamingAssistantLineIdx,
         ...formatted,
       );
-      render();
+      scheduleRender();
     },
     onToolCall: (name: string, args: Record<string, unknown>) => {
       streamingAssistantLineIdx = null;
@@ -264,13 +351,13 @@ export async function startFullScreenTui(
         streamingToolProgressLineIdx = transcriptLines.length;
         transcriptLines.push("");
       }
-      const previewRow = `${c.cyan("◌")} ${c.bold(target)} ${c.emerald(`${lines} lines`)} ${c.slate(`(${kb} KB)`)} ${c.dim(preview.slice(-60))}`;
+      const previewRow = `${c.cyan("◌")} ${c.bold(sanitizeTerminalText(target))} ${c.emerald(`${lines} lines`)} ${c.slate(`(${kb} KB)`)} ${c.dim(sanitizeTerminalText(preview.slice(-60)))}`;
       transcriptLines.splice(
         streamingToolProgressLineIdx,
         transcriptLines.length - streamingToolProgressLineIdx,
         previewRow,
       );
-      render();
+      scheduleRender();
     },
     onToolResult: (
       name: string,
@@ -312,8 +399,8 @@ export async function startFullScreenTui(
       render();
     },
     onNotice: (msg: string) => {
-      notice = msg;
-      transcriptLines.push(`  ${c.amber(`⚡ ${msg}`)}`);
+      notice = sanitizeTerminalText(msg);
+      transcriptLines.push(`  ${c.amber(`⚡ ${sanitizeTerminalText(msg)}`)}`);
       render();
     },
     chooseStrategy: async (decision: {
@@ -347,23 +434,10 @@ export async function startFullScreenTui(
       });
     },
     confirmAction: async (description: string) => {
-      stopBusy();
-      modal = {
-        id: "confirm",
-        title: `Allow ${description}?`,
-        filter: "",
-        selectedIdx: 0,
-        items: [
-          { value: "yes", label: "Yes, allow once", detail: "Execute this tool call now" },
-          { value: "always", label: "Always allow in session", detail: "Switch session to AUTO mode" },
-          { value: "no", label: "No, decline", detail: "Skip this action" },
-        ],
-      };
-      render();
-      return new Promise<boolean>((resConfirm) => {
-        pendingConfirmResolve = resConfirm;
-      });
+      const choice = await showConfirmModal(description);
+      return choice !== "no";
     },
+    confirmActionChoice: async (description: string) => showConfirmModal(description),
   };
 
   let activeSubagentRoleTarget: "explore" | "architect" | "builder" | "reviewer" | "all" = "explore";
@@ -383,7 +457,7 @@ export async function startFullScreenTui(
       if (m.supportsPromptCache) badges.push("cache");
       return {
         value: m.id,
-        label: m.id,
+        label: sanitizeTerminalText(m.id),
         badge: `[${badges.join("·")}]`,
         detail: `${formatCompactTokens(m.contextWindow)} ctx · $${inUsd}/$${outUsd}`,
       };
@@ -535,6 +609,10 @@ export async function startFullScreenTui(
 
   const openConfigModal = () => {
     const cfg = agent.config;
+    const permissionRuleCount = (["read", "write", "shell", "webfetch"] as const).reduce(
+      (total, kind) => total + (cfg.permissions?.[kind]?.length ?? 0),
+      0,
+    );
     modal = {
       id: "config",
       title: "AivoCode Settings & Configuration Center (/config · Ctrl+O)",
@@ -596,6 +674,18 @@ export async function startFullScreenTui(
           detail: "auto (Build) · plan (Read-only) · safe (Confirm)",
         },
         {
+          value: "sandbox",
+          label: "Sandbox Policy",
+          badge: `[${cfg.sandbox ?? "workspace"}]`,
+          detail: "workspace · read-only · danger-full-access",
+        },
+        {
+          value: "permissions",
+          label: "Permission Rules",
+          badge: `[${permissionRuleCount} rules]`,
+          detail: "Full-screen allow/ask/deny editor for read, write, shell & webfetch",
+        },
+        {
           value: "effort",
           label: "Primary Reasoning Effort",
           badge: `[${cfg.reasoningEffort}]`,
@@ -619,7 +709,188 @@ export async function startFullScreenTui(
           badge: `[${cfg.autoReviewFix !== false ? "ON" : "OFF"}]`,
           detail: "Toggle automatic post-edit verification & review-fix pass",
         },
+        {
+          value: "worktreeIsolation",
+          label: "Subagent Worktree Isolation",
+          badge: `[${cfg.worktreeIsolation !== false ? "ON" : "OFF"}]`,
+          detail: "Git worktree per mutating subagent prevents parallel edit races",
+        },
       ],
+    };
+    render();
+  };
+
+  const permissionKinds: readonly PermissionKind[] = ["read", "write", "shell", "webfetch"];
+
+  const permissionSettings = (): PermissionsConfig => agent.config.permissions ?? {};
+
+  const persistPermissionSettings = () => {
+    saveConfigForWorkspace(agent.config, { permissions: agent.config.permissions ?? {} });
+  };
+
+  const permissionPatternHint = (kind: PermissionKind): string => {
+    if (kind === "read" || kind === "write") return "**/*.env · src/** · secrets/**";
+    if (kind === "shell") return "npm * · git * · node *";
+    return "https://example.com/* · https://*.github.com/*";
+  };
+
+  const addPermissionRule = (
+    kind: PermissionKind,
+    pattern: string,
+    action: PermissionAction,
+  ) => {
+    const perms = { ...permissionSettings() };
+    perms[kind] = [...(perms[kind] ?? []), { pattern, action }];
+    agent.config.permissions = perms;
+    persistPermissionSettings();
+  };
+
+  const setPermissionRuleAction = (
+    kind: PermissionKind,
+    index: number,
+    action: PermissionAction,
+  ) => {
+    const perms = { ...permissionSettings() };
+    const rules = [...(perms[kind] ?? [])];
+    const current = rules[index];
+    if (!current) return;
+    rules[index] = { pattern: current.pattern, action };
+    perms[kind] = rules;
+    agent.config.permissions = perms;
+    persistPermissionSettings();
+  };
+
+  const deletePermissionRule = (kind: PermissionKind, index: number) => {
+    const perms = { ...permissionSettings() };
+    const rules = [...(perms[kind] ?? [])];
+    if (index < 0 || index >= rules.length) return;
+    rules.splice(index, 1);
+    if (rules.length > 0) perms[kind] = rules;
+    else delete perms[kind];
+    agent.config.permissions = perms;
+    persistPermissionSettings();
+  };
+
+  const beginPermissionDraft = (kind: PermissionKind, action: PermissionAction) => {
+    permissionDraft = { kind, action };
+    pendingPermissionKind = null;
+    permissionRuleTarget = null;
+    modal = {
+      id: "permissions",
+      title: `New ${kind} rule · action ${action}`,
+      filter: "",
+      selectedIdx: 0,
+      items: [],
+      filterLabel: "Pattern",
+      filterHint: "Enter save · Esc cancel",
+      emptyText: `Type a glob pattern, e.g. ${permissionPatternHint(kind)}`,
+    };
+    render();
+  };
+
+  const openPermissionActionPicker = (kind: PermissionKind, targetIndex?: number) => {
+    pendingPermissionKind = targetIndex === undefined ? kind : null;
+    permissionRuleTarget = targetIndex === undefined ? null : { kind, index: targetIndex };
+    const rule =
+      targetIndex === undefined ? undefined : (permissionSettings()[kind] ?? [])[targetIndex];
+    const items: ModalOption[] = [
+      {
+        value: "action:allow",
+        label: "Allow",
+        badge: "[allow]",
+        detail: "Run automatically without prompting",
+      },
+      {
+        value: "action:ask",
+        label: "Ask",
+        badge: "[ask]",
+        detail: "Prompt before each matching operation",
+      },
+      {
+        value: "action:deny",
+        label: "Deny",
+        badge: "[deny]",
+        detail: "Block matching operations",
+      },
+    ];
+    if (rule) {
+      items.push({
+        value: "delete",
+        label: "Delete this rule",
+        badge: "[remove]",
+        detail: rule.pattern,
+      });
+    }
+    modal = {
+      id: "permissions_action",
+      title: rule ? `Edit ${kind} rule: ${rule.pattern}` : `Add ${kind} rule — choose action`,
+      filter: "",
+      selectedIdx: rule ? Math.max(0, ["allow", "ask", "deny"].indexOf(rule.action)) : 1,
+      items,
+    };
+    render();
+  };
+
+  const openPermissionEditorModal = () => {
+    permissionDraft = null;
+    pendingPermissionKind = null;
+    permissionRuleTarget = null;
+    const perms = permissionSettings();
+    const items: ModalOption[] = [];
+    for (const kind of permissionKinds) {
+      for (const [index, rule] of (perms[kind] ?? []).entries()) {
+        items.push({
+          value: `rule:${kind}:${index}`,
+          label: `${kind} · ${rule.pattern}`,
+          badge: `[${rule.action}]`,
+          detail: "Enter: edit action · Del: remove",
+        });
+      }
+    }
+    for (const kind of permissionKinds) {
+      items.push({
+        value: `add:${kind}`,
+        label: `Add ${kind} rule…`,
+        badge: "[new]",
+        detail: `Allow/ask/deny by glob pattern · e.g. ${permissionPatternHint(kind)}`,
+      });
+    }
+    const network = perms.network ?? "allow";
+    const outside = perms.allowOutsideWorkspace === true;
+    items.push(
+      {
+        value: "toggle:network",
+        label: "Network access",
+        badge: `[${network}]`,
+        detail: "Used by the shell sandbox and webfetch permission checks",
+      },
+      {
+        value: "toggle:outside",
+        label: "Allow operations outside workspace",
+        badge: `[${outside ? "ON" : "OFF"}]`,
+        detail: "Off by default; outside paths require an explicit rule or this toggle",
+      },
+      {
+        value: "clear",
+        label: "Clear all permission rules",
+        badge: "[reset]",
+        detail: "Keep network and outside-workspace settings",
+      },
+      {
+        value: "done",
+        label: "Save & close",
+        badge: "[Esc]",
+        detail: "Changes are persisted immediately",
+      },
+    );
+    modal = {
+      id: "permissions",
+      title: "Permission Rules · read / write / shell / webfetch",
+      filter: "",
+      selectedIdx: 0,
+      items,
+      filterLabel: "Filter rules",
+      emptyText: "No permission rules yet. Choose an Add … action below.",
     };
     render();
   };
@@ -768,7 +1039,14 @@ export async function startFullScreenTui(
     const items: ModalOption[] = [
       ...(job.status === "running"
         ? [{ value: `kill:${job.id}`, label: "✗ Kill / Stop This Process", badge: `[PID ${job.pid ?? "-"}]`, detail: job.command }]
-        : []),
+        : [
+            {
+              value: `restart:${job.id}`,
+              label: "↻ Relaunch This Job",
+              badge: `[${job.status.toUpperCase()}]`,
+              detail: job.command,
+            },
+          ]),
       ...job.logs.slice(-40).map((l, idx) => ({
         value: `log:${idx}`,
         label: l.slice(0, 68),
@@ -809,21 +1087,36 @@ export async function startFullScreenTui(
 
     if (line.startsWith("!")) {
       const shellCmd = line.slice(1).trim();
-      transcriptLines.push(`${c.amber("$")} ${c.bold(shellCmd)}`);
+      transcriptLines.push(`${c.amber("$")} ${sanitizeTerminalText(shellCmd)}`);
       if (shellCmd) {
+        const abort = new AbortController();
+        activeAbort = abort;
+        startBusy(`Running shell command (Esc to stop)`);
         try {
-          const out = execSync(shellCmd, {
+          const { stdout, stderr } = await execShellCapture(shellCmd, {
             cwd: agent.config.cwd,
-            encoding: "utf8",
-            stdio: "pipe",
+            signal: abort.signal,
           });
-          if (out) {
-            transcriptLines.push(...out.trimEnd().split(/\r?\n/).map((l) => `  ${c.slate(l)}`));
+          const combined = [stdout, stderr].filter(Boolean).join("\n").trimEnd();
+          if (combined) {
+            const allLines = sanitizeTerminalText(combined).split(/\r?\n/);
+            const shown = allLines.slice(0, 500);
+            transcriptLines.push(...shown.map((l) => `  ${c.slate(l)}`));
+            if (allLines.length > shown.length) {
+              transcriptLines.push(`  ${c.slate(`... (${allLines.length - shown.length} more lines)`)}`);
+            }
           }
         } catch (err) {
           transcriptLines.push(
-            `  ${c.rose(`Command failed: ${err instanceof Error ? err.message : String(err)}`)}`,
+            `  ${c.rose(
+              abort.signal.aborted
+                ? "Command interrupted by user."
+                : `Command failed: ${sanitizeTerminalText(err instanceof Error ? err.message : String(err))}`,
+            )}`,
           );
+        } finally {
+          activeAbort = null;
+          stopBusy();
         }
         gitBranch = getGitBranchLabel(agent.config.cwd);
       }
@@ -833,6 +1126,7 @@ export async function startFullScreenTui(
     }
 
     if (line.startsWith("/")) {
+      try {
       const cmdOnly = line.toLowerCase();
       if (cmdOnly === "/model" || cmdOnly === "/models") {
         openModelModal();
@@ -844,6 +1138,10 @@ export async function startFullScreenTui(
       }
       if (cmdOnly === "/config" || cmdOnly === "/settings") {
         openConfigModal();
+        return;
+      }
+      if (cmdOnly === "/permissions" || cmdOnly === "/permission-rules") {
+        openPermissionEditorModal();
         return;
       }
       if (cmdOnly === "/strategy") {
@@ -892,7 +1190,7 @@ export async function startFullScreenTui(
       if (cmdOnly.startsWith("/bg ")) {
         const bgCmd = line.slice("/bg ".length).trim();
         if (bgCmd) {
-          const job = agent.backgroundJobs.startJob({ command: bgCmd, cwd: agent.config.cwd });
+          const job = agent.startBackgroundJob(bgCmd);
           notice = `Started background job ${job.id} (PID ${job.pid ?? "-"})`;
           transcriptLines.push(`${c.emerald("●")} Started background terminal ${c.bold(job.id)}: ${bgCmd}`);
           render();
@@ -902,6 +1200,10 @@ export async function startFullScreenTui(
       const res = await handleSlashCommand(line, agent, keyStatus, fetchFn, false);
       if (res.updatedKeyStatus !== undefined) {
         keyStatus = res.updatedKeyStatus;
+      }
+      if (res.prompt !== undefined) {
+        runPromptSafely(res.prompt);
+        return;
       }
       if (cmdOnly === "/clear" || cmdOnly === "/new") {
         transcriptLines.length = 0;
@@ -913,13 +1215,23 @@ export async function startFullScreenTui(
       if (res.shouldExit) {
         cleanupAndExit();
       }
+      } catch (err) {
+        stopBusy();
+        transcriptLines.push(
+          `  ${c.rose("✗")} ${sanitizeTerminalText(err instanceof Error ? err.message : String(err))}`,
+        );
+        transcriptLines.push("");
+        scrollOffset = 0;
+        render();
+      }
       return;
     }
 
     // Standard user prompt to LLM agent (format multi-line prompts cleanly per line)
     for (const [idx, subLine] of line.split(/\r?\n/).entries()) {
+      const safeLine = sanitizeTerminalText(subLine);
       transcriptLines.push(
-        idx === 0 ? `${c.cyan("❯")} ${c.bold(c.white(subLine))}` : `  ${c.bold(c.white(subLine))}`,
+        idx === 0 ? `${c.cyan("❯")} ${c.bold(c.white(safeLine))}` : `  ${c.bold(c.white(safeLine))}`,
       );
     }
     streamingAssistantLineIdx = null;
@@ -975,6 +1287,17 @@ export async function startFullScreenTui(
       streamingAssistantLineIdx = null;
       streamingReasoningLineIdx = null;
     }
+  };
+
+  const runPromptSafely = (line: string) => {
+    void executePromptOrCommand(line).catch((err) => {
+      stopBusy();
+      transcriptLines.push(
+        `  ${c.rose("✗")} ${sanitizeTerminalText(err instanceof Error ? err.message : String(err))}`,
+      );
+      transcriptLines.push("");
+      render();
+    });
   };
 
   let exitResolve: (() => void) | null = null;
@@ -1224,7 +1547,9 @@ export async function startFullScreenTui(
     cleanedUp = true;
     if (spinnerTimer) clearInterval(spinnerTimer);
     if (resizeTimer) clearTimeout(resizeTimer);
+    if (scheduledRenderTimer) clearTimeout(scheduledRenderTimer);
     agent.backgroundJobs.stopAll();
+    agent.dispose();
     stdout.off("resize", onResize);
     stdin.off("data", onRawStdinData);
     keyboardStream.off("keypress", onKeypress);
@@ -1274,7 +1599,52 @@ export async function startFullScreenTui(
           )
         : m.items;
 
+      if (m.id === "permissions" && permissionDraft) {
+        if (key?.name === "escape" || (key?.ctrl && key?.name === "c")) {
+          permissionDraft = null;
+          openPermissionEditorModal();
+          return;
+        }
+        if (key?.name === "backspace") {
+          m.filter = m.filter.slice(0, -1);
+          render();
+          return;
+        }
+        if (key?.name === "return" || key?.name === "enter") {
+          const pattern = m.filter.trim();
+          if (!pattern) {
+            notice = "Permission pattern cannot be empty";
+            render();
+            return;
+          }
+          const draft = permissionDraft;
+          addPermissionRule(draft.kind, pattern, draft.action);
+          permissionDraft = null;
+          notice = `Added ${draft.kind} ${draft.action} rule: ${pattern}`;
+          openPermissionEditorModal();
+          return;
+        }
+        if (str && !key?.ctrl && !key?.meta) {
+          const printable = sanitizeTerminalText(stripMouseEscapeGarbage(str)).replace(
+            /[\x00-\x1f\x7f]/g,
+            "",
+          );
+          if (printable) {
+            m.filter = sanitizeTerminalText(m.filter + printable);
+            render();
+          }
+          return;
+        }
+        return;
+      }
+
       if (key?.name === "escape" || (key?.ctrl && key?.name === "c")) {
+        if (m.id === "permissions_action") {
+          pendingPermissionKind = null;
+          permissionRuleTarget = null;
+          openPermissionEditorModal();
+          return;
+        }
         if (m.id === "strategy" && pendingStrategyResolve) {
           const fn = pendingStrategyResolve;
           pendingStrategyResolve = null;
@@ -1288,7 +1658,7 @@ export async function startFullScreenTui(
           pendingConfirmResolve = null;
           modal = null;
           render();
-          fn(false);
+          fn("no");
           return;
         }
         modal = null;
@@ -1314,6 +1684,16 @@ export async function startFullScreenTui(
         render();
         return;
       }
+      if (m.id === "permissions" && key?.name === "delete") {
+        const current = filtered[m.selectedIdx];
+        if (current?.value.startsWith("rule:")) {
+          const [, kind, index] = current.value.split(":");
+          deletePermissionRule(kind as PermissionKind, Number(index));
+          notice = `Removed ${kind} rule`;
+          openPermissionEditorModal();
+          return;
+        }
+      }
       if (key?.name === "return" || key?.name === "enter") {
         const chosen = filtered[m.selectedIdx];
         const modalId = m.id;
@@ -1328,22 +1708,108 @@ export async function startFullScreenTui(
         if (modalId === "confirm" && pendingConfirmResolve) {
           const fn = pendingConfirmResolve;
           pendingConfirmResolve = null;
-          if (chosen?.value === "always") {
-            agent.config.mode = "auto";
-            saveUserConfig({ mode: "auto" }, agent.config.globalConfigPath);
-            render();
-            fn(true);
-          } else {
-            render();
-            fn(chosen?.value === "yes");
-          }
+          render();
+          fn(
+            chosen?.value === "always"
+              ? "always"
+              : chosen?.value === "yes"
+                ? "yes"
+                : "no",
+          );
+          return;
+        }
+        if (!chosen && (modalId === "permissions" || modalId === "permissions_action")) {
+          modal = m;
+          render();
           return;
         }
         if (chosen) {
+          if (modalId === "permissions_action") {
+            const action = chosen.value.startsWith("action:")
+              ? (chosen.value.slice("action:".length) as PermissionAction)
+              : null;
+            if (chosen.value === "delete" && permissionRuleTarget) {
+              const target = permissionRuleTarget;
+              deletePermissionRule(target.kind, target.index);
+              permissionRuleTarget = null;
+              notice = `Removed ${target.kind} rule`;
+              openPermissionEditorModal();
+              return;
+            }
+            if (action && permissionRuleTarget) {
+              const target = permissionRuleTarget;
+              setPermissionRuleAction(target.kind, target.index, action);
+              permissionRuleTarget = null;
+              notice = `${target.kind} rule set to ${action}`;
+              openPermissionEditorModal();
+              return;
+            }
+            if (action && pendingPermissionKind) {
+              beginPermissionDraft(pendingPermissionKind, action);
+              return;
+            }
+            openPermissionEditorModal();
+            return;
+          }
+          if (modalId === "permissions") {
+            if (chosen.value.startsWith("rule:")) {
+              const [, kind, index] = chosen.value.split(":");
+              openPermissionActionPicker(kind as PermissionKind, Number(index));
+              return;
+            }
+            if (chosen.value.startsWith("add:")) {
+              openPermissionActionPicker(chosen.value.slice("add:".length) as PermissionKind);
+              return;
+            }
+            if (chosen.value === "toggle:network") {
+              const perms = permissionSettings();
+              const next = (perms.network ?? "allow") === "allow" ? "deny" : "allow";
+              agent.config.permissions = { ...perms, network: next };
+              persistPermissionSettings();
+              notice = `Network access: ${next}`;
+              openPermissionEditorModal();
+              return;
+            }
+            if (chosen.value === "toggle:outside") {
+              const perms = permissionSettings();
+              const next = perms.allowOutsideWorkspace !== true;
+              agent.config.permissions = { ...perms, allowOutsideWorkspace: next };
+              persistPermissionSettings();
+              notice = `Outside workspace access: ${next ? "ON" : "OFF"}`;
+              openPermissionEditorModal();
+              return;
+            }
+            if (chosen.value === "clear") {
+              modal = null;
+              render();
+              void showConfirmModal(
+                "Clear all read/write/shell/webfetch permission rules?",
+              ).then((choice) => {
+                if (choice !== "no") {
+                  const perms = permissionSettings();
+                  agent.config.permissions = {
+                    ...(perms.network ? { network: perms.network } : {}),
+                    ...(perms.allowOutsideWorkspace !== undefined
+                      ? { allowOutsideWorkspace: perms.allowOutsideWorkspace }
+                      : {}),
+                  };
+                  persistPermissionSettings();
+                  notice = "Cleared all permission rules";
+                }
+                openPermissionEditorModal();
+              });
+              return;
+            }
+            if (chosen.value === "done") {
+              permissionDraft = null;
+              render();
+              return;
+            }
+          }
           if (modalId === "model") {
             agent.config.model = chosen.value;
             agent.session.model = chosen.value;
-            saveUserConfig({ model: chosen.value }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { model: chosen.value });
             notice = `Primary model switched to ${chosen.value}`;
           } else if (modalId === "subagent_role") {
             if (chosen.value === "effort") {
@@ -1358,45 +1824,40 @@ export async function startFullScreenTui(
             const role = activeSubagentRoleTarget;
             if (role === "explore") {
               agent.config.fastModel = chosen.value;
-              saveUserConfig({ fastModel: chosen.value }, agent.config.globalConfigPath);
+              saveConfigForWorkspace(agent.config, { fastModel: chosen.value });
             } else if (role === "architect") {
               agent.config.architectModel = chosen.value;
-              saveUserConfig({ architectModel: chosen.value }, agent.config.globalConfigPath);
+              saveConfigForWorkspace(agent.config, { architectModel: chosen.value });
             } else if (role === "builder") {
               agent.config.builderModel = chosen.value;
-              saveUserConfig({ builderModel: chosen.value }, agent.config.globalConfigPath);
+              saveConfigForWorkspace(agent.config, { builderModel: chosen.value });
             } else if (role === "reviewer") {
               agent.config.reviewerModel = chosen.value;
-              saveUserConfig({ reviewerModel: chosen.value }, agent.config.globalConfigPath);
+              saveConfigForWorkspace(agent.config, { reviewerModel: chosen.value });
             } else if (role === "all") {
               agent.config.fastModel = chosen.value;
               agent.config.architectModel = chosen.value;
               agent.config.builderModel = chosen.value;
               agent.config.reviewerModel = chosen.value;
-              saveUserConfig(
-                {
-                  fastModel: chosen.value,
-                  architectModel: chosen.value,
-                  builderModel: chosen.value,
-                  reviewerModel: chosen.value,
-                },
-                agent.config.globalConfigPath,
-              );
+              saveConfigForWorkspace(agent.config, {
+                fastModel: chosen.value,
+                architectModel: chosen.value,
+                builderModel: chosen.value,
+                reviewerModel: chosen.value,
+              });
             }
             notice = `Set ${role} subagent model to ${chosen.value}`;
           } else if (modalId === "subagent_effort") {
             agent.config.subagentEffort = chosen.value as ReasoningEffort;
-            saveUserConfig(
-              { subagentEffort: chosen.value as ReasoningEffort },
-              agent.config.globalConfigPath,
-            );
+            saveConfigForWorkspace(agent.config, {
+              subagentEffort: chosen.value as ReasoningEffort,
+            });
             notice = `Subagent reasoning effort set to ${chosen.value}`;
           } else if (modalId === "strategy_config") {
             agent.config.strategy = chosen.value as ExecutionStrategy;
-            saveUserConfig(
-              { strategy: chosen.value as ExecutionStrategy },
-              agent.config.globalConfigPath,
-            );
+            saveConfigForWorkspace(agent.config, {
+              strategy: chosen.value as ExecutionStrategy,
+            });
             notice = `Execution strategy set to ${chosen.value}`;
           } else if (modalId === "config") {
             switch (chosen.value) {
@@ -1427,6 +1888,19 @@ export async function startFullScreenTui(
               case "mode":
                 openModeModal();
                 return;
+              case "sandbox": {
+                const modes = ["workspace", "read-only", "danger-full-access"] as const;
+                const current = agent.config.sandbox ?? "workspace";
+                const nextMode = modes[(modes.indexOf(current) + 1) % modes.length]!;
+                agent.config.sandbox = nextMode;
+                saveConfigForWorkspace(agent.config, { sandbox: nextMode });
+                notice = `Sandbox set to ${nextMode}`;
+                openConfigModal();
+                return;
+              }
+              case "permissions":
+                openPermissionEditorModal();
+                return;
               case "effort":
                 openEffortModal();
                 return;
@@ -1439,31 +1913,38 @@ export async function startFullScreenTui(
               case "autoReviewFix": {
                 const nextVal = agent.config.autoReviewFix === false;
                 agent.config.autoReviewFix = nextVal;
-                saveUserConfig({ autoReviewFix: nextVal }, agent.config.globalConfigPath);
+                saveConfigForWorkspace(agent.config, { autoReviewFix: nextVal });
                 notice = `Auto Review & Fix Gate: ${nextVal ? "ON" : "OFF"}`;
+                openConfigModal();
+                return;
+              }
+              case "worktreeIsolation": {
+                const nextVal = agent.config.worktreeIsolation === false;
+                agent.config.worktreeIsolation = nextVal;
+                saveConfigForWorkspace(agent.config, { worktreeIsolation: nextVal });
+                notice = `Subagent worktree isolation: ${nextVal ? "ON" : "OFF"}`;
                 openConfigModal();
                 return;
               }
             }
           } else if (modalId === "effort") {
             agent.config.reasoningEffort = chosen.value as ReasoningEffort;
-            saveUserConfig(
-              { reasoningEffort: chosen.value as ReasoningEffort },
-              agent.config.globalConfigPath,
-            );
+            saveConfigForWorkspace(agent.config, {
+              reasoningEffort: chosen.value as ReasoningEffort,
+            });
             notice = `Reasoning effort set to ${chosen.value}`;
           } else if (modalId === "mode") {
             agent.config.mode = chosen.value as PermissionMode;
-            saveUserConfig({ mode: chosen.value as PermissionMode }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { mode: chosen.value as PermissionMode });
             notice = `Mode switched to ${chosen.value.toUpperCase()}`;
           } else if (modalId === "wire") {
             agent.config.wire = chosen.value as AivoWire;
             agent.session.wire = chosen.value as AivoWire;
-            saveUserConfig({ wire: chosen.value as AivoWire }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { wire: chosen.value as AivoWire });
             notice = `Protocol wire set to ${chosen.value}`;
           } else if (modalId === "team") {
             agent.config.team = chosen.value as TeamId;
-            saveUserConfig({ team: chosen.value as TeamId }, agent.config.globalConfigPath);
+            saveConfigForWorkspace(agent.config, { team: chosen.value as TeamId });
             const t = getAgentTeam(chosen.value);
             notice = `Specialist Team: ${t?.name ?? chosen.value}`;
           } else if (modalId === "subagent_inspect_list") {
@@ -1477,10 +1958,16 @@ export async function startFullScreenTui(
               const jid = chosen.value.slice(5);
               agent.backgroundJobs.killJob(jid);
               notice = `Stopped background job ${jid}`;
+            } else if (chosen.value.startsWith("restart:")) {
+              const jid = chosen.value.slice("restart:".length);
+              const restarted = agent.backgroundJobs.restartJob(jid);
+              notice = restarted
+                ? `Relaunched ${restarted.id} (PID ${restarted.pid ?? "-"})`
+                : `Job ${jid} not found`;
             }
           } else if (modalId === "command") {
             render();
-            void executePromptOrCommand(chosen.value);
+            runPromptSafely(chosen.value);
             return;
           }
         }
@@ -1488,7 +1975,7 @@ export async function startFullScreenTui(
         return;
       }
       if (str && str.length === 1 && str >= " " && !key?.ctrl && !key?.meta) {
-        m.filter = stripMouseEscapeGarbage(m.filter + str);
+        m.filter = sanitizeTerminalText(stripMouseEscapeGarbage(m.filter + str));
         m.selectedIdx = 0;
         render();
       }
@@ -1543,14 +2030,11 @@ export async function startFullScreenTui(
       agent.config.reasoningEffort = hotkeyNext.effort;
       agent.config.wire = hotkeyNext.wire;
       agent.session.wire = hotkeyNext.wire;
-      saveUserConfig(
-        {
-          mode: hotkeyNext.mode,
-          reasoningEffort: hotkeyNext.effort,
-          wire: hotkeyNext.wire,
-        },
-        agent.config.globalConfigPath,
-      );
+      saveConfigForWorkspace(agent.config, {
+        mode: hotkeyNext.mode,
+        reasoningEffort: hotkeyNext.effort,
+        wire: hotkeyNext.wire,
+      });
       notice = `Mode=${hotkeyNext.mode.toUpperCase()} · Effort=${hotkeyNext.effort} · Wire=${hotkeyNext.wire}`;
       render();
       return;
@@ -1604,7 +2088,7 @@ export async function startFullScreenTui(
       const next = agent.catalog[(idx + 1) % agent.catalog.length]!;
       agent.config.model = next.id;
       agent.session.model = next.id;
-      saveUserConfig({ model: next.id }, agent.config.globalConfigPath);
+      saveConfigForWorkspace(agent.config, { model: next.id });
       notice = `Cycled model to ${next.id}`;
       render();
       return;
@@ -1939,7 +2423,7 @@ export async function startFullScreenTui(
       notice = null;
       render();
       if (lineToRun) {
-        void executePromptOrCommand(lineToRun);
+        runPromptSafely(lineToRun);
       }
       return;
     }
@@ -1986,7 +2470,9 @@ export async function startFullScreenTui(
     }
 
     if (str && !key?.ctrl && !key?.meta) {
-      const clean = stripMouseEscapeGarbage(str.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
+      const clean = sanitizeTerminalText(
+        stripMouseEscapeGarbage(str.replace(/\r\n/g, "\n").replace(/\r/g, "\n")),
+      );
       if (clean.length > 0 && (clean >= " " || clean.includes("\n"))) {
         if (inputSelection && inputSelection.anchor !== inputSelection.focus) {
           const s = Math.min(inputSelection.anchor, inputSelection.focus);
@@ -2025,7 +2511,7 @@ export async function startFullScreenTui(
   render(true);
 
   if (initialPrompt && initialPrompt.trim()) {
-    void executePromptOrCommand(initialPrompt.trim());
+    runPromptSafely(initialPrompt.trim());
   }
 
   return new Promise<void>((resPromise) => {
@@ -2052,6 +2538,8 @@ export interface FullScreenModalState {
     | "job_detail"
     | "strategy_config"
     | "config"
+    | "permissions"
+    | "permissions_action"
     | "effort"
     | "mode"
     | "wire"
@@ -2064,6 +2552,12 @@ export interface FullScreenModalState {
   filter: string;
   selectedIdx: number;
   items: ModalOption[];
+  /** Label for the filter/input line (defaults to "Search"). */
+  filterLabel?: string;
+  /** Hint shown next to the filter count. */
+  filterHint?: string;
+  /** Message shown when no item matches (defaults to "No matching items."). */
+  emptyText?: string;
 }
 
 export interface PaneSelectionRange {
@@ -2284,7 +2778,7 @@ function buildSidebarLines(state: FullScreenTuiState, width: number, height: num
   addSection("AivoKey Telemetry");
   const modeStr =
     state.keyStatus?.mode === "plan" && state.keyStatus.plan
-      ? `${c.violet(state.keyStatus.plan.name)}`
+      ? `${c.violet(sanitizeTerminalText(state.keyStatus.plan.name))}`
       : c.cyan("PAYG");
   const balStr =
     state.balanceMicro !== null && state.balanceMicro !== undefined
@@ -2314,12 +2808,12 @@ function buildSidebarLines(state: FullScreenTuiState, width: number, height: num
   addRow(
     `${c.slate("Team    :")} ${c.amber(c.bold(activeTeam?.shortLabel ?? "Full-Stack"))} ${c.slate(`[${activeTeam?.roles.map((r) => r.badge).join("→") ?? "ARCH→QA"}]`)}`,
   );
-  addRow(`${c.slate("Primary :")} ${c.emerald(c.bold(state.model))}`);
+  addRow(`${c.slate("Primary :")} ${c.emerald(c.bold(sanitizeTerminalText(state.model)))}`);
   if (state.fastModel) {
-    addRow(`${c.slate("Explorer:")} ${c.teal(state.fastModel)}`);
+    addRow(`${c.slate("Explorer:")} ${c.teal(sanitizeTerminalText(state.fastModel))}`);
   }
   addRow(`${c.slate("Wire    :")} ${c.cyan(state.wire)} · ${c.slate("Effort:")} ${c.violet(state.effort)}`);
-  addRow(`${c.slate("Session :")} ${c.dim(state.sessionId.slice(0, 18))}`);
+  addRow(`${c.slate("Session :")} ${c.dim(sanitizeTerminalText(state.sessionId).slice(0, 18))}`);
 
   addDivider();
   const doneCount = state.todos.filter((t) => t.status === "completed").length;
@@ -2334,7 +2828,7 @@ function buildSidebarLines(state: FullScreenTuiState, width: number, height: num
           : t.status === "in_progress"
             ? c.amber("▸")
             : c.slate("○");
-      addRow(`${icon} ${t.content}`);
+      addRow(`${icon} ${sanitizeTerminalText(t.content)}`);
     }
   }
 
@@ -2344,7 +2838,7 @@ function buildSidebarLines(state: FullScreenTuiState, width: number, height: num
     addRow(c.dim("No edits in session"));
   } else {
     for (const f of state.modifiedFiles.slice(-4)) {
-      const shortF = f.replace(/\\/g, "/").split("/").slice(-3).join("/");
+      const shortF = sanitizeTerminalText(f.replace(/\\/g, "/").split("/").slice(-3).join("/"));
       addRow(`${c.emerald("•")} ${c.white(shortF)}`);
     }
   }
@@ -2359,7 +2853,9 @@ function buildSidebarLines(state: FullScreenTuiState, width: number, height: num
           : sub.status === "running"
             ? c.amber("▸")
             : c.rose("✗");
-      addRow(`${stIcon} ${c.cyan(sub.id)} ${sub.name} (${sub.model})`);
+      addRow(
+        `${stIcon} ${c.cyan(sanitizeTerminalText(sub.id))} ${sanitizeTerminalText(sub.name)} (${sanitizeTerminalText(sub.model)})`,
+      );
     }
   }
 
@@ -2368,7 +2864,9 @@ function buildSidebarLines(state: FullScreenTuiState, width: number, height: num
     addSection(`Terminals (${state.backgroundJobs.length}) [Alt+J]`);
     for (const j of state.backgroundJobs.slice(-2)) {
       const stIcon = j.status === "running" ? c.emerald("●") : c.slate("○");
-      addRow(`${stIcon} ${c.cyan(j.id)} ${j.detectedUrl ?? j.command.slice(0, 18)}`);
+      addRow(
+        `${stIcon} ${c.cyan(sanitizeTerminalText(j.id))} ${sanitizeTerminalText(j.detectedUrl ?? j.command.slice(0, 18))}`,
+      );
     }
   }
 
@@ -2432,11 +2930,14 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
   const bodyHeight = Math.max(4, rows - 5 - visibleInputMeta.length);
 
   // ── 1. Top Header Bar (Row 0 & Row 1) ─────────────────────────────────────
+  const safeCwd = sanitizeTerminalText(state.cwd);
   const shortCwd =
-    state.cwd.length > 34 ? "…" + state.cwd.slice(state.cwd.length - 33) : state.cwd;
-  const gitPart = state.gitBranch ? ` ${c.violet(`(⎇ ${state.gitBranch})`)}` : "";
+    safeCwd.length > 34 ? "…" + safeCwd.slice(safeCwd.length - 33) : safeCwd;
+  const gitPart = state.gitBranch
+    ? ` ${c.violet(`(⎇ ${sanitizeTerminalText(state.gitBranch)})`)}`
+    : "";
   const leftHdr = ` ${c.cyan(c.bold("◆ AIVO CODE"))} ${c.slate(`v${state.version}`)} ${c.slate("│")} ${c.white(shortCwd)}${gitPart}`;
-  const rightHdr = `${modeBadge(state.mode)} ${c.slate("│")} ${c.emerald(c.bold(state.model))} `;
+  const rightHdr = `${modeBadge(state.mode)} ${c.slate("│")} ${c.emerald(c.bold(sanitizeTerminalText(state.model)))} `;
   const hdrGap = Math.max(1, cols - visibleLength(leftHdr) - visibleLength(rightHdr));
   const row0 = fitLineToWidth(`${leftHdr}${" ".repeat(hdrGap)}${rightHdr}`, cols);
 
@@ -2483,7 +2984,7 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
   }
 
   if (state.busyLabel) {
-    const busyLine = ` ${c.cyan("⠋")} ${c.amber(state.busyLabel)}`;
+    const busyLine = ` ${c.cyan("⠋")} ${c.amber(sanitizeTerminalText(state.busyLabel))}`;
     leftRows.push(
       hasSidebar ? fitLineToWidth(busyLine, mainWidth) : truncateLineToWidth(busyLine, mainWidth),
     );
@@ -2504,8 +3005,10 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
     itemsSlice.forEach((it, idx) => {
       const sel = idx === state.selectedSuggestionIdx;
       const ptr = sel ? c.cyan("❯") : " ";
-      const lbl = sel ? c.bold(c.cyan(it.label.padEnd(24))) : c.white(it.label.padEnd(24));
-      const desc = sel ? c.white(it.description) : c.slate(it.description);
+      const safeLabel = sanitizeTerminalText(it.label);
+      const safeDesc = sanitizeTerminalText(it.description);
+      const lbl = sel ? c.bold(c.cyan(safeLabel.padEnd(24))) : c.white(safeLabel.padEnd(24));
+      const desc = sel ? c.white(safeDesc) : c.slate(safeDesc);
       popRows.push(fitLineToWidth(` ${c.cyan("│")} ${ptr} ${lbl} ${desc}`, mainWidth));
     });
     popRows.push(fitLineToWidth(` ${c.cyan("╰" + "─".repeat(Math.max(10, mainWidth - 4)))}`, mainWidth));
@@ -2547,9 +3050,17 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
     const maxList = Math.min(10, Math.max(3, bodyHeight - 5));
     const modalLines: string[] = [];
     const innerModalW = modalW - 4;
+    const safeTitle = sanitizeTerminalText(m.title);
+    const safeFilter = sanitizeTerminalText(m.filter);
 
-    modalLines.push(c.cyan(`╭─ ${m.title} ${"─".repeat(Math.max(2, modalW - m.title.length - 5))}╮`));
-    const filterText = `Search: ${m.filter ? c.white(m.filter) : c.dim("type to filter…")} (${filtered.length} items · ↑/↓ · Enter · Esc)`;
+    modalLines.push(
+      c.cyan(`╭─ ${safeTitle} ${"─".repeat(Math.max(2, modalW - safeTitle.length - 5))}╮`),
+    );
+    const filterLabel = sanitizeTerminalText(m.filterLabel ?? "Search");
+    const filterHint = sanitizeTerminalText(
+      m.filterHint ?? `${filtered.length} items · ↑/↓ · Enter · Esc`,
+    );
+    const filterText = `${filterLabel}: ${safeFilter ? c.white(safeFilter) : c.dim("type…")} (${filterHint})`;
     modalLines.push(`${c.cyan("│")} ${padEndVisible(fitLineToWidth(filterText, innerModalW), innerModalW)} ${c.cyan("│")}`);
     modalLines.push(c.cyan(`├${"─".repeat(modalW - 2)}┤`));
 
@@ -2562,19 +3073,21 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
     }
 
     if (filtered.length === 0) {
+      const emptyText = sanitizeTerminalText(m.emptyText ?? "No matching items.");
       modalLines.push(
-        `${c.cyan("│")} ${padEndVisible(c.rose("No matching items."), innerModalW)} ${c.cyan("│")}`,
+        `${c.cyan("│")} ${padEndVisible(c.rose(emptyText), innerModalW)} ${c.cyan("│")}`,
       );
     } else {
       for (let i = listStart; i < listEnd; i++) {
         const item = filtered[i]!;
         const isCur = i === selIdx;
         const ptr = isCur ? c.cyan("❯") : " ";
+        const safeLabel = sanitizeTerminalText(item.label);
         const lbl = isCur
-          ? c.bold(c.emerald(item.label.padEnd(23).slice(0, 23)))
-          : c.white(item.label.padEnd(23).slice(0, 23));
-        const bdg = item.badge ? ` ${c.cyan(item.badge)}` : "";
-        const dtl = item.detail ? ` ${c.slate(item.detail)}` : "";
+          ? c.bold(c.emerald(safeLabel.padEnd(23).slice(0, 23)))
+          : c.white(safeLabel.padEnd(23).slice(0, 23));
+        const bdg = item.badge ? ` ${c.cyan(sanitizeTerminalText(item.badge))}` : "";
+        const dtl = item.detail ? ` ${c.slate(sanitizeTerminalText(item.detail))}` : "";
         const rowContent = fitLineToWidth(`${ptr} ${lbl}${bdg}${dtl}`, innerModalW);
         modalLines.push(`${c.cyan("│")} ${rowContent} ${c.cyan("│")}`);
       }
@@ -2599,7 +3112,7 @@ export function renderFullScreenViewport(state: FullScreenTuiState): string {
 
   const scrollTag =
     clampedScroll > 0 ? ` · ↑ Scrolled +${clampedScroll} lines (PgDn/End)` : "";
-  const noticeTag = state.notice ? ` · ⚡ ${state.notice}` : "";
+  const noticeTag = state.notice ? ` · ⚡ ${sanitizeTerminalText(state.notice)}` : "";
   const compHeader = `── ◆ ${modeLabel}${scrollTag}${noticeTag} `;
   const compTopDash = Math.max(2, cols - compHeader.length);
   const compTop = truncateLineToWidth(
@@ -2958,9 +3471,9 @@ export function formatSessionExitBanner(opts: SessionExitBannerOptions): string 
 
   return [
     `${c.cyan("╭─")} ${c.bold("AivoCode Session Summary")} ${c.cyan("─".repeat(48))}`,
-    `${c.cyan("│")} ${c.slate("Session ID     :")} ${c.bold(c.emerald(opts.sessionId))}`,
-    `${c.cyan("│")} ${c.slate("Workspace      :")} ${c.white(opts.cwd)}`,
-    `${c.cyan("│")} ${c.slate("Models Used    :")} Primary ${c.emerald(opts.model)} · Subagent ${c.teal(opts.fastModel ?? opts.model)}`,
+    `${c.cyan("│")} ${c.slate("Session ID     :")} ${c.bold(c.emerald(sanitizeTerminalText(opts.sessionId)))}`,
+    `${c.cyan("│")} ${c.slate("Workspace      :")} ${c.white(sanitizeTerminalText(opts.cwd))}`,
+    `${c.cyan("│")} ${c.slate("Models Used    :")} Primary ${c.emerald(sanitizeTerminalText(opts.model))} · Subagent ${c.teal(sanitizeTerminalText(opts.fastModel ?? opts.model))}`,
     `${c.cyan("│")} ${c.slate("Activity       :")} ${opts.messageCount} messages · ${opts.modifiedFilesCount} file(s) modified`,
     `${c.cyan("│")} ${c.slate("Tokens & Cost  :")} in=${opts.inputTokens.toLocaleString("en-US")} · cache=${opts.cacheReadTokens.toLocaleString("en-US")} (${cachePct}% hit) · out=${opts.outputTokens.toLocaleString("en-US")} · total=${c.emerald(formatMicroUsd(opts.costMicro))}`,
     `${c.cyan("├" + "─".repeat(75))}`,

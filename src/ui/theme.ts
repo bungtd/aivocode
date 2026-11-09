@@ -33,6 +33,70 @@ export function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
+/**
+ * Removes terminal control sequences (OSC, CSI, two-char escapes) and control characters
+ * from untrusted text (model output, file contents, tool arguments) before it is printed.
+ * App-generated SGR styling must be applied *after* this function.
+ */
+export function sanitizeTerminalText(text: string): string {
+  return text
+    // OSC: ESC ] ... BEL or ST
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    // CSI (including SGR): ESC [ parameters final-byte
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    // Two-character escapes (e.g. ESC 7, ESC c)
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b[@-_]/g, "")
+    // C0 controls except tab/newline, plus DEL
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+}
+
+function isIncompleteEscape(tail: string): boolean {
+  if (!tail.startsWith("\x1b")) return false;
+  if (tail.length === 1) return true;
+  if (tail[1] === "]") {
+    // OSC terminates with BEL or ST (ESC \).
+    return !tail.includes("\x07") && !tail.includes("\x1b\\");
+  }
+  if (tail[1] === "[") {
+    // CSI terminates with a final byte in the @-~ range.
+    return !/[\x40-\x7e]/.test(tail.slice(2));
+  }
+  return false;
+}
+
+/**
+ * Streaming-safe terminal sanitizer. Holds back a trailing incomplete escape sequence so
+ * an ANSI/OSC sequence split across model deltas cannot leak into stdout.
+ */
+export function createTerminalSanitizer(): {
+  push: (chunk: string) => string;
+  flush: () => string;
+} {
+  let pending = "";
+  return {
+    push(chunk: string): string {
+      pending += chunk;
+      const lastEsc = pending.lastIndexOf("\x1b");
+      let cut = pending.length;
+      if (lastEsc !== -1 && isIncompleteEscape(pending.slice(lastEsc))) {
+        cut = lastEsc;
+      }
+      const ready = pending.slice(0, cut);
+      pending = pending.slice(cut);
+      return sanitizeTerminalText(ready);
+    },
+    flush(): string {
+      const ready = sanitizeTerminalText(pending);
+      pending = "";
+      return ready;
+    },
+  };
+}
+
 export function visibleLength(text: string): number {
   return stripAnsi(text).length;
 }
@@ -41,6 +105,27 @@ export function padEndVisible(text: string, width: number): string {
   const len = visibleLength(text);
   if (len >= width) return text;
   return text + " ".repeat(width - len);
+}
+
+/** Truncates an ANSI-styled line to `width` visible columns without breaking SGR sequences. */
+export function truncateVisible(text: string, width: number): string {
+  if (width <= 0) return "";
+  if (visibleLength(text) <= width) return text;
+  let result = "";
+  let visible = 0;
+  for (let i = 0; i < text.length && visible < Math.max(0, width - 1); i++) {
+    if (text[i] === "\x1b" && text[i + 1] === "[") {
+      const end = text.indexOf("m", i);
+      if (end !== -1) {
+        result += text.slice(i, end + 1);
+        i = end;
+        continue;
+      }
+    }
+    result += text[i];
+    visible++;
+  }
+  return `${result}\x1b[0m…`;
 }
 
 export function formatCompactTokens(tokens: number): string {
@@ -110,16 +195,20 @@ export function renderHeaderBanner(opts: HeaderBannerOptions): string {
   const titleGap = Math.max(1, inner - visibleLength(titleLeft) - visibleLength(badgeRight));
   const headerLine = `${titleLeft}${" ".repeat(titleGap)}${badgeRight}`;
 
+  const safeCwd = sanitizeTerminalText(opts.cwd);
+  const safeModel = sanitizeTerminalText(opts.model);
+  const safeFastModel = opts.fastModel ? sanitizeTerminalText(opts.fastModel) : null;
+  const safeBranch = opts.gitBranch ? sanitizeTerminalText(opts.gitBranch) : "";
   const shortCwd =
-    opts.cwd.length > 46 ? "…" + opts.cwd.slice(opts.cwd.length - 45) : opts.cwd;
-  const gitTag = opts.gitBranch ? `  ${c.violet(`⎇ ${opts.gitBranch}`)}` : "";
+    safeCwd.length > 46 ? "…" + safeCwd.slice(safeCwd.length - 45) : safeCwd;
+  const gitTag = safeBranch ? `  ${c.violet(`⎇ ${safeBranch}`)}` : "";
   const wsLine = `${c.slate("Workspace :")} ${c.white(shortCwd)}${gitTag}`;
 
   const fastTag =
-    opts.fastModel && opts.fastModel !== opts.model
-      ? c.slate(` · subagent: ${c.teal(opts.fastModel)}`)
+    safeFastModel && safeFastModel !== safeModel
+      ? c.slate(` · subagent: ${c.teal(safeFastModel)}`)
       : "";
-  const modelLine = `${c.slate("Model     :")} ${c.emerald(c.bold(opts.model))} ${c.slate(`[wire:${opts.wire} · effort:${opts.effort}]`)}${fastTag}`;
+  const modelLine = `${c.slate("Model     :")} ${c.emerald(c.bold(safeModel))} ${c.slate(`[wire:${opts.wire} · effort:${opts.effort}]`)}${fastTag}`;
 
   let accountLine: string;
   if (!opts.keyStatus) {
@@ -128,7 +217,7 @@ export function renderHeaderBanner(opts: HeaderBannerOptions): string {
     const ks = opts.keyStatus;
     const planLabel =
       ks.mode === "plan" && ks.plan
-        ? `${c.violet(c.bold(ks.plan.name))} ${c.slate(`(${ks.plan.allowanceMode})`)}`
+        ? `${c.violet(c.bold(sanitizeTerminalText(ks.plan.name)))} ${c.slate(`(${ks.plan.allowanceMode})`)}`
         : c.cyan("PAYG");
     const balLabel = `${c.emerald(formatMicroUsd(ks.balanceMicro))}`;
     const freeCount = ks.freeTokens.reduce((acc, f) => acc + f.remainingTokens, 0n);
@@ -136,7 +225,7 @@ export function renderHeaderBanner(opts: HeaderBannerOptions): string {
       freeCount > 0n
         ? ` · ${c.amber(`Faucet: ${formatCompactTokens(Number(freeCount))} tok`)}`
         : "";
-    accountLine = `${c.slate("AivoKey   :")} ${planLabel} · Balance ${balLabel}${freeLabel} · ${c.dim(opts.sessionId)}`;
+    accountLine = `${c.slate("AivoKey   :")} ${planLabel} · Balance ${balLabel}${freeLabel} · ${c.dim(sanitizeTerminalText(opts.sessionId))}`;
   }
 
   const shortcutsLine =
@@ -186,7 +275,7 @@ export function renderStatusBar(opts: StatusBarOptions): string {
 
   const segments: string[] = [
     modePill,
-    `${c.emerald("◆")} ${c.bold(opts.model)} ${c.slate(`(${opts.effort}·${opts.wire})`)}`,
+    `${c.emerald("◆")} ${c.bold(sanitizeTerminalText(opts.model))} ${c.slate(`(${opts.effort}·${opts.wire})`)}`,
     `${c.slate("ctx")} ${ctxColored}`,
     `${c.slate("cache")} ${c.teal(`${opts.cacheHitPct}%`)}`,
     `${c.slate("cost")} ${c.white(formatMicroUsd(opts.sessionCostMicro))}`,
@@ -196,7 +285,7 @@ export function renderStatusBar(opts: StatusBarOptions): string {
     segments.push(`${c.slate("bal")} ${c.emerald(formatMicroUsd(opts.balanceMicro))}`);
   }
   if (opts.gitBranch) {
-    segments.push(`${c.violet(`⎇ ${opts.gitBranch}`)}`);
+    segments.push(`${c.violet(`⎇ ${sanitizeTerminalText(opts.gitBranch)}`)}`);
   }
 
   return segments.join(c.slate(" │ "));
@@ -243,8 +332,11 @@ export function formatToolTarget(name: string, args: Record<string, unknown>): s
 }
 
 export function renderToolCallCard(opts: ToolCallCardOptions): string {
-  const meta = TOOL_DISPLAY_NAMES[opts.name] ?? { label: opts.name, icon: "●" };
-  const target = formatToolTarget(opts.name, opts.args);
+  const meta = TOOL_DISPLAY_NAMES[opts.name] ?? {
+    label: sanitizeTerminalText(opts.name),
+    icon: "●",
+  };
+  const target = sanitizeTerminalText(formatToolTarget(opts.name, opts.args));
   const statusBullet =
     opts.status === "error"
       ? c.rose("✗")
@@ -254,7 +346,9 @@ export function renderToolCallCard(opts: ToolCallCardOptions): string {
 
   const timeTag =
     opts.durationMs !== undefined ? c.slate(` · ${opts.durationMs}ms`) : "";
-  const summaryTag = opts.summary ? c.slate(` — ${opts.summary}`) : "";
+  const summaryTag = opts.summary
+    ? c.slate(` — ${sanitizeTerminalText(opts.summary)}`)
+    : "";
 
   return `${statusBullet} ${c.bold(meta.label)}${target ? c.cyan(`(${target})`) : ""}${timeTag}${summaryTag}`;
 }
@@ -266,12 +360,13 @@ export function renderTodoBoard(todos: TodoItem[]): string {
     `${c.cyan("╭─")} ${c.bold(`Tasks (${completedCount}/${todos.length})`)} ${c.cyan("─".repeat(44))}`,
   ];
   for (const t of todos) {
+    const content = sanitizeTerminalText(t.content);
     if (t.status === "completed") {
-      lines.push(`${c.cyan("│")} ${c.emerald("✓")} ${c.dim(t.content)}`);
+      lines.push(`${c.cyan("│")} ${c.emerald("✓")} ${c.dim(content)}`);
     } else if (t.status === "in_progress") {
-      lines.push(`${c.cyan("│")} ${c.amber("▸")} ${c.bold(c.white(t.content))}`);
+      lines.push(`${c.cyan("│")} ${c.amber("▸")} ${c.bold(c.white(content))}`);
     } else {
-      lines.push(`${c.cyan("│")} ${c.slate("○")} ${c.slate(t.content)}`);
+      lines.push(`${c.cyan("│")} ${c.slate("○")} ${c.slate(content)}`);
     }
   }
   lines.push(`${c.cyan("╰" + "─".repeat(58))}`);
@@ -309,7 +404,7 @@ export class TerminalSpinner {
     this.frameIdx++;
     const elapsed = ((Date.now() - this.startedAt) / 1000).toFixed(1);
     process.stderr.write(
-      `\r\x1b[2K${c.cyan(frame)} ${c.slate(this.label)} ${c.dim(`(${elapsed}s)`)}`,
+      `\r\x1b[2K${c.cyan(frame)} ${c.slate(sanitizeTerminalText(this.label))} ${c.dim(`(${elapsed}s)`)}`,
     );
   }
 

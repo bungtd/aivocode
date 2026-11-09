@@ -123,7 +123,7 @@ describe("CLI subcommands & interactive REPL slash commands", () => {
       expect(agent.session.id).not.toBe(oldSessionId);
       expect(outFork.output).toContain(agent.session.id);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -176,7 +176,7 @@ describe("CLI subcommands & interactive REPL slash commands", () => {
       expect(joined).toContain("deepseek-v4-pro");
       expect(joined).toContain("$3.00");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });

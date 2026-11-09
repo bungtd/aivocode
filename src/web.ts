@@ -252,6 +252,14 @@ export class ClientWebSearchRouter {
     return [...healthy, ...cooling];
   }
 
+  private markFailure(id: string): void {
+    const prev = this.health.get(id) ?? { cooldownUntil: 0, failures: 0 };
+    this.health.set(id, {
+      failures: prev.failures + 1,
+      cooldownUntil: Date.now() + DEFAULT_COOLDOWN_MS,
+    });
+  }
+
   async search(input: {
     query: string;
     maxResults?: number;
@@ -267,6 +275,9 @@ export class ClientWebSearchRouter {
     const errors: string[] = [];
 
     for (const provider of candidates) {
+      if (input.signal?.aborted) {
+        throw new Error("Web search cancelled by user.");
+      }
       if (
         this.isCoolingDown(provider) &&
         provider !== "duckduckgo" &&
@@ -283,9 +294,17 @@ export class ClientWebSearchRouter {
           livecrawl,
           input.signal,
         );
+        if (sources.length === 0 && provider !== "duckduckgo") {
+          // An empty JSON success from a paid API should not stop the failover chain.
+          throw new Error("provider returned 0 results");
+        }
         this.markSuccess(provider);
         return { provider, sources };
       } catch (err) {
+        const aborted =
+          input.signal?.aborted ||
+          (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError"));
+        if (!aborted) this.markFailure(provider);
         errors.push(`${provider}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
@@ -648,12 +667,88 @@ export function htmlToMarkdown(html: string): string {
     .trim();
 }
 
+const PRIVATE_IPV4_RE =
+  /^(?:0\.|10\.|127\.|169\.254\.|192\.168\.|172\.(?:1[6-9]|2\d|3[0-1])\.|100\.(?:6[4-9]|[7-9]\d|1[0-2]\d)\.)/;
+
+/**
+ * Blocks obvious SSRF targets (localhost, private/link-local literals) for model-initiated
+ * fetches. Hostnames are not DNS-resolved here; redirects are still followed by fetch, so
+ * this is a guardrail rather than a complete network sandbox.
+ */
+export function isPrivateOrLocalHost(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host) return true;
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  if (host === "metadata.google.internal" || host === "metadata") return true;
+  // IPv4-mapped/compatible IPv6 literals such as `::ffff:127.0.0.1` must be
+  // judged by the embedded IPv4 address, not skipped as an unknown host.
+  const mapped = /^::(?:ffff:)?(\d{1,3}(?:\.\d{1,3}){3})$/.exec(host);
+  if (mapped) return PRIVATE_IPV4_RE.test(mapped[1]!);
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+    return PRIVATE_IPV4_RE.test(host);
+  }
+  if (host === "::1" || host === "::" || host.startsWith("fc") || host.startsWith("fd")) return true;
+  if (host.startsWith("fe80:")) return true;
+  return false;
+}
+
+/** Override for users who intentionally want to fetch a local dev server. */
+export function privateFetchAllowed(): boolean {
+  return process.env.AIVO_ALLOW_PRIVATE_FETCH === "1" || process.env.AIVO_ALLOW_PRIVATE_FETCH === "true";
+}
+
+function combineSignals(signals: AbortSignal[]): AbortSignal {
+  const controller = new AbortController();
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort();
+      break;
+    }
+    signal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+  return controller.signal;
+}
+
+async function fetchWithRedirectGuard(
+  initialUrl: string,
+  fetchFn: typeof fetch,
+  headers: Record<string, string>,
+  signal: AbortSignal,
+  allowPrivate: boolean,
+): Promise<{ res: Response; finalUrl: string }> {
+  const redirectStatuses = new Set([301, 302, 303, 307, 308]);
+  let current = initialUrl;
+  for (let hop = 0; hop <= 5; hop++) {
+    const parsed = new URL(current);
+    if (!allowPrivate && isPrivateOrLocalHost(parsed.hostname)) {
+      throw new Error(
+        `Refusing to follow redirect to local/private host '${parsed.hostname}'.`,
+      );
+    }
+    const res = await fetchFn(current, {
+      headers,
+      redirect: "manual",
+      signal,
+    });
+    if (redirectStatuses.has(res.status)) {
+      const location = res.headers.get("location");
+      if (!location) return { res, finalUrl: current };
+      current = new URL(location, current).href;
+      continue;
+    }
+    return { res, finalUrl: current };
+  }
+  throw new Error("Too many redirects while fetching URL.");
+}
+
 export interface ClientWebFetchOptions {
   url: string;
   format?: "markdown" | "text" | "html";
   timeoutSec?: number;
   signal?: AbortSignal;
   fetchFn?: typeof fetch;
+  /** Permit localhost/private targets (used by tests and explicit local-dev workflows). */
+  allowPrivateHosts?: boolean;
 }
 
 export interface ClientWebFetchResult {
@@ -664,6 +759,7 @@ export interface ClientWebFetchResult {
 }
 
 const MAX_WEBFETCH_INLINE_CHARS = 32_000;
+const MAX_WEBFETCH_BODY_CHARS = 5 * 1024 * 1024;
 
 export async function clientWebFetch(
   opts: ClientWebFetchOptions,
@@ -672,17 +768,35 @@ export async function clientWebFetch(
   if (!/^https?:\/\//i.test(url)) {
     throw new Error(`Invalid URL (must start with http:// or https://): ${url}`);
   }
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    throw new Error(`Invalid URL: ${url}`);
+  }
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error("Refusing to fetch a URL containing embedded credentials.");
+  }
+  const allowPrivate = opts.allowPrivateHosts ?? privateFetchAllowed();
+  if (!allowPrivate && isPrivateOrLocalHost(parsedUrl.hostname)) {
+    throw new Error(
+      `Refusing to fetch local/private host '${parsedUrl.hostname}'. Set AIVO_ALLOW_PRIVATE_FETCH=1 to override for local development.`,
+    );
+  }
+
   const format = opts.format ?? "markdown";
   const timeoutMs = Math.min(120_000, Math.max(1_000, (opts.timeoutSec ?? 30) * 1000));
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
-  const signal = opts.signal
-    ? AbortSignal.any([opts.signal, timeoutSignal])
-    : timeoutSignal;
+  const signal = opts.signal ? combineSignals([opts.signal, timeoutSignal]) : timeoutSignal;
 
   const fetchFn = opts.fetchFn ?? fetch;
 
   const tryExaMcpFetch = async (): Promise<ClientWebFetchResult | null> => {
-    if (format === "html" || /^https?:\/\/(?:localhost|127\.0\.0\.1)\b/i.test(url)) {
+    if (
+      format === "html" ||
+      allowPrivate ||
+      /^https?:\/\/(?:localhost|127\.0\.0\.1)\b/i.test(url)
+    ) {
       return null;
     }
     try {
@@ -725,13 +839,17 @@ export async function clientWebFetch(
 
   let res: Response | null = null;
   try {
-    res = await fetchFn(url, {
-      headers: {
+    const guarded = await fetchWithRedirectGuard(
+      url,
+      fetchFn,
+      {
         "user-agent": USER_AGENT,
         accept: "text/html,application/xhtml+xml,application/json,text/plain,*/*;q=0.8",
       },
       signal,
-    });
+      allowPrivate,
+    );
+    res = guarded.res;
   } catch (fetchErr) {
     const exaFallback = await tryExaMcpFetch();
     if (exaFallback) return exaFallback;
@@ -755,7 +873,10 @@ export async function clientWebFetch(
     throw new Error(`Binary content-type '${contentType}' is not supported by web_fetch; use vision tools for images.`);
   }
 
-  const rawBody = await res.text();
+  let rawBody = await res.text();
+  if (rawBody.length > MAX_WEBFETCH_BODY_CHARS) {
+    rawBody = rawBody.slice(0, MAX_WEBFETCH_BODY_CHARS);
+  }
   let formatted: string;
   if (format === "html") {
     formatted = rawBody;

@@ -79,7 +79,7 @@ describe("Deep Review Round 1 Fixes", () => {
       expect(updated).toContain("const bonus = 5;");
       expect(updated).toContain("return 2;");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -213,7 +213,7 @@ describe("Deep Review Round 1 Fixes", () => {
       // Session store must only have 1 saved session (parent), not polluted by child subagents!
       expect(store.listSessions()).toHaveLength(1);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 

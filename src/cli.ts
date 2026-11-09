@@ -1,13 +1,15 @@
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
+import { spawnSync } from "node:child_process";
 import {
   DEFAULT_FAST_MODEL,
   DEFAULT_MODEL,
+  looksLikeApiKey,
   maskApiKey,
   normalizeGatewayOrigin,
   normalizeModelId,
   resolveConfig,
-  saveUserConfig,
+  saveConfigForWorkspace,
   type AivoWire,
   type PermissionMode,
   type ReasoningEffort,
@@ -26,16 +28,26 @@ import {
 } from "./aivokey-client.js";
 import { interactiveSelect } from "./ui/select.js";
 import { AivoAgent } from "./agent.js";
+import { ShellSandbox, type NetworkAccess, type SandboxMode } from "./sandbox.js";
 import { formatDetailedStatus, formatModelsTable, startInteractiveRepl } from "./repl.js";
 import { startFullScreenTui } from "./ui/fullscreen.js";
 import { AIVO_CLIENT_VERSION } from "./client-identity.js";
+import { EVENT_STREAM_VERSION, createJsonlEventSink, toolEndEvent } from "./events.js";
+import { Tracer } from "./telemetry.js";
 import { checkForUpdate, formatUpdateNotice, runUpdate } from "./update.js";
 import { AGENT_TEAMS, type TeamId } from "./teams.js";
 import { SessionStore } from "./session.js";
+import { McpManager } from "./mcp.js";
+import { McpAuthStore } from "./mcp-oauth.js";
+import { LspManager } from "./lsp.js";
+import { HookRunner, loadCustomCommands } from "./hooks.js";
+import { PluginRuntime } from "./plugins.js";
 import {
   c,
+  createTerminalSanitizer,
   renderTodoBoard,
   renderToolCallCard,
+  sanitizeTerminalText,
   TerminalSpinner,
 } from "./ui/theme.js";
 import { renderUnifiedDiff } from "./ui/markdown.js";
@@ -53,6 +65,13 @@ export type CliCommand =
   | "doctor"
   | "login"
   | "sessions"
+  | "mcp"
+  | "lsp"
+  | "hooks"
+  | "plugins"
+  | "acp"
+  | "trace"
+  | "metrics"
   | "update"
   | "version"
   | "help";
@@ -65,6 +84,16 @@ export interface ParsedCliArgs {
   continueLast?: boolean;
   mini?: boolean;
   json?: boolean;
+  /** `aivo run --events-json`: newline-delimited JSON event stream. */
+  eventsJson?: boolean;
+  /** `aivo run --events-json`: include full tool output in events. */
+  fullOutput?: boolean;
+  /** `--trace <path>`: write a JSONL span trace. */
+  tracePath?: string;
+  /** `--metrics-json`: print Prometheus metrics at the end of a run. */
+  metricsJson?: boolean;
+  /** `--metrics-prom`: print Prometheus text at the end of a run. */
+  metricsProm?: boolean;
   /** `aivo update --check`: report the newest release without installing. */
   checkUpdate?: boolean;
   cliConfig: Partial<UserConfigFile>;
@@ -77,6 +106,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   let continueLast = false;
   let mini = false;
   let json = false;
+  let eventsJson = false;
+  let fullOutput = false;
+  let tracePath: string | undefined;
+  let metricsJson = false;
+  let metricsProm = false;
   let checkUpdate = false;
   let explicitPrompt: string | undefined;
   let filterFlag = "";
@@ -103,6 +137,23 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       cliConfig.reasoningEffort = (argv[++i] ?? "off") as ReasoningEffort;
     } else if (arg === "--mode") {
       cliConfig.mode = (argv[++i] ?? "auto") as PermissionMode;
+    } else if (arg === "--sandbox") {
+      cliConfig.sandbox = (argv[++i] ?? "workspace") as SandboxMode;
+    } else if (arg === "--no-worktrees") {
+      cliConfig.worktreeIsolation = false;
+    } else if (arg === "--worktrees") {
+      cliConfig.worktreeIsolation = true;
+    } else if (arg === "--network") {
+      const network = (argv[++i] ?? "allow") as NetworkAccess;
+      cliConfig.permissions = {
+        ...(cliConfig.permissions ?? {}),
+        network: network === "deny" ? "deny" : "allow",
+      };
+    } else if (arg === "--allow-outside-workspace") {
+      cliConfig.permissions = {
+        ...(cliConfig.permissions ?? {}),
+        allowOutsideWorkspace: true,
+      };
     } else if (arg === "--team" || arg === "-t") {
       cliConfig.team = (argv[++i] ?? "fullstack") as TeamId;
     } else if (arg === "--mini") {
@@ -119,6 +170,16 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       cliConfig.webSearch = true;
     } else if (arg === "--json") {
       json = true;
+    } else if (arg === "--events-json") {
+      eventsJson = true;
+    } else if (arg === "--full-output") {
+      fullOutput = true;
+    } else if (arg === "--trace") {
+      tracePath = argv[++i];
+    } else if (arg === "--metrics-json") {
+      metricsJson = true;
+    } else if (arg === "--metrics-prom") {
+      metricsProm = true;
     } else if (arg === "--check") {
       checkUpdate = true;
     } else if (arg === "--tools") {
@@ -142,6 +203,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -156,6 +222,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       continueLast,
       mini: true,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -168,6 +239,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       continueLast,
       mini,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -180,6 +256,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       continueLast,
       mini,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -192,6 +273,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       continueLast,
       mini,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -204,6 +290,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       continueLast,
       checkUpdate,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -215,6 +306,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -226,6 +322,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -237,6 +338,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -248,6 +354,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -259,6 +370,108 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
+      cliConfig,
+    };
+  }
+  if (first === "mcp") {
+    return {
+      command: "mcp",
+      prompt: positionals.slice(1).join(" "),
+      filter: "",
+      sessionId,
+      continueLast,
+      json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
+      cliConfig,
+    };
+  }
+
+  if (first === "lsp") {
+    return {
+      command: "lsp",
+      prompt: positionals.slice(1).join(" "),
+      filter: "",
+      sessionId,
+      continueLast,
+      json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
+      cliConfig,
+    };
+  }
+  if (first === "hooks") {
+    return {
+      command: "hooks",
+      prompt: "",
+      filter: "",
+      sessionId,
+      continueLast,
+      json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
+      cliConfig,
+    };
+  }
+  if (first === "plugins") {
+    return {
+      command: "plugins",
+      prompt: "",
+      filter: "",
+      sessionId,
+      continueLast,
+      json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
+      cliConfig,
+    };
+  }
+  if (first === "acp") {
+    return {
+      command: "acp",
+      prompt: positionals.slice(1).join(" "),
+      filter: "",
+      sessionId,
+      continueLast,
+      json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
+      cliConfig,
+    };
+  }
+  if (first === "trace" || first === "metrics") {
+    return {
+      command: first,
+      prompt: positionals.slice(1).join(" "),
+      filter: "",
+      sessionId,
+      continueLast,
+      json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -270,6 +483,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -281,6 +499,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -292,6 +515,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       sessionId,
       continueLast,
       json,
+      eventsJson,
+      fullOutput,
+      tracePath,
+      metricsJson,
+      metricsProm,
       cliConfig,
     };
   }
@@ -346,8 +574,24 @@ async function maybeUpdateNotice(
   }
 }
 
+async function readPipedStdin(): Promise<string> {
+  let text = "";
+  for await (const chunk of stdin) {
+    text += typeof chunk === "string" ? chunk : Buffer.from(chunk as Uint8Array).toString("utf8");
+  }
+  return text;
+}
+
 export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<number> {
   const parsed = parseCliArgs(argv);
+  // `echo "..." | aivo` (or `cat prompt.txt | aivo`) behaves like a one-shot run.
+  if (parsed.command === "repl" && !parsed.prompt && !opts.writeOut && !stdin.isTTY) {
+    const piped = (await readPipedStdin()).trim();
+    if (piped) {
+      parsed.command = "run";
+      parsed.prompt = piped;
+    }
+  }
   const writeOut = opts.writeOut ?? ((text: string) => process.stdout.write(text + "\n"));
   const writeErr = opts.writeErr ?? ((text: string) => process.stderr.write(text + "\n"));
   const fetchFn = opts.fetchFn ?? fetch;
@@ -367,10 +611,29 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     return 0;
   }
 
+  // One-shot commands cannot prompt for a key or a prompt, so fail fast before network work.
+  if (parsed.command === "run" && !parsed.prompt.trim()) {
+    writeOut('Usage: aivo run "<prompt>" (or aivo -p "<prompt>")');
+    return 1;
+  }
+  if (parsed.command === "workflow" && !parsed.prompt.trim()) {
+    writeOut('Usage: aivo workflow "<goal>" [--team <id>]');
+    return 1;
+  }
+  if (
+    (parsed.command === "run" || parsed.command === "workflow") &&
+    !config.apiKey
+  ) {
+    writeOut(
+      "Error: AIVOKEY_API_KEY is not set. Run `aivo login <sk-aivo_...>` or pass `--api-key`.",
+    );
+    return 1;
+  }
+
   if (parsed.command === "help") {
     writeOut(
       [
-        `${c.cyan(c.bold("◆ AivoCode (`aivo`) v1.0"))} — Native AI Coding Studio for AivoKey`,
+        `${c.cyan(c.bold(`◆ AivoCode (\`aivo\`) v${AIVO_CLIENT_VERSION}`))} — Native AI Coding Studio for AivoKey`,
         "",
         c.bold("Usage:"),
         "  aivo                          Launch Interactive TUI Studio",
@@ -384,20 +647,36 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         "  aivo doctor                   Verify AivoKey gateway connectivity, key & model setup",
         "  aivo login <sk-aivo_...>      Save your AivoKey API key to ~/.aivokey/config.json",
         "  aivo sessions                 List recent saved sessions",
+        "  aivo mcp [--json|restart [srv]]  Inspect or restart configured MCP servers/tools",
+        "  aivo mcp auth [srv]           Authorize remote MCP servers with OAuth (PKCE + DCR)",
+        "  aivo lsp [--json|restart [srv]]  Inspect or restart LSP servers for code intelligence",
+        "  aivo hooks [--json]           Show lifecycle hooks and custom slash commands",
+        "  aivo plugins [--json]         Show loaded plugins, plugin tools and plugin hooks",
+        "  aivo acp                      Run the Agent Client Protocol server (editor integration)",
+        "  aivo metrics [--json]         Print Prometheus or JSON metrics for the current process",
+        "  aivo trace <trace.jsonl>      Summarize or export a recorded trace (--json)",
         "  aivo update [--check]         Upgrade to the newest release in place (no reinstall)",
         "",
         c.bold("Flags:"),
-        "  -m, --model <id>              Canonical model ID (default: deepseek-v4-flash)",
+        `  -m, --model <id>              Canonical model ID (default: ${DEFAULT_MODEL})`,
         "  --fast-model <id>             Fast model for explore subagents",
         "  -t, --team <id>               Specialist team (fullstack|backend|frontend|android|blender3d|gamedev|autopilot)",
         "  --wire <chat|messages|responses> Protocol wire (default: chat)",
         "  --effort <off|minimal..max>   Reasoning effort level (default: off for instant streaming)",
         "  --mode <auto|safe|plan>       Permission mode (default: auto)",
+        "  --sandbox <workspace|read-only|danger-full-access>",
+        "                                OS/path sandbox policy (default: workspace)",
+        "  --network <allow|deny>        Allow/deny network for permissions and shell sandbox",
+        "  --allow-outside-workspace     Allow read/write outside the workspace without asking",
+        "  --no-worktrees                Disable per-subagent git worktree isolation",
         "  --mini                        Use inline terminal mode instead of TUI Studio",
         "  --base-url <url>              AivoKey gateway URL (default: https://api.aivokey.dev)",
         "  --api-key <key>               AivoKey API key (or set AIVOKEY_API_KEY)",
         "  -c, --continue                Resume most recent session",
         "  -s, --session <id>            Resume specific session ID",
+        "  --json                        Machine-readable final result for one-shot runs",
+        "  --events-json                 Newline-delimited JSON event stream (headless/CI)",
+        "  --full-output                 Include full tool output in --events-json",
       ].join("\n"),
     );
     return 0;
@@ -431,11 +710,218 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     return 0;
   }
 
+  if (parsed.command === "mcp") {
+    const authMatch = parsed.prompt.match(/^auth(?:\s+(\S+))?$/i);
+    if (authMatch) {
+      const serverName = authMatch[1]?.trim();
+      const servers = config.mcpServers ?? {};
+      const names = serverName ? [serverName] : Object.keys(servers);
+      if (names.length === 0) {
+        writeOut("No MCP servers configured.");
+        return 1;
+      }
+      const { authorizeMcpServer } = await import("./mcp-oauth.js");
+      const authStore = new McpAuthStore(config.mcpAuthPath);
+      let failed = false;
+      for (const name of names) {
+        const server = servers[name];
+        if (!server?.url) {
+          writeOut(`${c.amber("skip")} ${name}: not a remote (HTTP/SSE) server`);
+          continue;
+        }
+        writeOut(`${c.cyan("◆")} Authorizing ${name} (${server.url})...`);
+        try {
+          const result = await authorizeMcpServer({
+            serverName: name,
+            serverUrl: server.url,
+            fetchFn,
+            presentUrl: (url) => writeOut(`Open: ${url}`),
+          });
+          authStore.set(server.url, {
+            serverUrl: server.url,
+            tokens: result.tokens,
+            registration: result.registration,
+            metadata: result.metadata,
+            resource: result.resource,
+          });
+          writeOut(`${c.emerald("✓")} Saved OAuth tokens for ${name}`);
+        } catch (err) {
+          failed = true;
+          writeOut(`${c.rose("✗")} ${name}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      return failed ? 1 : 0;
+    }
+    const manager = new McpManager(config.mcpServers ?? {}, {
+      cwd: config.cwd,
+      fetchFn,
+      sandbox: {
+        mode: config.sandbox ?? "workspace",
+        network: config.permissions?.network ?? "allow",
+        envAllow: config.permissions?.env,
+      },
+      oauth: { authPath: config.mcpAuthPath },
+    });
+    try {
+      const restartMatch = parsed.prompt.match(/^restart(?:\s+(.+))?$/i);
+      if (restartMatch) {
+        const target = restartMatch[1]?.trim();
+        try {
+          await manager.restart(target);
+        } catch (err) {
+          writeOut(`MCP restart failed: ${err instanceof Error ? err.message : String(err)}`);
+          return 1;
+        }
+      } else {
+        await manager.ensureStarted();
+      }
+      if (parsed.json) {
+        writeOut(JSON.stringify({ servers: manager.getStatuses() }, null, 2));
+      } else {
+        writeOut(manager.formatStatus());
+      }
+      return 0;
+    } finally {
+      manager.dispose();
+    }
+  }
+
+  if (parsed.command === "lsp") {
+    const manager = new LspManager({
+      cwd: config.cwd,
+      servers: config.lspServers,
+      envAllow: config.permissions?.env,
+    });
+    try {
+      const restartMatch = parsed.prompt.match(/^restart(?:\s+(.+))?$/i);
+      if (restartMatch) {
+        await manager.restart(restartMatch[1]?.trim());
+      }
+      if (parsed.json) {
+        writeOut(JSON.stringify({ servers: manager.getStatuses() }, null, 2));
+      } else {
+        writeOut(manager.formatStatus());
+      }
+      return 0;
+    } finally {
+      manager.dispose();
+    }
+  }
+
+  if (parsed.command === "hooks") {
+    const runner = new HookRunner({
+      cwd: config.cwd,
+      config: config.hooks,
+      envAllow: config.permissions?.env,
+    });
+    if (parsed.json) {
+      writeOut(
+        JSON.stringify(
+          {
+            hooks: config.hooks ?? {},
+            customCommands: loadCustomCommands(config.cwd).map((command) => ({
+              name: command.name,
+              description: command.description,
+              scope: command.scope,
+            })),
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      writeOut(runner.formatStatus());
+      const commands = loadCustomCommands(config.cwd);
+      if (commands.length > 0) {
+        writeOut("");
+        writeOut(
+          `Custom commands: ${commands.map((command) => `/${command.name}`).join(", ")}`,
+        );
+      }
+    }
+    return 0;
+  }
+
+  if (parsed.command === "plugins") {
+    const runtime = new PluginRuntime({
+      cwd: config.cwd,
+      onNotice: (message) => writeOut(message),
+    });
+    await runtime.ensureLoaded();
+    if (parsed.json) {
+      writeOut(
+        JSON.stringify(
+          {
+            loaded: runtime.loaded,
+            tools: [...runtime.tools.keys()],
+            hooks: runtime.hooks.map((hook) => ({
+              event: hook.event,
+              matcher: hook.matcher,
+            })),
+            errors: runtime.errors,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      writeOut(runtime.formatStatus());
+    }
+    return 0;
+  }
+
+  if (parsed.command === "acp") {
+    if (!config.apiKey) {
+      writeErr(
+        "Error: AIVOKEY_API_KEY is not set. Run `aivo login <sk-aivo_...>` or pass `--api-key`.\n",
+      );
+      return 1;
+    }
+    const { runAcpServer } = await import("./acp.js");
+    return runAcpServer({
+      config,
+      catalog: DEFAULT_AIVOKEY_CATALOG,
+      sessionStore: new SessionStore(),
+      fetchFn,
+      writeErr,
+    });
+  }
+
+  if (parsed.command === "trace" || parsed.command === "metrics") {
+    const { readTraceFile, formatTraceSummary } = await import("./telemetry-cli.js");
+    if (parsed.command === "metrics") {
+      const { globalMetrics } = await import("./telemetry.js");
+      writeOut(parsed.json ? JSON.stringify(globalMetrics.toJSON(), null, 2) : globalMetrics.toPrometheus());
+      return 0;
+    }
+    const tracePath = parsed.prompt.trim();
+    if (!tracePath) {
+      writeOut("Usage: aivo trace <trace.jsonl> [--json]");
+      return 1;
+    }
+    const spans = readTraceFile(tracePath);
+    if (spans === null) {
+      writeOut(`Trace file not found or unreadable: ${tracePath}`);
+      return 1;
+    }
+    if (parsed.json) {
+      writeOut(JSON.stringify({ spans }, null, 2));
+    } else {
+      writeOut(formatTraceSummary(spans));
+    }
+    return 0;
+  }
+
   if (parsed.command === "login") {
     const keyToSave = parsed.prompt || config.apiKey;
     if (!keyToSave) {
       writeOut("Usage: aivo login <sk-aivo_...> [--base-url https://api.aivokey.dev]");
       return 1;
+    }
+    if (!looksLikeApiKey(keyToSave)) {
+      writeOut(
+        `${c.amber("⚠")} This does not look like a standard AivoKey key (sk-...). Saving it anyway.`,
+      );
     }
 
     let loginCatalog: AivoModelInfo[] = DEFAULT_AIVOKEY_CATALOG;
@@ -470,7 +956,7 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
 
     if (stdin.isTTY && stdout.isTTY && !opts.writeOut) {
       writeOut(
-        `\n${c.emerald("✓")} Verified AivoKey Account: ${loginKeyStatus ? formatKeyStatusSummary(loginKeyStatus) : "Connected"}`,
+        `\n${c.emerald("✓")} Verified AivoKey Account: ${loginKeyStatus ? sanitizeTerminalText(formatKeyStatusSummary(loginKeyStatus)) : "Connected"}`,
       );
       writeOut(
         `  ${c.cyan("◆")} Detected ${c.bold(String(eligible.length))} eligible models for your account (${loginKeyStatus?.mode === "plan" && !loginKeyStatus.fallbackEnabled ? "Plan-filtered" : "All active models"}).\n`,
@@ -530,18 +1016,15 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       if (pickedSubEffort) chosenSubEffort = pickedSubEffort;
     }
 
-    saveUserConfig(
-      {
-        apiKey: keyToSave,
-        baseUrl: config.baseUrl,
-        model: chosenPrimary,
-        fastModel: chosenFast,
-        reasoningEffort: chosenEffort,
-        subagentEffort: chosenSubEffort,
-        setupCompleted: true,
-      },
-      config.globalConfigPath,
-    );
+    saveConfigForWorkspace(config, {
+      apiKey: keyToSave,
+      baseUrl: config.baseUrl,
+      model: chosenPrimary,
+      fastModel: chosenFast,
+      reasoningEffort: chosenEffort,
+      subagentEffort: chosenSubEffort,
+      setupCompleted: true,
+    });
     writeOut(
       `${c.emerald("✓")} Saved AivoKey configuration to ${config.globalConfigPath}\n` +
         `  • Key            : ${maskApiKey(keyToSave)}\n` +
@@ -600,8 +1083,43 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
   }
 
   if (parsed.command === "doctor") {
+    const nodeMajor = Number(process.versions.node.split(".")[0] ?? 0);
+    const gitCheck = spawnSync("git", ["--version"], {
+      encoding: "utf8",
+      timeout: 3000,
+      windowsHide: true,
+    });
+    const gitOk = gitCheck.status === 0;
     writeOut(`${c.cyan("╭─")} ${c.bold("AivoCode Doctor")} ${c.cyan("─".repeat(55))}`);
-    writeOut(`${c.cyan("│")} Gateway Origin : ${c.white(config.baseUrl)}`);
+    writeOut(
+      `${c.cyan("│")} Node.js        : ${nodeMajor >= 20 ? c.emerald(`OK (v${process.versions.node})`) : c.rose(`UNSUPPORTED (v${process.versions.node}; need >=20)`)}`,
+    );
+    writeOut(
+      `${c.cyan("│")} Git            : ${gitOk ? c.emerald("OK") : c.amber("not found (optional, needed for /diff and branches)")}`,
+    );
+    const doctorSandbox = new ShellSandbox({
+      cwd: config.cwd,
+      mode: config.sandbox ?? "workspace",
+      network: config.permissions?.network ?? "allow",
+    });
+    writeOut(`${c.cyan("│")} Sandbox        : ${c.white(doctorSandbox.describe())}`);
+    const doctorLsp = new LspManager({
+      cwd: config.cwd,
+      servers: config.lspServers,
+      envAllow: config.permissions?.env,
+    });
+    const lspStatuses = doctorLsp.getStatuses();
+    doctorLsp.dispose();
+    writeOut(
+      `${c.cyan("│")} LSP            : ${
+        lspStatuses.length === 0
+          ? c.amber("not configured (add lspServers to ~/.aivokey/config.json)")
+          : c.emerald(
+              `${lspStatuses.length} server(s): ${lspStatuses.map((status) => status.name).join(", ")}`,
+            )
+      }`,
+    );
+    writeOut(`${c.cyan("│")} Gateway Origin : ${c.white(sanitizeTerminalText(config.baseUrl))}`);
     writeOut(`${c.cyan("│")} API Key        : ${c.white(maskApiKey(config.apiKey))}`);
     writeOut(
       `${c.cyan("│")} Model Catalog  : ${catalogErr ? c.rose(`FAILED (${catalogErr})`) : c.emerald(`OK (${catalog.length} canonical models loaded)`)}`,
@@ -622,7 +1140,7 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       `${c.cyan("│")} Active Model   : ${c.emerald(config.model)} (recommended fast subagent: ${c.teal(rec.fastModel)})`,
     );
     writeOut(`${c.cyan("╰" + "─".repeat(73))}`);
-    return catalogErr || keyErr ? 1 : 0;
+    return catalogErr || keyErr || !config.apiKey || nodeMajor < 20 ? 1 : 0;
   }
 
   const sessionStore = new SessionStore();
@@ -651,6 +1169,18 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
   let inThinkingBlock = false;
   let thinkingStartMs = 0;
   const turnSpinner = new TerminalSpinner();
+  const textSanitizer = createTerminalSanitizer();
+  const reasoningSanitizer = createTerminalSanitizer();
+  const emitEvent = parsed.eventsJson
+    ? createJsonlEventSink((line) => writeOut(line.replace(/\n$/, "")))
+    : null;
+  const streamStartMs = Date.now();
+  const traceEnabled =
+    Boolean(parsed.tracePath) || Boolean(parsed.metricsJson) || Boolean(parsed.metricsProm);
+  const tracer = new Tracer({
+    enabled: traceEnabled,
+    jsonlPath: parsed.tracePath,
+  });
 
   const agent = new AivoAgent({
     config,
@@ -658,10 +1188,17 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     sessionStore,
     session: initialSession,
     fetchFn,
+    tracer,
     callbacks: {
       onReasoningDelta: (d) => {
+        if (emitEvent) {
+          emitEvent({ type: "reasoning", text: d });
+          return;
+        }
         if (parsed.json) return;
         turnSpinner.stop();
+        const safe = reasoningSanitizer.push(d);
+        if (!safe) return;
         if (!inThinkingBlock) {
           inThinkingBlock = true;
           thinkingStartMs = Date.now();
@@ -669,10 +1206,14 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
             `\n${c.slate(`╭─ 💭 Thinking (${config.reasoningEffort}) ──────────────────────────────`)}\n${c.slate("│ ")}`,
           );
         }
-        const formatted = d.replace(/\n/g, `\n${c.slate("│ ")}`);
+        const formatted = safe.replace(/\n/g, `\n${c.slate("│ ")}`);
         process.stderr.write(c.dim(formatted));
       },
       onTextDelta: (d) => {
+        if (emitEvent) {
+          emitEvent({ type: "text", text: d });
+          return;
+        }
         if (parsed.json) return;
         turnSpinner.stop();
         if (inThinkingBlock) {
@@ -682,9 +1223,14 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
           );
           inThinkingBlock = false;
         }
-        process.stdout.write(d);
+        const safe = textSanitizer.push(d);
+        if (safe) process.stdout.write(safe);
       },
       onToolCall: (name, args) => {
+        if (emitEvent) {
+          emitEvent({ type: "tool_start", name, args });
+          return;
+        }
         if (parsed.json) return;
         turnSpinner.stop();
         if (inThinkingBlock) {
@@ -697,12 +1243,26 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         turnSpinner.start(`Running ${name}...`);
         void args;
       },
-      onToolCallProgress: (target, bytes, lines) => {
+      onToolCallProgress: (target, bytes, lines, preview) => {
+        if (emitEvent) {
+          emitEvent({ type: "tool_progress", name: target, bytes, lines, preview });
+          return;
+        }
         if (parsed.json) return;
         const kb = (bytes / 1024).toFixed(1);
-        turnSpinner.update(`Streaming ${target} · ${lines} lines (${kb} KB)...`);
+        turnSpinner.update(
+          `Streaming ${sanitizeTerminalText(target)} · ${lines} lines (${kb} KB)...`,
+        );
       },
-      onToolResult: (name, _output, isError, details, args) => {
+      onToolResult: (name, output, isError, details, args) => {
+        if (emitEvent) {
+          const event = toolEndEvent(name, output, Boolean(isError), details);
+          if (!parsed.fullOutput && event.type === "tool_end") {
+            event.output = event.output.slice(0, 2_000);
+          }
+          emitEvent(event);
+          return;
+        }
         if (parsed.json) return;
         turnSpinner.stop();
         const card = renderToolCallCard({
@@ -727,19 +1287,48 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         }
       },
       onNotice: (msg) => {
+        if (emitEvent) {
+          emitEvent({ type: "notice", message: msg, level: "info" });
+          return;
+        }
         if (!parsed.json) {
           turnSpinner.stop();
-          process.stderr.write(`\n${c.amber(`⚡ ${msg}`)}\n`);
+          process.stderr.write(`\n${c.amber(`⚡ ${sanitizeTerminalText(msg)}`)}\n`);
         }
       },
       confirmAction: async (description) => {
+        if (emitEvent || parsed.json || !stdin.isTTY) return false;
         turnSpinner.stop();
         const decision = await interactiveConfirmBar(description);
-        if (decision === "always") {
-          agent.config.mode = "auto";
-          return true;
-        }
-        return decision === "yes";
+        return decision !== "no";
+      },
+      confirmActionChoice: async (description) => {
+        if (emitEvent || parsed.json || !stdin.isTTY) return "no";
+        turnSpinner.stop();
+        return interactiveConfirmBar(description);
+      },
+      chooseStrategy: async ({ teamName, recommendedMode }) => {
+        if (!stdin.isTTY || !stdout.isTTY || opts.writeOut) return recommendedMode;
+        turnSpinner.stop();
+        const picked = await interactiveSelect<"subagent-driven" | "native">({
+          title: `Choose Execution Strategy — ${teamName}`,
+          initialValue: recommendedMode,
+          items: [
+            {
+              value: "subagent-driven",
+              label: "Subagent-Driven Team Workflow",
+              badge: "[Recommended]",
+              detail: `Multi-stage specialist workflow (${teamName})`,
+            },
+            {
+              value: "native",
+              label: "Native Direct Execution",
+              badge: "[Fast]",
+              detail: "Implement directly in this session + review gate",
+            },
+          ],
+        });
+        return picked ?? recommendedMode;
       },
     },
   });
@@ -764,6 +1353,10 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
   }
 
   if (parsed.command === "workflow") {
+    if (!parsed.prompt.trim()) {
+      writeOut('Usage: aivo workflow "<goal>" [--team <id>]');
+      return 1;
+    }
     if (!config.apiKey) {
       writeOut(
         "Error: AIVOKEY_API_KEY is not set. Run `aivo login <sk-aivo_...>` or pass `--api-key`.",
@@ -771,11 +1364,17 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       return 1;
     }
     const out = await agent.executeTeamWorkflow(parsed.prompt, config.team);
+    agent.backgroundJobs.stopAll();
+    agent.dispose();
     writeOut(out);
     return 0;
   }
 
   if (parsed.command === "run") {
+    if (!parsed.prompt.trim()) {
+      writeOut('Usage: aivo run "<prompt>" (or aivo -p "<prompt>")');
+      return 1;
+    }
     if (!config.apiKey) {
       writeOut(
         "Error: AIVOKEY_API_KEY is not set. Run `aivo login <sk-aivo_...>` or pass `--api-key`.",
@@ -783,9 +1382,39 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       return 1;
     }
     const agentT0 = Date.now();
-    const res = await agent.runUserPrompt(parsed.prompt);
+    emitEvent?.({
+      type: "start",
+      version: EVENT_STREAM_VERSION,
+      sessionId: agent.session.id,
+      model: agent.config.model,
+      cwd: agent.config.cwd,
+    });
+    let res;
+    try {
+      res = await agent.runUserPrompt(parsed.prompt);
+    } catch (err) {
+      emitEvent?.({
+        type: "error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
     const agentTimeMs = Math.max(1, Date.now() - agentT0);
-    if (parsed.json) {
+    emitEvent?.({
+      type: "result",
+      text: res.finalText,
+      steps: res.steps,
+      usage: {
+        inputTokens: res.turnUsage.inputTokens,
+        outputTokens: res.turnUsage.outputTokens,
+        cacheReadTokens: res.turnUsage.cacheReadTokens,
+        cacheWriteTokens: res.turnUsage.cacheWriteTokens,
+      },
+      costMicro: res.turnCostMicro.toString(),
+      cacheSavedMicro: res.turnCacheSavedMicro.toString(),
+      elapsedMs: Date.now() - streamStartMs,
+    });
+    if (parsed.json && !parsed.eventsJson) {
       writeOut(
         JSON.stringify({
           sessionId: agent.session.id,
@@ -798,9 +1427,22 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
           cacheSavedMicro: res.turnCacheSavedMicro.toString(),
         }),
       );
-    } else {
+    } else if (!parsed.eventsJson) {
       writeOut("");
     }
+    if (parsed.metricsProm || parsed.metricsJson) {
+      const metrics = agent.metrics;
+      if (parsed.metricsJson) {
+        writeOut(JSON.stringify(metrics.toJSON(), null, 2));
+      } else {
+        writeOut(metrics.toPrometheus());
+      }
+    }
+    if (parsed.tracePath) {
+      writeErr(`Trace written to ${parsed.tracePath} (${agent.tracer.listSpans().length} spans)`);
+    }
+    agent.backgroundJobs.stopAll();
+    agent.dispose();
     return 0;
   }
 
@@ -811,6 +1453,14 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
   });
 
   if (parsed.command === "mini" || parsed.mini) {
+    if ((!stdin.isTTY || !stdout.isTTY) && !opts.writeOut) {
+      writeOut(
+        "`aivo mini` requires an interactive terminal. Use `aivo -p \"<prompt>\"` for one-shot runs.",
+      );
+      agent.backgroundJobs.stopAll();
+      agent.dispose();
+      return 1;
+    }
     if (updateNotice) writeErr(c.amber(`◆ ${updateNotice}`));
     await startInteractiveRepl(
       agent,
@@ -819,9 +1469,30 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
       (label) => turnSpinner.start(label),
       () => turnSpinner.stop(),
     );
+    agent.backgroundJobs.stopAll();
+    agent.dispose();
     return 0;
   }
 
-  await startFullScreenTui(agent, keyStatus, fetchFn, parsed.prompt, updateNotice);
+  if (parsed.command === "repl" && (!stdin.isTTY || !stdout.isTTY)) {
+    writeOut(
+      "AivoCode TUI requires an interactive terminal. Use `aivo -p \"<prompt>\"` for one-shot runs or `aivo mini` in a TTY.",
+    );
+    agent.backgroundJobs.stopAll();
+    agent.dispose();
+    return 1;
+  }
+
+  const noKeyNotice = !config.apiKey
+    ? "No AivoKey API key configured. Run `aivo login <key>` or use /login inside the TUI."
+    : null;
+  await startFullScreenTui(
+    agent,
+    keyStatus,
+    fetchFn,
+    parsed.prompt,
+    [noKeyNotice, updateNotice].filter(Boolean).join(" · ") || null,
+  );
+  agent.dispose();
   return 0;
 }

@@ -106,4 +106,49 @@ describe("Full-Screen Alt-Buffer TUI Viewport Renderer (100% columns × rows)", 
     expect(plain).toContain("deepseek-v4-flash");
     expect(plain).toContain("$0.30/$1.20");
   });
+
+  it("renders the full-screen permission-rule editor with custom filter labels and hints", () => {
+    const list = createSampleState({
+      cols: 110,
+      rows: 28,
+      modal: {
+        id: "permissions",
+        title: "Permission Rules · read / write / shell / webfetch",
+        filter: "npm",
+        selectedIdx: 0,
+        items: [
+          {
+            value: "rule:shell:0",
+            label: "shell · npm *",
+            badge: "[allow]",
+            detail: "Enter: edit action · Del: remove",
+          },
+        ],
+        filterLabel: "Filter rules",
+      },
+    });
+    const listPlain = stripAnsi(renderFullScreenViewport(list));
+    expect(listPlain).toContain("Permission Rules");
+    expect(listPlain).toContain("Filter rules: npm");
+    expect(listPlain).toContain("shell · npm *");
+
+    const draft = createSampleState({
+      cols: 110,
+      rows: 28,
+      modal: {
+        id: "permissions",
+        title: "New read rule · action deny",
+        filter: "",
+        selectedIdx: 0,
+        items: [],
+        filterLabel: "Pattern",
+        filterHint: "Enter save · Esc cancel",
+        emptyText: "Type a glob pattern, e.g. **/*.env",
+      },
+    });
+    const draftPlain = stripAnsi(renderFullScreenViewport(draft));
+    expect(draftPlain).toContain("Pattern:");
+    expect(draftPlain).toContain("Enter save · Esc cancel");
+    expect(draftPlain).toContain("Type a glob pattern");
+  });
 });

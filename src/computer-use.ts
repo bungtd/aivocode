@@ -85,26 +85,38 @@ export async function ensureLocalPreviewServer(rootDir: string): Promise<string>
 
   return new Promise<string>((resolvePromise, rejectPromise) => {
     const server = createServer((req, res) => {
-      const urlPath = decodeURIComponent((req.url ?? "/").split("?")[0] ?? "/");
-      const rel = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, "");
-      const filePath = resolve(rootDir, rel);
-      const relCheck = relative(resolve(rootDir), filePath);
-      if (relCheck.startsWith("..") || isAbsolute(relCheck)) {
-        res.writeHead(403);
-        res.end("Forbidden");
-        return;
+      try {
+        let urlPath: string;
+        try {
+          urlPath = decodeURIComponent((req.url ?? "/").split("?")[0] ?? "/").replace(/\0/g, "");
+        } catch {
+          res.writeHead(400);
+          res.end("Bad request");
+          return;
+        }
+        const rel = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, "");
+        const filePath = resolve(rootDir, rel);
+        const relCheck = relative(resolve(rootDir), filePath);
+        if (relCheck.startsWith("..") || isAbsolute(relCheck)) {
+          res.writeHead(403);
+          res.end("Forbidden");
+          return;
+        }
+        if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+          res.writeHead(404);
+          res.end("Not found");
+          return;
+        }
+        const ext = extname(filePath).toLowerCase();
+        res.writeHead(200, {
+          "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream",
+          "Cache-Control": "no-store",
+        });
+        res.end(readFileSync(filePath));
+      } catch {
+        if (!res.headersSent) res.writeHead(500);
+        res.end("Preview server error");
       }
-      if (!existsSync(filePath) || !statSync(filePath).isFile()) {
-        res.writeHead(404);
-        res.end("Not found");
-        return;
-      }
-      const ext = extname(filePath).toLowerCase();
-      res.writeHead(200, {
-        "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream",
-        "Cache-Control": "no-store",
-      });
-      res.end(readFileSync(filePath));
     });
 
     server.on("error", rejectPromise);
@@ -231,6 +243,126 @@ function defaultRunCommand(cmd: string, shell?: string): Promise<string> {
       },
     );
   });
+}
+
+/** Quotes one POSIX shell argument (used for xdotool/osascript on macOS/Linux). */
+function posixShellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+const XDOTOOL_KEY_NAMES: Record<string, string> = {
+  escape: "Escape",
+  esc: "Escape",
+  enter: "Return",
+  return: "Return",
+  tab: "Tab",
+  backspace: "BackSpace",
+  bksp: "BackSpace",
+  delete: "Delete",
+  del: "Delete",
+  insert: "Insert",
+  home: "Home",
+  end: "End",
+  pageup: "Page_Up",
+  pgup: "Page_Up",
+  pagedown: "Page_Down",
+  pgdn: "Page_Down",
+  up: "Up",
+  arrowup: "Up",
+  down: "Down",
+  arrowdown: "Down",
+  left: "Left",
+  arrowleft: "Left",
+  right: "Right",
+  arrowright: "Right",
+  space: "space",
+};
+
+function toXdotoolKey(raw: string): string {
+  const parts = raw
+    .trim()
+    .split("+")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return "";
+  const modifiers: string[] = [];
+  let key = parts[parts.length - 1]!;
+  for (const modifier of parts.slice(0, -1)) {
+    const lower = modifier.toLowerCase();
+    if (lower === "control" || lower === "ctrl") modifiers.push("ctrl");
+    else if (lower === "alt" || lower === "option") modifiers.push("alt");
+    else if (lower === "shift") modifiers.push("shift");
+    else if (lower === "meta" || lower === "cmd" || lower === "super") modifiers.push("super");
+  }
+  const lowerKey = key.toLowerCase();
+  key = XDOTOOL_KEY_NAMES[lowerKey] ?? key;
+  if (key.length === 1) key = key.toLowerCase();
+  return [...modifiers, key].join("+");
+}
+
+function appleScriptString(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r?\n/g, "\\n")}"`;
+}
+
+const APPLE_KEY_CODES: Record<string, number> = {
+  escape: 53,
+  esc: 53,
+  enter: 36,
+  return: 36,
+  tab: 48,
+  backspace: 51,
+  delete: 117,
+  home: 115,
+  end: 119,
+  pageup: 116,
+  pgup: 116,
+  pagedown: 121,
+  pgdn: 121,
+  up: 126,
+  arrowup: 126,
+  down: 125,
+  arrowdown: 125,
+  left: 123,
+  arrowleft: 123,
+  right: 124,
+  arrowright: 124,
+  space: 49,
+  f1: 122,
+  f2: 120,
+  f3: 99,
+  f4: 118,
+  f5: 96,
+  f6: 97,
+  f7: 98,
+  f8: 100,
+  f9: 101,
+  f10: 109,
+  f11: 103,
+  f12: 111,
+};
+
+function toAppleKeyScript(raw: string): string {
+  const parts = raw
+    .trim()
+    .split("+")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return `key code 36`;
+  const modifiers: string[] = [];
+  const key = parts[parts.length - 1]!;
+  for (const modifier of parts.slice(0, -1)) {
+    const lower = modifier.toLowerCase();
+    if (lower === "control" || lower === "ctrl") modifiers.push("control down");
+    else if (lower === "alt" || lower === "option") modifiers.push("option down");
+    else if (lower === "shift") modifiers.push("shift down");
+    else if (lower === "meta" || lower === "cmd" || lower === "super") modifiers.push("command down");
+  }
+  const using = modifiers.length > 0 ? ` using {${modifiers.join(", ")}}` : "";
+  const code = APPLE_KEY_CODES[key.toLowerCase()];
+  if (code !== undefined) {
+    return `key code ${code}${using}`;
+  }
+  return `keystroke ${appleScriptString(key)}${using}`;
 }
 
 const WIN32_DPI_PREAMBLE = [
@@ -441,7 +573,18 @@ export async function executeComputerUse(
           await runCmd(ps, "powershell.exe");
           return { output: `Moved mouse cursor to (${x}, ${y})` };
         }
-        return { output: `Moved mouse cursor to (${x}, ${y})` };
+        if (platform === "darwin") {
+          await runCmd(`cliclick m:${x},${y}`);
+          return { output: `Moved mouse cursor to (${x}, ${y})` };
+        }
+        if (platform === "linux") {
+          await runCmd(`xdotool mousemove ${x} ${y}`);
+          return { output: `Moved mouse cursor to (${x}, ${y})` };
+        }
+        return {
+          isError: true,
+          output: `mouse_move is not supported on ${platform}. Install xdotool (Linux) or cliclick (macOS) and retry.`,
+        };
       }
 
       case "mouse_click": {
@@ -465,7 +608,22 @@ export async function executeComputerUse(
           await runCmd(ps, "powershell.exe");
           return { output: `Clicked mouse (${button}) at (${x}, ${y})` };
         }
-        return { output: `Clicked mouse (${button}) at (${x}, ${y})` };
+        if (platform === "darwin") {
+          const clickCmd =
+            button === "right" ? `rc:${x},${y}` : button === "double" ? `dc:${x},${y}` : `c:${x},${y}`;
+          await runCmd(`cliclick ${clickCmd}`);
+          return { output: `Clicked mouse (${button}) at (${x}, ${y})` };
+        }
+        if (platform === "linux") {
+          const buttonCode = button === "right" ? 3 : 1;
+          const repeat = button === "double" ? "--repeat 2 " : "";
+          await runCmd(`xdotool mousemove ${x} ${y} click ${repeat}${buttonCode}`);
+          return { output: `Clicked mouse (${button}) at (${x}, ${y})` };
+        }
+        return {
+          isError: true,
+          output: `mouse_click is not supported on ${platform}. Install xdotool (Linux) or cliclick (macOS) and retry.`,
+        };
       }
 
       case "keyboard_type":
@@ -475,14 +633,37 @@ export async function executeComputerUse(
         const sendKeysExpr =
           input.action === "key_press"
             ? normalizeSendKeysExpression(rawText)
-            : rawText.replace(/([+^%~(){}])/g, "{$1}");
+            : rawText.replace(/\r?\n/g, "{ENTER}").replace(/([+^%~(){}])/g, "{$1}");
         if (platform === "win32") {
           const escaped = sendKeysExpr.replace(/'/g, "''");
           const ps = `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('${escaped}')`;
           await runCmd(ps, "powershell.exe");
           return { output: `Sent keystrokes: ${rawText} (${sendKeysExpr})` };
         }
-        return { output: `Sent keystrokes: ${rawText}` };
+        if (platform === "darwin") {
+          const keyScript = rawText
+            .split(/\r?\n/)
+            .map((line) => appleScriptString(line))
+            .join(" & (ASCII character 13) & ");
+          const script =
+            input.action === "key_press"
+              ? `tell application "System Events" to ${toAppleKeyScript(rawText)}`
+              : `tell application "System Events" to keystroke ${keyScript}`;
+          await runCmd(`osascript -e ${posixShellQuote(script)}`);
+          return { output: `Sent keystrokes: ${rawText}` };
+        }
+        if (platform === "linux") {
+          const command =
+            input.action === "key_press"
+              ? `xdotool key --clearmodifiers ${posixShellQuote(toXdotoolKey(rawText))}`
+              : `xdotool type --clearmodifiers -- ${posixShellQuote(rawText)}`;
+          await runCmd(command);
+          return { output: `Sent keystrokes: ${rawText}` };
+        }
+        return {
+          isError: true,
+          output: `Keyboard control is not supported on ${platform}. Install xdotool (Linux) or use macOS System Events/cliclick.`,
+        };
       }
 
       default:

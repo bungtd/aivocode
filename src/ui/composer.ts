@@ -1,7 +1,12 @@
 import { emitKeypressEvents } from "node:readline";
 import { stdin, stdout } from "node:process";
 import type { AivoWire, PermissionMode, ReasoningEffort } from "../config.js";
-import { c, padEndVisible, renderStatusBar, visibleLength } from "./theme.js";
+import {
+  c,
+  renderStatusBar,
+  sanitizeTerminalText,
+  truncateVisible,
+} from "./theme.js";
 import { SLASH_COMMANDS } from "./select.js";
 
 import { DEFAULT_AIVOKEY_CATALOG } from "../aivokey-client.js";
@@ -84,6 +89,7 @@ export function computeComposerSuggestions(
   buffer: string,
   workspaceFiles: string[],
   catalogModelIds?: string[],
+  extraCommands: Array<{ cmd: string; description: string }> = [],
 ): ComposerSuggestions {
   const modelIds =
     catalogModelIds && catalogModelIds.length > 0
@@ -93,7 +99,7 @@ export function computeComposerSuggestions(
   // 1. Live `/` Command Palette when buffer starts with `/` and has no space or newline yet
   if (buffer.startsWith("/") && !buffer.includes(" ") && !buffer.includes("\n")) {
     const q = buffer.slice(1).toLowerCase();
-    const matched = SLASH_COMMANDS.filter(
+    const matched = [...SLASH_COMMANDS, ...extraCommands].filter(
       (s) =>
         s.cmd.slice(1).startsWith(q) ||
         s.cmd.slice(1).includes(q) ||
@@ -364,23 +370,27 @@ export interface RenderComposerFrameOptions {
 }
 
 export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
-  const width = 76;
+  // Never exceed the real terminal width: a single wrapping line breaks clearFrame().
+  const width = Math.max(40, Math.min(110, (stdout.columns || 76) - 1));
   const inner = width - 4;
   const borderColor =
     opts.mode === "plan" ? c.violet : opts.mode === "safe" ? c.amber : c.cyan;
 
-  const statusBar = renderStatusBar({
-    mode: opts.mode,
-    model: opts.model,
-    effort: opts.effort,
-    wire: opts.wire,
-    usedContextTokens: opts.usedContextTokens,
-    maxContextTokens: opts.maxContextTokens,
-    cacheHitPct: opts.cacheHitPct,
-    sessionCostMicro: opts.sessionCostMicro,
-    balanceMicro: opts.balanceMicro,
-    gitBranch: opts.gitBranch,
-  });
+  const statusBar = truncateVisible(
+    renderStatusBar({
+      mode: opts.mode,
+      model: opts.model,
+      effort: opts.effort,
+      wire: opts.wire,
+      usedContextTokens: opts.usedContextTokens,
+      maxContextTokens: opts.maxContextTokens,
+      cacheHitPct: opts.cacheHitPct,
+      sessionCostMicro: opts.sessionCostMicro,
+      balanceMicro: opts.balanceMicro,
+      gitBranch: opts.gitBranch,
+    }),
+    width,
+  );
 
   const modeTitle =
     opts.mode === "plan"
@@ -389,7 +399,7 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
         ? "SAFE · CONFIRM EDITS"
         : "AUTO · BUILD AGENT";
 
-  const topTitle = `── ◆ ${modeTitle} `;
+  const topTitle = truncateVisible(`── ◆ ${modeTitle} `, Math.max(8, width - 2));
   const topDashCount = Math.max(2, width - topTitle.length);
   const topBorder = borderColor(`${topTitle}${"─".repeat(topDashCount)}`);
 
@@ -403,23 +413,27 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
   const middleRows: string[] = [];
   if (!opts.buffer) {
     const placeholder = "Ask anything, @file to attach, / for commands, !cmd for shell…";
-    middleRows.push(` ${glyph}${c.white("▏")}${c.dim(placeholder)}`);
+    middleRows.push(
+      truncateVisible(` ${glyph}${c.white("▏")}${c.dim(placeholder)}`, width),
+    );
   } else {
     const beforeCursor = opts.buffer.slice(0, opts.cursorPos);
     const afterCursor = opts.buffer.slice(opts.cursorPos);
     const rawWithCaret = `${beforeCursor}▏${afterCursor}`;
-    const maxChars = inner - 3;
+    const maxChars = Math.max(8, inner - 3);
     const rawLines = rawWithCaret.split("\n");
     rawLines.forEach((rawLine, idx) => {
       const clipped =
         rawLine.length > maxChars ? "…" + rawLine.slice(rawLine.length - (maxChars - 1)) : rawLine;
       const prefix = idx === 0 ? glyph : "   ";
-      middleRows.push(` ${prefix}${c.white(clipped)}`);
+      middleRows.push(truncateVisible(` ${prefix}${c.white(clipped)}`, width));
     });
   }
 
-  const footerHint =
-    "── Shift+Tab: Mode · Ctrl+K: Models · Ctrl+E: Effort · Ctrl+W: Wire · /: Cmds ";
+  const footerHint = truncateVisible(
+    "── Shift+Tab: Mode · Ctrl+K: Models · Ctrl+E: Effort · Ctrl+W: Wire · /: Cmds ",
+    Math.max(8, width - 2),
+  );
   const bottomDashCount = Math.max(1, width - footerHint.length);
   const bottomBorder = borderColor(`${footerHint}${"─".repeat(bottomDashCount)}`);
 
@@ -435,16 +449,25 @@ export function renderComposerFrame(opts: RenderComposerFrameOptions): string {
       opts.suggestions.kind === "slash"
         ? "Slash Commands (↑/↓ navigate · Tab/Enter select)"
         : "Workspace Files (↑/↓ navigate · Tab/Enter attach)";
-    lines.push(`  ${c.cyan("╭─")} ${c.bold(headerLabel)} ${c.cyan("─".repeat(22))}`);
+    lines.push(
+      truncateVisible(
+        `  ${c.cyan("╭─")} ${c.bold(headerLabel)} ${c.cyan("─".repeat(22))}`,
+        width,
+      ),
+    );
     opts.suggestions.items.forEach((item, idx) => {
       const isSelected = idx === opts.selectedSuggestionIdx;
       const pointer = isSelected ? c.cyan("❯") : " ";
-      const labelPadded = item.label.padEnd(28).slice(0, 28);
+      const labelPadded = sanitizeTerminalText(item.label).padEnd(28).slice(0, 28);
       const labelStyled = isSelected ? c.bold(c.cyan(labelPadded)) : c.white(labelPadded);
-      const descStyled = isSelected ? c.white(item.description) : c.slate(item.description);
-      lines.push(`  ${c.cyan("│")} ${pointer} ${labelStyled} ${descStyled}`);
+      const descStyled = isSelected
+        ? c.white(sanitizeTerminalText(item.description))
+        : c.slate(sanitizeTerminalText(item.description));
+      lines.push(
+        truncateVisible(`  ${c.cyan("│")} ${pointer} ${labelStyled} ${descStyled}`, width),
+      );
     });
-    lines.push(`  ${c.cyan("╰" + "─".repeat(70))}`);
+    lines.push(truncateVisible(`  ${c.cyan("╰" + "─".repeat(70))}`, width));
   }
 
   return lines.join("\n");
@@ -776,10 +799,12 @@ export async function readInteractiveComposerLine(opts: {
         return;
       }
 
-      // Printable text (including multi-char paste)
+      // Printable text (including multi-line paste)
       if (str && !key?.ctrl && !key?.meta) {
-        const clean = str.replace(/[\r\n]+/g, " ");
-        if (clean.length > 0 && clean >= " ") {
+        const clean = sanitizeTerminalText(
+          str.replace(/\r\n/g, "\n").replace(/\r/g, "\n"),
+        );
+        if (clean.length > 0 && (clean >= " " || clean.includes("\n"))) {
           buffer = buffer.slice(0, cursorPos) + clean + buffer.slice(cursorPos);
           cursorPos += clean.length;
           selectedSuggestionIdx = 0;

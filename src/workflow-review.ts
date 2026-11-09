@@ -232,12 +232,11 @@ export function parseReviewerVerdict(rawText: string): ParsedReviewerVerdict {
     }
   }
 
-  if (!hasNeedsFix && issues.length === 0) {
-    return { passed: true, issues: [], rawText: text };
-  }
-
-  if (hasNeedsFix && issues.length === 0) {
-    issues.push(text.replace(/VERDICT:\s*NEEDS_FIX/i, "").trim() || "Reviewer requested fixes");
+  // Fail-closed: only an explicit `VERDICT: PASS` counts as a pass. Unknown verdicts
+  // (e.g. `VERDICT: FAIL`, malformed output) must not silently approve the changes.
+  if (issues.length === 0) {
+    const fallback = text.replace(/VERDICT:\s*\w+/i, "").trim();
+    issues.push(fallback || "Reviewer did not return an explicit PASS verdict");
   }
 
   return {

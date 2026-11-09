@@ -152,7 +152,7 @@ describe("AivoAgent multi-turn tool loop, subagent routing, and auto-recovery", 
       expect(undo.restoredFiles).toHaveLength(1);
       expect(readFileSync(join(dir, "app.ts"), "utf8")).toBe("export const version = 1;\n");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -220,7 +220,7 @@ describe("AivoAgent multi-turn tool loop, subagent routing, and auto-recovery", 
       expect(attempt).toBe(3);
       expect(sleptMs).toEqual([2000]);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });

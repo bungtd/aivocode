@@ -125,7 +125,7 @@ describe("AivoCode v1.1 Fixes: Background Jobs, Plan-Aware Model Filtering, Iter
       expect(events.indexOf("reviewer_round_1")).toBeLessThan(events.indexOf("fixer_round_1"));
       expect(events.indexOf("fixer_round_1")).toBeLessThan(events.indexOf("reviewer_round_2"));
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 

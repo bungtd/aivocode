@@ -28,7 +28,7 @@ describe("Context manager, @file mentions, compaction, and JSONL sessions", () =
       expect(expanded).toContain('<file path="src-hello.ts" lines="1-1">');
       expect(expanded).toContain("1: export const greeting = 'Halo AivoKey';");
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 
@@ -83,7 +83,7 @@ describe("Context manager, @file mentions, compaction, and JSONL sessions", () =
       const list = store.listSessions();
       expect(list.length).toBe(2);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   });
 });
