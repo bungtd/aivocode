@@ -3,7 +3,7 @@
 All notable changes to AivoCode (`aivocode` / `aivo`) are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [1.1.2] — 2026-11-12
+## [1.1.2] — 2026-11-10
 
 Patch release: the TUI now measures terminal cells instead of string length,
 keeps its layout math in one place, and has a testable keyboard.
